@@ -1,7 +1,7 @@
 pub mod config;
 
 use tracing_subscriber::EnvFilter;
-use crate::config::config::init_config;
+use crate::config::settings::init_config;
 
 type R<T> = anyhow::Result<T>;
 

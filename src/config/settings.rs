@@ -5,7 +5,7 @@ use std::fmt::{Display, Formatter};
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VoiceConfig {
+pub struct Settings {
     /// 外部连接配置的主机ip
     pub port: u16,
     pub static_dir: String,
@@ -14,7 +14,7 @@ pub struct VoiceConfig {
     #[serde(default)]
     pub template_values: HashMap<String, String>,
 }
-impl Display for VoiceConfig {
+impl Display for Settings {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -25,7 +25,7 @@ impl Display for VoiceConfig {
     }
 }
 
-pub fn init_config() -> R<VoiceConfig> {
+pub fn init_config() -> R<Settings> {
     let s = std::fs::read_to_string("application.yaml").unwrap_or_else(|_| {
         r#"
             port: 8080
@@ -40,7 +40,7 @@ pub fn init_config() -> R<VoiceConfig> {
            "#
             .to_string()
     });
-    let config = serde_yaml::from_str::<VoiceConfig>(s.as_str())?;
+    let config = serde_yaml::from_str::<Settings>(s.as_str())?;
     info!(%config, "VoiceConfig:");
     Ok(config)
 }
