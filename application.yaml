@@ -1,0 +1,6 @@
+port: 8080
+static_dir: "static"
+index_file: "index.html"
+template_extensions:
+  - "js"
+template_values:
