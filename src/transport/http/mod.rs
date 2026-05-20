@@ -11,9 +11,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod signaling;
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ws", get(signaling::websocket))
         .route("/api/rooms", post(create_room))
         .route("/api/rooms/{room_id}", get(get_room))
         .route("/api/rooms/{room_id}/join", post(join_room))

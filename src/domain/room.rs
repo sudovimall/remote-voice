@@ -1,4 +1,5 @@
 use crate::{Error, Result};
+use rand::{Rng, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -49,7 +50,6 @@ pub struct RoomStore {
     max_members: usize,
     room_id_seed: u64,
     next_room_seq: AtomicU64,
-    next_member_seq: AtomicU64,
 }
 
 impl RoomStore {
@@ -59,7 +59,6 @@ impl RoomStore {
             max_members,
             room_id_seed: new_room_id_seed(),
             next_room_seq: AtomicU64::new(1),
-            next_member_seq: AtomicU64::new(1),
         }
     }
 
@@ -87,13 +86,20 @@ impl RoomStore {
     }
 
     pub fn join_room(&self, room_id: &str, nickname: impl Into<String>) -> Result<RoomJoin> {
-        let member = self.new_member(nickname, MemberRole::Member);
+        let nickname = nickname.into();
         let mut rooms = self.write_rooms()?;
         let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
 
         if room.members.len() >= self.max_members {
             return Err(Error::RoomFull);
         }
+
+        let member = loop {
+            let candidate = self.new_member(nickname.clone(), MemberRole::Member);
+            if !room.members.contains_key(&candidate.id) {
+                break candidate;
+            }
+        };
 
         room.members.insert(member.id.clone(), member.clone());
         room.last_active_epoch_seconds = now_epoch_seconds();
@@ -134,10 +140,43 @@ impl RoomStore {
         Ok(room.clone())
     }
 
+    pub fn set_self_muted(&self, room_id: &str, member_id: &str, self_muted: bool) -> Result<Room> {
+        let mut rooms = self.write_rooms()?;
+        let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
+        let member = room
+            .members
+            .get_mut(member_id)
+            .ok_or(Error::MemberNotFound)?;
+
+        member.self_muted = self_muted;
+        room.last_active_epoch_seconds = now_epoch_seconds();
+
+        Ok(room.clone())
+    }
+
+    pub fn leave_room(&self, room_id: &str, member_id: &str) -> Result<Room> {
+        let mut rooms = self.write_rooms()?;
+        let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
+
+        if !room.members.contains_key(member_id) {
+            return Err(Error::MemberNotFound);
+        }
+
+        if room.owner_member_id == member_id {
+            let room = room.clone();
+            rooms.remove(room_id);
+            return Ok(room);
+        }
+
+        room.members.remove(member_id);
+        room.last_active_epoch_seconds = now_epoch_seconds();
+
+        Ok(room.clone())
+    }
+
     fn new_member(&self, nickname: impl Into<String>, role: MemberRole) -> Member {
-        let seq = self.next_member_seq.fetch_add(1, Ordering::Relaxed);
         Member {
-            id: format!("m{}", seq),
+            id: new_member_id(),
             nickname: nickname.into(),
             role,
             can_speak: true,
@@ -184,6 +223,17 @@ fn new_room_id_seed() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or_default()
+}
+
+fn new_member_id() -> String {
+    let mut rng = rand::rng();
+    let suffix: String = (&mut rng)
+        .sample_iter(Alphanumeric)
+        .take(22)
+        .map(char::from)
+        .collect();
+
+    format!("m_{suffix}")
 }
 
 fn mix64(mut value: u64) -> u64 {

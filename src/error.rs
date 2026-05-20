@@ -44,7 +44,7 @@ impl Error {
         }
     }
 
-    fn code(&self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Error::RoomNotFound => "room_not_found",
             Error::RoomFull => "room_full",
