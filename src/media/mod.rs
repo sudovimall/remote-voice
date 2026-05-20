@@ -1,4 +1,5 @@
 use crate::{Error, Result};
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt, sync::Arc};
 use tokio::sync::{Mutex, mpsc};
 use webrtc::{
@@ -26,7 +27,44 @@ pub struct MediaController {
 #[derive(Debug)]
 pub struct MediaAnswer {
     pub sdp: String,
-    pub local_ice_candidates: mpsc::Receiver<String>,
+    // handle_offer 返回后 ICE 仍会继续收集；信令层从这个队列流式发送给同一个客户端。
+    pub local_ice_candidates: mpsc::Receiver<IceCandidate>,
+}
+
+/// WebSocket 信令层传输的 ICE candidate 结构，保持和浏览器 RTCIceCandidateInit 对齐。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IceCandidate {
+    // candidate 行本体，例如 "candidate:..."。其他字段用于定位具体的 m-line。
+    pub candidate: String,
+    #[serde(default)]
+    pub sdp_mid: Option<String>,
+    #[serde(rename = "sdpMLineIndex", default)]
+    pub sdp_mline_index: Option<u16>,
+    #[serde(default)]
+    pub username_fragment: Option<String>,
+}
+
+impl From<RTCIceCandidateInit> for IceCandidate {
+    fn from(candidate: RTCIceCandidateInit) -> Self {
+        Self {
+            candidate: candidate.candidate,
+            sdp_mid: candidate.sdp_mid,
+            sdp_mline_index: candidate.sdp_mline_index,
+            username_fragment: candidate.username_fragment,
+        }
+    }
+}
+
+impl From<IceCandidate> for RTCIceCandidateInit {
+    fn from(candidate: IceCandidate) -> Self {
+        Self {
+            candidate: candidate.candidate,
+            sdp_mid: candidate.sdp_mid,
+            sdp_mline_index: candidate.sdp_mline_index,
+            username_fragment: candidate.username_fragment,
+        }
+    }
 }
 
 impl fmt::Debug for MediaController {
@@ -72,7 +110,7 @@ impl MediaController {
             .await
             .map_err(|err| Error::Internal(format!("创建 PeerConnection 失败: {err}")))?;
         let (local_ice_sender, local_ice_candidates) =
-            mpsc::channel::<String>(LOCAL_ICE_QUEUE_CAPACITY);
+            mpsc::channel::<IceCandidate>(LOCAL_ICE_QUEUE_CAPACITY);
 
         // webrtc-rs 通过回调异步产出本地 candidate；信令层负责把它们发回当前浏览器。
         peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
@@ -85,7 +123,7 @@ impl MediaController {
                     return;
                 };
 
-                let _ = local_ice_sender.try_send(candidate.candidate);
+                let _ = local_ice_sender.try_send(candidate.into());
             })
         }));
 
@@ -126,7 +164,7 @@ impl MediaController {
         &self,
         room_id: &str,
         member_id: &str,
-        candidate: String,
+        candidate: IceCandidate,
     ) -> Result<()> {
         let key = (room_id.to_string(), member_id.to_string());
         let peer_connection = {
@@ -136,10 +174,7 @@ impl MediaController {
         .ok_or_else(|| Error::InvalidMessage("媒体会话不存在，请先发送 offer".to_string()))?;
 
         peer_connection
-            .add_ice_candidate(RTCIceCandidateInit {
-                candidate,
-                ..Default::default()
-            })
+            .add_ice_candidate(candidate.into())
             .await
             .map_err(|err| Error::Internal(format!("添加 ICE candidate 失败: {err}")))
     }
@@ -165,7 +200,7 @@ impl MediaController {
 
 #[cfg(test)]
 mod tests {
-    use super::MediaController;
+    use super::{IceCandidate, MediaController};
     use crate::Error;
     use webrtc::{
         api::{
@@ -210,7 +245,12 @@ mod tests {
             .add_ice_candidate(
                 "room-1",
                 "member-1",
-                "candidate:1 1 udp 1 127.0.0.1 1 typ host".to_string(),
+                IceCandidate {
+                    candidate: "candidate:1 1 udp 1 127.0.0.1 1 typ host".to_string(),
+                    sdp_mid: Some("0".to_string()),
+                    sdp_mline_index: Some(0),
+                    username_fragment: None,
+                },
             )
             .await
             .expect_err("没有 offer 时不能添加候选");

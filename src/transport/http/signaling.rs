@@ -1,4 +1,4 @@
-use crate::{Error, Result, domain::room::Room, state::AppState};
+use crate::{Error, Result, domain::room::Room, media::IceCandidate, state::AppState};
 use axum::{
     extract::{
         State,
@@ -36,17 +36,20 @@ pub enum ClientSignal {
         member_id: String,
         can_speak: bool,
     },
+    // 浏览器发给后端 PeerConnection 的 offer；不再携带目标成员，也不会被转发给其他成员。
     WebrtcOffer {
         request_id: Option<String>,
         sdp: String,
     },
+    // 当前 SFU MVP 中后端不主动发起 offer，因此客户端 answer 会被拒绝。
     WebrtcAnswer {
         request_id: Option<String>,
         sdp: String,
     },
+    // 浏览器 trickle ICE 的原始结构，保留 sdpMid/sdpMLineIndex 等字段给 webrtc-rs。
     IceCandidate {
         request_id: Option<String>,
-        candidate: String,
+        candidate: IceCandidate,
     },
 }
 
@@ -77,8 +80,9 @@ pub enum ServerSignal {
         request_id: Option<String>,
         sdp: String,
     },
+    // 服务端 PeerConnection 产出的本地 candidate，只回给当前协商的 WebSocket。
     IceCandidate {
-        candidate: String,
+        candidate: IceCandidate,
     },
     Error {
         request_id: Option<String>,
@@ -183,7 +187,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     let mut joined_room_id: Option<String> = None;
     let mut joined_member_id: Option<String> = None;
     let mut outbound: Option<mpsc::Receiver<ServerSignal>> = None;
-    let mut local_ice_candidates: Option<mpsc::Receiver<String>> = None;
+    let mut local_ice_candidates: Option<mpsc::Receiver<IceCandidate>> = None;
 
     loop {
         tokio::select! {
@@ -513,8 +517,17 @@ async fn send_json(
 #[cfg(test)]
 mod tests {
     use super::{ClientSignal, SIGNAL_QUEUE_CAPACITY, ServerSignal, SignalHub};
-    use crate::Error;
+    use crate::{Error, media::IceCandidate};
     use tokio::sync::mpsc::error::TryRecvError;
+
+    fn test_candidate(value: &str) -> IceCandidate {
+        IceCandidate {
+            candidate: value.to_string(),
+            sdp_mid: Some("0".to_string()),
+            sdp_mline_index: Some(0),
+            username_fragment: None,
+        }
+    }
 
     #[test]
     fn 客户端信令消息按_type_字段解析() {
@@ -549,6 +562,45 @@ mod tests {
         assert_eq!(json["type"], "error");
         assert_eq!(json["request_id"], "req-1");
         assert_eq!(json["code"], "room_not_found");
+    }
+
+    #[test]
+    fn 客户端_ice_candidate_按浏览器结构解析() {
+        let signal: ClientSignal = serde_json::from_str(
+            r#"{"type":"ice_candidate","request_id":"ice-1","candidate":{"candidate":"candidate:abc","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"ufrag"}}"#,
+        )
+        .expect("解析浏览器 ICE candidate");
+
+        assert!(matches!(
+            signal,
+            ClientSignal::IceCandidate {
+                request_id,
+                candidate
+            } if request_id.as_deref() == Some("ice-1")
+                && candidate.candidate == "candidate:abc"
+                && candidate.sdp_mid.as_deref() == Some("0")
+                && candidate.sdp_mline_index == Some(0)
+                && candidate.username_fragment.as_deref() == Some("ufrag")
+        ));
+    }
+
+    #[test]
+    fn 服务端_ice_candidate_按浏览器结构序列化() {
+        let json = serde_json::to_value(ServerSignal::IceCandidate {
+            candidate: IceCandidate {
+                candidate: "candidate:abc".to_string(),
+                sdp_mid: Some("0".to_string()),
+                sdp_mline_index: Some(0),
+                username_fragment: Some("ufrag".to_string()),
+            },
+        })
+        .expect("序列化服务端 ICE candidate");
+
+        assert_eq!(json["type"], "ice_candidate");
+        assert_eq!(json["candidate"]["candidate"], "candidate:abc");
+        assert_eq!(json["candidate"]["sdpMid"], "0");
+        assert_eq!(json["candidate"]["sdpMLineIndex"], 0);
+        assert_eq!(json["candidate"]["usernameFragment"], "ufrag");
     }
 
     #[test]
@@ -587,7 +639,7 @@ mod tests {
             hub.broadcast(
                 "room-1",
                 ServerSignal::IceCandidate {
-                    candidate: format!("candidate-{index}"),
+                    candidate: test_candidate(&format!("candidate-{index}")),
                 },
                 None,
             )
@@ -597,7 +649,7 @@ mod tests {
         hub.broadcast(
             "room-1",
             ServerSignal::IceCandidate {
-                candidate: "overflow".to_string(),
+                candidate: test_candidate("overflow"),
             },
             None,
         )
@@ -610,7 +662,7 @@ mod tests {
         hub.broadcast(
             "room-1",
             ServerSignal::IceCandidate {
-                candidate: "after-remove".to_string(),
+                candidate: test_candidate("after-remove"),
             },
             None,
         )
@@ -618,7 +670,7 @@ mod tests {
 
         assert!(matches!(
             replacement.try_recv(),
-            Ok(ServerSignal::IceCandidate { candidate }) if candidate == "after-remove"
+            Ok(ServerSignal::IceCandidate { candidate }) if candidate.candidate == "after-remove"
         ));
     }
 
