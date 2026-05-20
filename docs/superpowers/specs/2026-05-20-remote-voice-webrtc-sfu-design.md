@@ -1,106 +1,106 @@
-# Remote Voice WebRTC SFU Design
+# Remote Voice WebRTC SFU 设计文档
 
-Date: 2026-05-20
+日期：2026-05-20
 
-## Goal
+## 目标
 
-Build a low-latency team voice platform that can run on a personal server with minimal operational dependencies.
+实现一个可部署在个人服务器上的低延迟组队语音平台，并尽量减少运行时依赖和运维复杂度。
 
-The MVP is a browser-based voice room system:
+MVP 是一个基于网页的语音房间系统：
 
-- A user opens the web page, enters a nickname, and creates or joins a room.
-- The room creator becomes the room owner.
-- Browser clients send microphone audio to the Rust backend through WebRTC.
-- The backend forwards audio from each speaker to other members in the same room.
-- The room owner can control whether a member is allowed to speak.
-- Text chat, persistent accounts, room passwords, and recording are later extensions.
+- 用户打开网页后输入昵称，并创建或加入房间。
+- 创建房间的用户成为房主。
+- 浏览器通过 WebRTC 把麦克风音频发送到 Rust 后端。
+- 后端负责把每个发言者的音频转发给同房间内其他成员。
+- 房主可以控制某个成员是否允许发言。
+- 文字聊天、持久化账号、房间密码、录音等功能作为后续扩展。
 
-## Non-Goals For MVP
+## MVP 不做的内容
 
-- No video.
-- No persistent database.
-- No full account system.
-- No audio mixing.
-- No audio recording.
-- No end-to-end encryption beyond normal WebRTC transport encryption.
-- No clustered multi-server deployment.
+- 不做视频。
+- 不引入持久化数据库。
+- 不做完整账号系统。
+- 不做音频混音。
+- 不做录音。
+- 不额外实现端到端加密，只使用 WebRTC 自带的传输加密。
+- 不做多服务器集群部署。
 
-## Architecture
+## 架构
 
-The system uses a lightweight SFU architecture.
+系统采用轻量 SFU 架构。
 
 ```text
-Browser
-  | HTTPS page load
+浏览器
+  | HTTPS 加载页面
   v
-Rust backend
+Rust 后端
 
-Browser
-  | WebSocket signaling over TCP
+浏览器
+  | WebSocket 信令，基于 TCP
   v
-Rust backend
+Rust 后端
 
-Browser
-  | WebRTC audio: ICE + DTLS + SRTP over UDP/TCP fallback
+浏览器
+  | WebRTC 音频：ICE + DTLS + SRTP，优先 UDP，可回退 TCP
   v
-Rust backend
-  | forwards RTP audio packets
+Rust 后端
+  | 转发 RTP 音频包
   v
-Other browsers in the same room
+同房间内其他浏览器
 ```
 
-The backend is not a raw UDP voice server. Browsers cannot safely send plain UDP audio directly from JavaScript. Instead, each browser creates a WebRTC peer connection with the backend. The backend receives encrypted WebRTC media, terminates the WebRTC connection, and forwards RTP audio packets to other room members through their own WebRTC peer connections.
+后端不是裸 UDP 语音服务器。浏览器 JavaScript 不能安全、直接地发送普通 UDP 音频包。每个浏览器需要和后端建立 WebRTC PeerConnection。后端终止 WebRTC 连接，接收浏览器发来的加密媒体流，然后把 RTP 音频包转发给同房间其他成员对应的 WebRTC 连接。
 
-## Main Components
+## 主要模块
 
-### HTTP Server
+### HTTP 服务
 
-The Axum HTTP server owns:
+Axum HTTP 服务负责：
 
-- Static frontend file serving.
-- `GET /health` for deployment checks.
-- `POST /api/rooms` for room creation.
-- `GET /api/rooms/:room_id` for room status.
-- `GET /ws` for WebSocket signaling.
+- 静态前端文件服务。
+- `GET /health` 部署健康检查。
+- `POST /api/rooms` 创建房间。
+- `GET /api/rooms/:room_id` 查询房间状态。
+- `GET /ws` WebSocket 信令连接。
 
-The HTTP layer should stay thin. It parses requests, calls domain services, and returns JSON responses or WebSocket messages.
+HTTP 层应保持轻量，只负责解析请求、调用领域服务、返回 JSON 响应或 WebSocket 消息。
 
-### Room Domain
+### 房间领域
 
-Room state is held in memory for MVP.
+MVP 阶段房间状态保存在内存中。
 
-Each room contains:
+每个房间包含：
 
-- Room ID.
-- Owner member ID.
-- Members.
-- Per-member speaking permission.
-- Creation time.
-- Last activity time.
+- 房间 ID。
+- 房主成员 ID。
+- 成员列表。
+- 每个成员的发言权限。
+- 创建时间。
+- 最后活跃时间。
 
-Each member contains:
+每个成员包含：
 
-- Member ID.
-- Nickname.
-- Role: `owner` or `member`.
-- Connection status.
-- Speaking permission.
-- Mute state reported by the client.
+- 成员 ID。
+- 昵称。
+- 角色：`owner` 或 `member`。
+- 连接状态。
+- 发言权限。
+- 客户端上报的本地静音状态。
 
-Rules:
+规则：
 
-- The creator of a room is the owner.
-- Only the owner can change another member's speaking permission.
-- The owner cannot be removed by non-owners.
-- If the owner leaves, MVP should close the room and disconnect remaining members.
-- Empty rooms are removed automatically.
-- Rooms have a configurable member limit.
+- 房间创建者是房主。
+- 只有房主可以修改其他成员的发言权限。
+- 普通成员不能移除或管理房主。
+- MVP 阶段如果房主离开，房间关闭，剩余成员断开连接。
+- 空房间自动回收。
+- 房间人数上限可配置。
 
-### Signaling
+### 信令
 
-WebSocket signaling coordinates room membership and WebRTC negotiation.
+WebSocket 信令负责协调房间成员状态和 WebRTC 协商。
 
-Client-to-server messages:
+客户端发给服务端的消息：
 
 - `join_room`
 - `leave_room`
@@ -110,7 +110,7 @@ Client-to-server messages:
 - `set_self_muted`
 - `set_member_can_speak`
 
-Server-to-client messages:
+服务端发给客户端的消息：
 
 - `joined_room`
 - `member_joined`
@@ -122,81 +122,113 @@ Server-to-client messages:
 - `ice_candidate`
 - `error`
 
-Signaling messages are JSON. Every message should include a `type` field and a request ID when a direct response is expected.
+信令消息使用 JSON。每条消息都应包含 `type` 字段；需要直接响应的请求应包含请求 ID。
 
-### Media Forwarding
+### 媒体转发
 
-The media layer owns backend WebRTC peer connections.
+媒体层负责后端 WebRTC PeerConnection 管理。
 
-For each connected member:
+对于每个已连接成员：
 
-- The browser sends one local microphone audio track to the backend.
-- The backend receives that audio as an incoming track.
-- The backend creates outgoing audio tracks for other room members as needed.
-- Incoming RTP packets are forwarded to allowed recipients.
+- 浏览器向后端发送一个本地麦克风音频轨道。
+- 后端接收该音频轨道。
+- 后端按房间成员关系为其他成员创建下行音频轨道。
+- 后端把收到的 RTP 音频包转发给允许接收的成员。
 
-The backend does not decode Opus audio and does not mix multiple speakers into one stream. It forwards RTP packets to keep CPU usage and latency low.
+后端不解码 Opus 音频，也不把多人声音混成一路。这样可以降低 CPU 使用和转发延迟。
 
-Speaking permission is enforced on the server:
+发言权限由服务端强制执行：
 
-- If `can_speak = false`, incoming audio from that member is dropped.
-- Other members are notified that the member cannot speak.
-- The client UI should also disable or mark the microphone, but server enforcement is authoritative.
+- 如果成员的 `can_speak = false`，后端丢弃该成员的上行音频包。
+- 其他成员会收到该成员发言权限变化的通知。
+- 客户端 UI 应禁用或标记该成员的麦克风状态，但最终权限以后端判断为准。
 
-Receiving permission is not part of MVP. All connected room members can hear allowed speakers.
+MVP 不做收听权限控制。同房间成员可以听到所有被允许发言的成员。
 
-## Permission Model
+## 权限模型
 
-Roles:
+角色：
 
-- `owner`: created the room and can control room permissions.
-- `member`: can speak only when allowed by the owner.
+- `owner`：房间创建者，可以管理房间权限。
+- `member`：普通成员，只能在被允许时发言。
 
-Actions:
+操作权限：
 
-| Action | Owner | Member |
+| 操作 | 房主 | 普通成员 |
 | --- | --- | --- |
-| Create room | Yes | Yes |
-| Join room | Yes | Yes |
-| Speak when `can_speak = true` | Yes | Yes |
-| Speak when `can_speak = false` | No | No |
-| Change own mute state | Yes | Yes |
-| Change another member's speaking permission | Yes | No |
-| Close room | Yes | No |
+| 创建房间 | 可以 | 可以 |
+| 加入房间 | 可以 | 可以 |
+| `can_speak = true` 时发言 | 可以 | 可以 |
+| `can_speak = false` 时发言 | 不可以 | 不可以 |
+| 修改自己的本地静音状态 | 可以 | 可以 |
+| 修改其他成员发言权限 | 可以 | 不可以 |
+| 关闭房间 | 可以 | 不可以 |
 
-Default MVP behavior:
+MVP 默认行为：
 
-- The owner has `can_speak = true`.
-- New members have `can_speak = true` by default.
-- The owner can turn a member's `can_speak` value on or off.
+- 房主默认 `can_speak = true`。
+- 新成员默认 `can_speak = true`。
+- 房主可以随时开启或关闭某个成员的 `can_speak`。
 
-This default keeps small friend/team rooms convenient. A later room setting can make new members join muted by default.
+这个默认行为适合小团队或朋友组队语音。后续可以增加房间设置，让新成员默认进入禁言状态，等待房主允许发言。
 
-## Frontend
+## 前端
 
-The frontend is a single browser page for MVP.
+MVP 前端是一个单页网页。
 
-Views:
+视图：
 
-- Lobby: nickname input, create room, join room by room ID.
-- Room: room ID, member list, owner controls, microphone toggle, disconnect button.
+- 大厅：昵称输入、创建房间、通过房间号加入房间。
+- 房间：房间号、成员列表、房主管理控件、麦克风开关、断开按钮。
 
-Owner controls:
+房主控件：
 
-- Show a speaking permission toggle next to each member.
-- Disable owner-only controls for normal members.
-- Reflect permission changes immediately from server messages.
+- 每个成员旁边显示发言权限开关。
+- 普通成员看不到或不能操作房主专用控件。
+- 服务端广播权限变化后，前端应立即刷新成员状态。
 
-Audio behavior:
+音频行为：
 
-- Request microphone permission only when joining or creating a room.
-- Use `RTCPeerConnection` for backend media transport.
-- Play remote audio tracks from the backend.
-- Allow local mute without leaving the room.
+- 只在创建或加入房间时请求麦克风权限。
+- 使用 `RTCPeerConnection` 和后端传输媒体。
+- 播放后端下发的远端音频轨道。
+- 支持本地静音，不需要离开房间。
 
-## Dependencies
+## 代码规格与协作限制
 
-Current dependencies already fit the service skeleton:
+### 语言要求
+
+- 项目文档使用中文编写。
+- 代码注释使用中文编写。
+- 用户可见的错误提示、日志关键消息和接口说明优先使用中文，除非协议字段、库类型名或行业固定术语更适合英文。
+- WebRTC、SFU、ICE、SDP、RTP、Opus 等固定技术名词可以保留英文。
+
+### 注释要求
+
+- 不为显而易见的代码写注释。
+- 对并发状态、房间权限、媒体转发、WebRTC 协商等容易误解的逻辑写简短中文注释。
+- 注释解释“为什么这样做”，避免重复描述“这行代码做了什么”。
+- 对协议消息、配置字段、权限判断函数保留清晰的中文说明。
+
+### 代码结构要求
+
+- HTTP 层只处理请求解析和响应转换，不直接实现房间业务逻辑。
+- 房间、成员、权限判断放在领域模块中。
+- WebSocket 信令和 WebRTC 媒体转发分开实现。
+- 共享状态集中放在 `AppState` 或明确的状态服务中。
+- 不在多个模块里重复实现同一套权限判断。
+- 新增依赖前必须说明用途和不可替代原因，保持依赖最小化。
+
+### 提交限制
+
+- 修改代码或文档后，必须先让用户审阅。
+- 只有在用户明确确认后，才可以执行 `git commit`。
+- 未经用户确认，不得自动提交。
+- 提交前应说明本次将提交哪些文件。
+
+## 依赖
+
+当前依赖已经适合服务端骨架：
 
 - `tokio`
 - `axum`
@@ -207,19 +239,19 @@ Current dependencies already fit the service skeleton:
 - `anyhow`
 - `thiserror`
 
-Additional likely dependencies:
+后续可能需要增加：
 
-- `serde_json` for WebSocket messages.
-- `tower-http` for static file serving.
-- `webrtc` for WebRTC, ICE, DTLS, SRTP, RTP, and media tracks.
-- `nanoid` or `uuid` for room and member IDs.
-- `dashmap` or `tokio::sync::RwLock<HashMap<...>>` for shared room state.
+- `serde_json`：处理 WebSocket JSON 消息。
+- `tower-http`：提供静态文件服务。
+- `webrtc`：实现 WebRTC、ICE、DTLS、SRTP、RTP 和媒体轨道。
+- `nanoid` 或 `uuid`：生成房间 ID 和成员 ID。
+- `dashmap` 或 `tokio::sync::RwLock<HashMap<...>>`：保存共享房间状态。
 
-The `webrtc` crate is the main unavoidable dependency. Implementing ICE, DTLS, SRTP, RTP, and WebRTC negotiation directly is not realistic for this project.
+其中 `webrtc` 是核心依赖。直接实现 ICE、DTLS、SRTP、RTP 和 WebRTC 协商对本项目不现实。
 
-## Configuration
+## 配置
 
-`application.yaml` should grow to include:
+`application.yaml` 后续应扩展为：
 
 ```yaml
 port: 8080
@@ -236,117 +268,117 @@ webrtc:
     - "stun:stun.l.google.com:19302"
 ```
 
-For personal server deployment, production should run behind HTTPS. WebRTC microphone access requires a secure context except on localhost.
+个人服务器部署时，生产环境应通过 HTTPS 访问。除 localhost 外，浏览器麦克风权限通常要求安全上下文。
 
-## Error Handling
+## 错误处理
 
-The backend should return structured errors:
+后端应返回结构化错误：
 
-- `room_not_found`
-- `room_full`
-- `not_room_owner`
-- `member_not_found`
-- `invalid_message`
-- `webrtc_error`
-- `internal_error`
+- `room_not_found`：房间不存在。
+- `room_full`：房间人数已满。
+- `not_room_owner`：不是房主，不能执行该操作。
+- `member_not_found`：成员不存在。
+- `invalid_message`：信令消息格式错误。
+- `webrtc_error`：WebRTC 协商或媒体处理失败。
+- `internal_error`：内部错误。
 
-WebSocket errors should be sent as JSON `error` messages when the connection can continue. Fatal errors should close the connection with a clear close reason.
+如果 WebSocket 连接可以继续，错误应以 JSON `error` 消息返回。致命错误才关闭连接，并给出明确关闭原因。
 
-## Testing Strategy
+## 测试策略
 
-Unit tests:
+单元测试：
 
-- Room creation and deletion.
-- Member join and leave.
-- Owner permission checks.
-- Speaking permission updates.
-- Room cleanup behavior.
+- 房间创建和删除。
+- 成员加入和离开。
+- 房主权限判断。
+- 发言权限更新。
+- 房间清理行为。
 
-Integration tests:
+集成测试：
 
-- HTTP health endpoint.
-- Room creation API.
-- WebSocket join flow.
-- Rejection when non-owner changes speaking permission.
+- HTTP 健康检查。
+- 创建房间 API。
+- WebSocket 加入房间流程。
+- 普通成员修改他人发言权限时被拒绝。
 
-Manual browser tests:
+手动浏览器测试：
 
-- Two browser tabs can join one room.
-- One user speaks and the other hears audio.
-- Owner disables a member's speaking permission.
-- Disabled member's audio is not forwarded.
-- Re-enabling speaking restores audio forwarding.
+- 两个浏览器标签页可以加入同一房间。
+- 一个用户说话，另一个用户能听到。
+- 房主关闭某个成员的发言权限。
+- 被关闭发言权限的成员音频不会被转发。
+- 房主重新开启权限后，该成员恢复发言。
 
-## Implementation Phases
+## 实施阶段
 
-### Phase 1: Service Skeleton
+### 阶段 1：服务骨架
 
-- Complete `lib.rs`, `app.rs`, `error.rs`, and `state.rs`.
-- Start Axum from config.
-- Add `/health`.
-- Serve static frontend files.
-- Add shared `AppState`.
+- 补全 `lib.rs`、`app.rs`、`error.rs` 和 `state.rs`。
+- 按配置启动 Axum。
+- 增加 `/health`。
+- 提供静态前端文件服务。
+- 增加共享 `AppState`。
 
-### Phase 2: Room System
+### 阶段 2：房间系统
 
-- Add room and member domain types.
-- Generate short room IDs.
-- Add room creation and status APIs.
-- Add in-memory room storage.
-- Add owner role and speaking permission model.
+- 增加房间和成员领域类型。
+- 生成短房间号。
+- 增加创建房间和查询房间状态 API。
+- 增加内存房间存储。
+- 增加房主角色和发言权限模型。
 
-### Phase 3: WebSocket Signaling
+### 阶段 3：WebSocket 信令
 
-- Define signaling message types.
-- Implement `/ws`.
-- Add join and leave flows.
-- Broadcast member updates.
-- Enforce owner-only permission changes.
+- 定义信令消息类型。
+- 实现 `/ws`。
+- 实现加入和离开流程。
+- 广播成员状态变化。
+- 强制执行只有房主能修改发言权限。
 
-### Phase 4: Backend WebRTC/SFU
+### 阶段 4：后端 WebRTC/SFU
 
-- Add server-side WebRTC peer connection handling.
-- Accept client microphone tracks.
-- Create outgoing tracks for room members.
-- Forward RTP packets without decoding or mixing.
-- Drop incoming RTP from members with `can_speak = false`.
+- 增加服务端 WebRTC PeerConnection 管理。
+- 接收客户端麦克风音频轨道。
+- 为房间成员创建下行音频轨道。
+- 转发 RTP 包，不解码、不混音。
+- 对 `can_speak = false` 的成员丢弃上行 RTP 包。
 
-### Phase 5: Browser Client
+### 阶段 5：浏览器客户端
 
-- Build lobby and room UI.
-- Add microphone permission flow.
-- Connect WebSocket signaling.
-- Create WebRTC connection to backend.
-- Render member list and owner controls.
+- 实现大厅和房间 UI。
+- 增加麦克风权限流程。
+- 接入 WebSocket 信令。
+- 创建到后端的 WebRTC 连接。
+- 渲染成员列表和房主控制项。
 
-### Phase 6: Deployment
+### 阶段 6：部署
 
-- Build release binary.
-- Deploy binary plus static files.
-- Add sample `systemd` service.
-- Document Caddy or Nginx HTTPS reverse proxy.
-- Document required TCP and UDP ports.
+- 构建 release 二进制。
+- 部署二进制和静态文件。
+- 增加 `systemd` 服务示例。
+- 文档说明 Caddy 或 Nginx HTTPS 反向代理配置。
+- 文档说明需要开放的 TCP 和 UDP 端口。
 
-### Phase 7: Later Extensions
+### 阶段 7：后续扩展
 
-- Text chat over the existing room WebSocket.
-- Room password.
-- Persistent users.
-- Owner transfer when owner leaves.
-- TURN/coturn support for restrictive networks.
-- Optional recording.
-- Metrics and status page.
+- 基于现有房间 WebSocket 增加文字聊天。
+- 增加房间密码。
+- 增加持久化用户。
+- 增加房主离开后的房主转移。
+- 增加 TURN/coturn 支持，以适配更复杂的网络环境。
+- 可选录音。
+- 指标和状态页。
 
-## Open Decisions
+## 已确定的 MVP 决策
 
-- Whether new members should default to `can_speak = true` or wait for owner approval.
-- Whether owner leaving closes the room or transfers ownership.
-- Whether room IDs should be purely random or human-readable.
-- Whether MVP frontend should be plain HTML/CSS/JS or a small frontend framework.
+- 新成员默认 `can_speak = true`。
+- 房主离开时关闭房间。
+- 房间 ID 使用随机 6 位大写字母数字。
+- 前端先使用原生 HTML/CSS/JS，减少依赖。
 
-Recommended MVP decisions:
+## 后续可调整项
 
-- New members default to `can_speak = true`.
-- Owner leaving closes the room.
-- Room IDs are random 6-character uppercase alphanumeric codes.
-- Frontend starts as plain HTML/CSS/JS to minimize dependencies.
+- 是否让新成员默认禁言，等待房主允许后发言。
+- 是否支持房主离开后自动转移房主。
+- 是否让房间号更易读，例如按词组生成。
+- 是否在前端复杂度增加后引入小型前端框架。
