@@ -1,4 +1,9 @@
-use crate::{Error, Result, domain::room::Room, media::IceCandidate, state::AppState};
+use crate::{
+    Error, Result,
+    domain::room::Room,
+    media::{IceCandidate, MediaEvent},
+    state::AppState,
+};
 use axum::{
     extract::{
         State,
@@ -79,6 +84,10 @@ pub enum ServerSignal {
     WebrtcAnswer {
         request_id: Option<String>,
         sdp: String,
+    },
+    // 有新的服务端下行 track 可订阅时，客户端需要重新发 offer 让 answer 带上新 m-line。
+    RenegotiationNeeded {
+        member_id: String,
     },
     // 服务端 PeerConnection 产出的本地 candidate，只回给当前协商的 WebSocket。
     IceCandidate {
@@ -188,6 +197,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     let mut joined_member_id: Option<String> = None;
     let mut outbound: Option<mpsc::Receiver<ServerSignal>> = None;
     let mut local_ice_candidates: Option<mpsc::Receiver<IceCandidate>> = None;
+    let mut media_events = state.media.subscribe_events();
 
     loop {
         tokio::select! {
@@ -426,6 +436,23 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                     break;
                 }
             }
+            media_event = media_events.recv(), if joined_room_id.is_some() => {
+                let Ok(media_event) = media_event else {
+                    continue;
+                };
+
+                let Some(signal) = renegotiation_signal_for_event(
+                    &media_event,
+                    joined_room_id.as_deref(),
+                    joined_member_id.as_deref(),
+                ) else {
+                    continue;
+                };
+
+                if send_json(&mut sender, &signal).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 
@@ -468,6 +495,25 @@ fn joined_pair<'a>(
     member_id: &'a Option<String>,
 ) -> Option<(&'a str, &'a str)> {
     Some((room_id.as_deref()?, member_id.as_deref()?))
+}
+
+fn renegotiation_signal_for_event(
+    event: &MediaEvent,
+    joined_room_id: Option<&str>,
+    joined_member_id: Option<&str>,
+) -> Option<ServerSignal> {
+    match event {
+        MediaEvent::InboundAudioTrack { room_id, member_id }
+            if joined_room_id == Some(room_id.as_str())
+                && joined_member_id.is_some()
+                && joined_member_id != Some(member_id.as_str()) =>
+        {
+            Some(ServerSignal::RenegotiationNeeded {
+                member_id: member_id.clone(),
+            })
+        }
+        _ => None,
+    }
 }
 
 async fn send_not_joined(
@@ -516,8 +562,14 @@ async fn send_json(
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientSignal, SIGNAL_QUEUE_CAPACITY, ServerSignal, SignalHub};
-    use crate::{Error, media::IceCandidate};
+    use super::{
+        ClientSignal, SIGNAL_QUEUE_CAPACITY, ServerSignal, SignalHub,
+        renegotiation_signal_for_event,
+    };
+    use crate::{
+        Error,
+        media::{IceCandidate, MediaEvent},
+    };
     use tokio::sync::mpsc::error::TryRecvError;
 
     fn test_candidate(value: &str) -> IceCandidate {
@@ -601,6 +653,37 @@ mod tests {
         assert_eq!(json["candidate"]["sdpMid"], "0");
         assert_eq!(json["candidate"]["sdpMLineIndex"], 0);
         assert_eq!(json["candidate"]["usernameFragment"], "ufrag");
+    }
+
+    #[test]
+    fn 服务端_renegotiation_needed_包含发布者成员_id() {
+        let json = serde_json::to_value(ServerSignal::RenegotiationNeeded {
+            member_id: "publisher-1".to_string(),
+        })
+        .expect("序列化重新协商信令");
+
+        assert_eq!(json["type"], "renegotiation_needed");
+        assert_eq!(json["member_id"], "publisher-1");
+    }
+
+    #[test]
+    fn 媒体事件只通知同房间的其他成员重新协商() {
+        let event = MediaEvent::InboundAudioTrack {
+            room_id: "room-1".to_string(),
+            member_id: "publisher-1".to_string(),
+        };
+
+        assert!(matches!(
+            renegotiation_signal_for_event(&event, Some("room-1"), Some("listener-1")),
+            Some(ServerSignal::RenegotiationNeeded { member_id }) if member_id == "publisher-1"
+        ));
+        assert!(
+            renegotiation_signal_for_event(&event, Some("room-1"), Some("publisher-1")).is_none()
+        );
+        assert!(
+            renegotiation_signal_for_event(&event, Some("room-2"), Some("listener-1")).is_none()
+        );
+        assert!(renegotiation_signal_for_event(&event, None, None).is_none());
     }
 
     #[test]

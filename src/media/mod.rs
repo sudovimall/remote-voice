@@ -1,7 +1,7 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt, sync::Arc};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use webrtc::{
     api::{
         API, APIBuilder, interceptor_registry::register_default_interceptors,
@@ -20,11 +20,18 @@ use webrtc::{
 type SessionKey = (String, String);
 type SessionMap = HashMap<SessionKey, MediaSession>;
 const LOCAL_ICE_QUEUE_CAPACITY: usize = 64;
+const MEDIA_EVENT_QUEUE_CAPACITY: usize = 256;
 
 pub struct MediaController {
     api: API,
     // 每个成员只维护一条到后端的 PeerConnection；上行轨道也挂在同一个会话里。
     sessions: Arc<Mutex<SessionMap>>,
+    event_sender: broadcast::Sender<MediaEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaEvent {
+    InboundAudioTrack { room_id: String, member_id: String },
 }
 
 struct MediaSession {
@@ -123,7 +130,12 @@ impl MediaController {
         Ok(Self {
             api,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            event_sender: broadcast::channel(MEDIA_EVENT_QUEUE_CAPACITY).0,
         })
+    }
+
+    pub fn subscribe_events(&self) -> broadcast::Receiver<MediaEvent> {
+        self.event_sender.subscribe()
     }
 
     /// 创建或替换某个成员和后端之间的 PeerConnection。
@@ -164,11 +176,13 @@ impl MediaController {
 
         let sessions = Arc::clone(&self.sessions);
         let session_key = (room_id.to_string(), member_id.to_string());
+        let event_sender = self.event_sender.clone();
         let track_peer_connection = Arc::clone(&peer_connection);
         // 收到上行 TrackRemote 后先登记元数据；RTP 转发会在下一阶段消费这些 track。
         peer_connection.on_track(Box::new(move |track, _, _| {
             let sessions = Arc::clone(&sessions);
             let session_key = session_key.clone();
+            let event_sender = event_sender.clone();
             let track_peer_connection = Arc::clone(&track_peer_connection);
 
             Box::pin(async move {
@@ -189,10 +203,14 @@ impl MediaController {
                     tokio::spawn(read_inbound_rtp(
                         Arc::clone(&track),
                         sessions_for_reader,
-                        session_key,
+                        session_key.clone(),
                         track_peer_connection,
                         track_id,
                     ));
+                    let _ = event_sender.send(MediaEvent::InboundAudioTrack {
+                        room_id: session_key.0,
+                        member_id: session_key.1,
+                    });
                 }
             })
         }));
