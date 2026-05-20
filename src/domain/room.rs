@@ -227,6 +227,7 @@ fn new_room_id_seed() -> u64 {
 
 fn new_member_id() -> String {
     let mut rng = rand::rng();
+    // member_id 会作为当前 MVP 的临时连接凭据，不能再使用 m1/m2 这类可猜序列。
     let suffix: String = (&mut rng)
         .sample_iter(Alphanumeric)
         .take(22)

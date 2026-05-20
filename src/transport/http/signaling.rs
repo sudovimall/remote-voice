@@ -89,6 +89,7 @@ pub enum ServerSignal {
 
 #[derive(Debug)]
 pub struct SignalHub {
+    // 这里只保存房间事件通道，不承载媒体包，也不再做成员间 WebRTC 信令转发。
     rooms: RwLock<RoomSignalSenders>,
 }
 
@@ -182,6 +183,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     let mut joined_room_id: Option<String> = None;
     let mut joined_member_id: Option<String> = None;
     let mut outbound: Option<mpsc::Receiver<ServerSignal>> = None;
+    let mut local_ice_candidates: Option<mpsc::Receiver<String>> = None;
 
     loop {
         tokio::select! {
@@ -197,6 +199,8 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                     continue;
                 };
 
+                // `deny_unknown_fields` 让旧的成员间 P2P 信令字段（例如 target_member_id）
+                // 直接被拒绝，避免客户端绕过后端媒体层。
                 let signal = match serde_json::from_str::<ClientSignal>(&text) {
                     Ok(signal) => signal,
                     Err(error) => {
@@ -345,13 +349,15 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             continue;
                         };
 
+                        // SFU 模式下 offer 只交给后端媒体层；answer 和本地 ICE 再回给同一个 socket。
                         match state.media.handle_offer(room_id, member_id, sdp).await {
                             Ok(answer) => {
+                                local_ice_candidates = Some(answer.local_ice_candidates);
                                 let _ = send_json(
                                     &mut sender,
                                     &ServerSignal::WebrtcAnswer {
                                         request_id,
-                                        sdp: answer,
+                                        sdp: answer.sdp,
                                     },
                                 )
                                 .await;
@@ -375,6 +381,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             continue;
                         };
 
+                        // 这是浏览器发给后端 PeerConnection 的远端 candidate，不会广播给其他成员。
                         if let Err(error) = state
                             .media
                             .add_ice_candidate(room_id, member_id, candidate)
@@ -396,6 +403,22 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                 };
 
                 if send_json(&mut sender, &signal).await.is_err() {
+                    break;
+                }
+            }
+            candidate = async {
+                match local_ice_candidates.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => pending().await,
+                }
+            }, if local_ice_candidates.is_some() => {
+                let Some(candidate) = candidate else {
+                    local_ice_candidates = None;
+                    continue;
+                };
+
+                // 服务端本地 candidate 只发给当前协商的浏览器。
+                if send_json(&mut sender, &ServerSignal::IceCandidate { candidate }).await.is_err() {
                     break;
                 }
             }

@@ -210,6 +210,14 @@ async fn websocket_webrtc_offer_由后端媒体层处理而不是转发给成员
             .contains("m=audio")
     );
 
+    let server_candidate = read_until_type(&mut member_a_ws, "ice_candidate").await;
+    assert!(
+        server_candidate["candidate"]
+            .as_str()
+            .expect("服务端 candidate 是字符串")
+            .starts_with("candidate:")
+    );
+
     let forwarded_message = timeout(Duration::from_millis(200), member_b_ws.next()).await;
     assert!(
         forwarded_message.is_err(),
