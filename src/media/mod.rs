@@ -13,15 +13,49 @@ use webrtc::{
         RTCPeerConnection, configuration::RTCConfiguration,
         sdp::session_description::RTCSessionDescription,
     },
+    rtp_transceiver::rtp_codec::RTPCodecType,
+    track::track_remote::TrackRemote,
 };
 
 type SessionKey = (String, String);
+type SessionMap = HashMap<SessionKey, MediaSession>;
 const LOCAL_ICE_QUEUE_CAPACITY: usize = 64;
 
 pub struct MediaController {
     api: API,
-    // 每个成员只维护一条到后端的 PeerConnection；后续 SFU 转发会在这个会话上接收上行轨道。
-    peer_connections: Mutex<HashMap<SessionKey, Arc<RTCPeerConnection>>>,
+    // 每个成员只维护一条到后端的 PeerConnection；上行轨道也挂在同一个会话里。
+    sessions: Arc<Mutex<SessionMap>>,
+}
+
+struct MediaSession {
+    peer_connection: Arc<RTCPeerConnection>,
+    inbound_tracks: HashMap<usize, InboundTrack>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundTrack {
+    id: String,
+    stream_id: String,
+    ssrc: u32,
+    mime_type: String,
+    packet_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaSessionSnapshot {
+    pub inbound_track_count: usize,
+    pub audio_track_count: usize,
+    pub inbound_packet_count: u64,
+    pub tracks: Vec<InboundTrackSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundTrackSnapshot {
+    pub id: String,
+    pub stream_id: String,
+    pub ssrc: u32,
+    pub mime_type: String,
+    pub packet_count: u64,
 }
 
 #[derive(Debug)]
@@ -88,7 +122,7 @@ impl MediaController {
 
         Ok(Self {
             api,
-            peer_connections: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -109,6 +143,7 @@ impl MediaController {
             .new_peer_connection(RTCConfiguration::default())
             .await
             .map_err(|err| Error::Internal(format!("创建 PeerConnection 失败: {err}")))?;
+        let peer_connection = Arc::new(peer_connection);
         let (local_ice_sender, local_ice_candidates) =
             mpsc::channel::<IceCandidate>(LOCAL_ICE_QUEUE_CAPACITY);
 
@@ -127,28 +162,84 @@ impl MediaController {
             })
         }));
 
-        peer_connection
-            .set_remote_description(offer)
-            .await
-            .map_err(|err| Error::Internal(format!("设置 remote description 失败: {err}")))?;
-        let answer = peer_connection
-            .create_answer(None)
-            .await
-            .map_err(|err| Error::Internal(format!("创建 SDP answer 失败: {err}")))?;
-        peer_connection
-            .set_local_description(answer.clone())
-            .await
-            .map_err(|err| Error::Internal(format!("设置 local description 失败: {err}")))?;
-        let peer_connection = Arc::new(peer_connection);
+        let sessions = Arc::clone(&self.sessions);
+        let session_key = (room_id.to_string(), member_id.to_string());
+        let track_peer_connection = Arc::clone(&peer_connection);
+        // 收到上行 TrackRemote 后先登记元数据；RTP 转发会在下一阶段消费这些 track。
+        peer_connection.on_track(Box::new(move |track, _, _| {
+            let sessions = Arc::clone(&sessions);
+            let session_key = session_key.clone();
+            let track_peer_connection = Arc::clone(&track_peer_connection);
+
+            Box::pin(async move {
+                if track.kind() != RTPCodecType::Audio {
+                    return;
+                }
+
+                let inbound_track = InboundTrack::from_remote_track(&track);
+                let sessions_for_reader = Arc::clone(&sessions);
+                let mut session_map = sessions.lock().await;
+                let Some(session) = session_map.get_mut(&session_key) else {
+                    return;
+                };
+
+                if Arc::ptr_eq(&session.peer_connection, &track_peer_connection) {
+                    let track_id = track.tid();
+                    session.inbound_tracks.insert(track_id, inbound_track);
+                    tokio::spawn(read_inbound_rtp(
+                        Arc::clone(&track),
+                        sessions_for_reader,
+                        session_key,
+                        track_peer_connection,
+                        track_id,
+                    ));
+                }
+            })
+        }));
 
         let key = (room_id.to_string(), member_id.to_string());
         let previous = {
-            let mut peer_connections = self.peer_connections.lock().await;
-            peer_connections.insert(key, Arc::clone(&peer_connection))
+            let mut sessions = self.sessions.lock().await;
+            sessions.insert(
+                key.clone(),
+                MediaSession {
+                    peer_connection: Arc::clone(&peer_connection),
+                    inbound_tracks: HashMap::new(),
+                },
+            )
         };
+
+        let answer = match create_answer(&peer_connection, offer).await {
+            Ok(answer) => answer,
+            Err(error) => {
+                let failed_session = {
+                    let mut sessions = self.sessions.lock().await;
+                    match sessions.get(&key) {
+                        Some(session)
+                            if Arc::ptr_eq(&session.peer_connection, &peer_connection) =>
+                        {
+                            sessions.remove(&key)
+                        }
+                        _ => None,
+                    }
+                };
+
+                if let Some(failed_session) = failed_session {
+                    let _ = failed_session.peer_connection.close().await;
+                }
+
+                if let Some(previous) = previous {
+                    let mut sessions = self.sessions.lock().await;
+                    sessions.insert(key, previous);
+                }
+
+                return Err(error);
+            }
+        };
+
         if let Some(previous) = previous {
             // 新连接已经保存成功，旧连接关闭失败不应让本次 answer 回滚。
-            let _ = previous.close().await;
+            let _ = previous.peer_connection.close().await;
         }
 
         Ok(MediaAnswer {
@@ -168,8 +259,10 @@ impl MediaController {
     ) -> Result<()> {
         let key = (room_id.to_string(), member_id.to_string());
         let peer_connection = {
-            let peer_connections = self.peer_connections.lock().await;
-            peer_connections.get(&key).cloned()
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(&key)
+                .map(|session| Arc::clone(&session.peer_connection))
         }
         .ok_or_else(|| Error::InvalidMessage("媒体会话不存在，请先发送 offer".to_string()))?;
 
@@ -182,19 +275,116 @@ impl MediaController {
     /// 关闭成员的媒体会话。房间状态清理由领域层负责。
     pub async fn close_member(&self, room_id: &str, member_id: &str) -> Result<()> {
         let key = (room_id.to_string(), member_id.to_string());
-        let peer_connection = {
-            let mut peer_connections = self.peer_connections.lock().await;
-            peer_connections.remove(&key)
+        let session = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(&key)
         };
 
-        if let Some(peer_connection) = peer_connection {
-            peer_connection
+        if let Some(session) = session {
+            session
+                .peer_connection
                 .close()
                 .await
                 .map_err(|err| Error::Internal(format!("关闭 PeerConnection 失败: {err}")))?;
         }
 
         Ok(())
+    }
+
+    /// 返回当前媒体会话的只读快照，主要供状态检查和测试使用。
+    pub async fn session_snapshot(
+        &self,
+        room_id: &str,
+        member_id: &str,
+    ) -> Option<MediaSessionSnapshot> {
+        let key = (room_id.to_string(), member_id.to_string());
+        let sessions = self.sessions.lock().await;
+        sessions.get(&key).map(MediaSession::snapshot)
+    }
+}
+
+async fn create_answer(
+    peer_connection: &RTCPeerConnection,
+    offer: RTCSessionDescription,
+) -> Result<RTCSessionDescription> {
+    peer_connection
+        .set_remote_description(offer)
+        .await
+        .map_err(|err| Error::Internal(format!("设置 remote description 失败: {err}")))?;
+    let answer = peer_connection
+        .create_answer(None)
+        .await
+        .map_err(|err| Error::Internal(format!("创建 SDP answer 失败: {err}")))?;
+    peer_connection
+        .set_local_description(answer.clone())
+        .await
+        .map_err(|err| Error::Internal(format!("设置 local description 失败: {err}")))?;
+    Ok(answer)
+}
+
+impl MediaSession {
+    fn snapshot(&self) -> MediaSessionSnapshot {
+        let tracks = self
+            .inbound_tracks
+            .values()
+            .map(InboundTrack::snapshot)
+            .collect::<Vec<_>>();
+
+        MediaSessionSnapshot {
+            inbound_track_count: tracks.len(),
+            audio_track_count: tracks.len(),
+            inbound_packet_count: tracks.iter().map(|track| track.packet_count).sum(),
+            tracks,
+        }
+    }
+}
+
+impl InboundTrack {
+    fn from_remote_track(track: &TrackRemote) -> Self {
+        Self {
+            id: track.id(),
+            stream_id: track.stream_id(),
+            ssrc: track.ssrc(),
+            mime_type: track.codec().capability.mime_type,
+            packet_count: 0,
+        }
+    }
+
+    fn snapshot(&self) -> InboundTrackSnapshot {
+        InboundTrackSnapshot {
+            id: self.id.clone(),
+            stream_id: self.stream_id.clone(),
+            ssrc: self.ssrc,
+            mime_type: self.mime_type.clone(),
+            packet_count: self.packet_count,
+        }
+    }
+}
+
+async fn read_inbound_rtp(
+    track: Arc<TrackRemote>,
+    sessions: Arc<Mutex<SessionMap>>,
+    session_key: SessionKey,
+    peer_connection: Arc<RTCPeerConnection>,
+    track_id: usize,
+) {
+    loop {
+        if track.read_rtp().await.is_err() {
+            break;
+        }
+
+        let mut sessions = sessions.lock().await;
+        let Some(session) = sessions.get_mut(&session_key) else {
+            break;
+        };
+
+        if !Arc::ptr_eq(&session.peer_connection, &peer_connection) {
+            break;
+        }
+
+        if let Some(track) = session.inbound_tracks.get_mut(&track_id) {
+            track.packet_count = track.packet_count.saturating_add(1);
+        }
     }
 }
 
@@ -223,6 +413,34 @@ mod tests {
             .expect("根据 offer 生成 answer");
 
         assert!(answer.sdp.contains("m=audio"));
+    }
+
+    #[tokio::test]
+    async fn offer_建立媒体会话_关闭成员后清理会话() {
+        let media = MediaController::new().expect("创建媒体控制器");
+        let offer_sdp = create_audio_offer().await;
+
+        assert!(media.session_snapshot("room-1", "member-1").await.is_none());
+
+        media
+            .handle_offer("room-1", "member-1", offer_sdp)
+            .await
+            .expect("根据 offer 建立媒体会话");
+
+        let snapshot = media
+            .session_snapshot("room-1", "member-1")
+            .await
+            .expect("offer 后存在媒体会话");
+        assert_eq!(snapshot.inbound_track_count, 0);
+        assert_eq!(snapshot.audio_track_count, 0);
+        assert_eq!(snapshot.inbound_packet_count, 0);
+
+        media
+            .close_member("room-1", "member-1")
+            .await
+            .expect("关闭媒体会话");
+
+        assert!(media.session_snapshot("room-1", "member-1").await.is_none());
     }
 
     #[tokio::test]
