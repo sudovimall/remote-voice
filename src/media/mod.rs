@@ -14,7 +14,10 @@ use webrtc::{
         sdp::session_description::RTCSessionDescription,
     },
     rtp_transceiver::rtp_codec::RTPCodecType,
-    track::track_remote::TrackRemote,
+    track::{
+        track_local::{TrackLocal, track_local_static_rtp::TrackLocalStaticRTP},
+        track_remote::TrackRemote,
+    },
 };
 
 type SessionKey = (String, String);
@@ -37,15 +40,24 @@ pub enum MediaEvent {
 struct MediaSession {
     peer_connection: Arc<RTCPeerConnection>,
     inbound_tracks: HashMap<usize, InboundTrack>,
+    outbound_tracks: HashMap<String, OutboundTrack>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct InboundTrack {
     id: String,
     stream_id: String,
     ssrc: u32,
     mime_type: String,
     packet_count: u64,
+    fanout_track: Arc<TrackLocalStaticRTP>,
+}
+
+#[derive(Debug, Clone)]
+struct OutboundTrack {
+    publisher_member_id: String,
+    track_id: String,
+    fanout_track: Arc<TrackLocalStaticRTP>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +65,9 @@ pub struct MediaSessionSnapshot {
     pub inbound_track_count: usize,
     pub audio_track_count: usize,
     pub inbound_packet_count: u64,
+    pub outbound_track_count: usize,
     pub tracks: Vec<InboundTrackSnapshot>,
+    pub outbound_tracks: Vec<OutboundTrackSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +77,12 @@ pub struct InboundTrackSnapshot {
     pub ssrc: u32,
     pub mime_type: String,
     pub packet_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundTrackSnapshot {
+    pub publisher_member_id: String,
+    pub track_id: String,
 }
 
 #[derive(Debug)]
@@ -190,23 +210,45 @@ impl MediaController {
                     return;
                 }
 
-                let inbound_track = InboundTrack::from_remote_track(&track);
+                let inbound_track =
+                    InboundTrack::from_remote_track(&track, &session_key.0, &session_key.1);
+                let fanout_track = Arc::clone(&inbound_track.fanout_track);
+                let outbound_track_id = format!("{}:{}", session_key.1, inbound_track.id);
                 let sessions_for_reader = Arc::clone(&sessions);
-                let mut session_map = sessions.lock().await;
-                let Some(session) = session_map.get_mut(&session_key) else {
-                    return;
+                let track_id = track.tid();
+                let should_attach = {
+                    let mut session_map = sessions.lock().await;
+                    let Some(session) = session_map.get_mut(&session_key) else {
+                        return;
+                    };
+
+                    if !Arc::ptr_eq(&session.peer_connection, &track_peer_connection) {
+                        return;
+                    }
+
+                    session.inbound_tracks.insert(track_id, inbound_track);
+                    true
                 };
 
-                if Arc::ptr_eq(&session.peer_connection, &track_peer_connection) {
-                    let track_id = track.tid();
-                    session.inbound_tracks.insert(track_id, inbound_track);
+                if should_attach {
                     tokio::spawn(read_inbound_rtp(
                         Arc::clone(&track),
+                        Arc::clone(&fanout_track),
                         sessions_for_reader,
                         session_key.clone(),
-                        track_peer_connection,
+                        Arc::clone(&track_peer_connection),
                         track_id,
                     ));
+
+                    let _ = attach_audio_to_subscribers(
+                        Arc::clone(&sessions),
+                        &session_key.0,
+                        &session_key.1,
+                        outbound_track_id,
+                        fanout_track,
+                    )
+                    .await;
+
                     let _ = event_sender.send(MediaEvent::InboundAudioTrack {
                         room_id: session_key.0,
                         member_id: session_key.1,
@@ -223,9 +265,25 @@ impl MediaController {
                 MediaSession {
                     peer_connection: Arc::clone(&peer_connection),
                     inbound_tracks: HashMap::new(),
+                    outbound_tracks: HashMap::new(),
                 },
             )
         };
+
+        if let Some(previous) = &previous {
+            for outbound_track in previous.outbound_tracks.values() {
+                peer_connection
+                    .add_track(Arc::clone(&outbound_track.fanout_track)
+                        as Arc<dyn TrackLocal + Send + Sync>)
+                    .await
+                    .map_err(|err| Error::Internal(format!("恢复下行音频 track 失败: {err}")))?;
+            }
+
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(&key) {
+                session.outbound_tracks = previous.outbound_tracks.clone();
+            }
+        }
 
         let answer = match create_answer(&peer_connection, offer).await {
             Ok(answer) => answer,
@@ -319,6 +377,34 @@ impl MediaController {
         let sessions = self.sessions.lock().await;
         sessions.get(&key).map(MediaSession::snapshot)
     }
+
+    #[cfg(test)]
+    async fn attach_audio_to_subscribers_for_test(
+        &self,
+        room_id: &str,
+        publisher_member_id: &str,
+    ) -> Result<()> {
+        let track_id = format!("{publisher_member_id}:test-audio");
+        let fanout_track = Arc::new(TrackLocalStaticRTP::new(
+            webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability {
+                mime_type: "audio/opus".to_string(),
+                clock_rate: 48000,
+                channels: 2,
+                ..Default::default()
+            },
+            track_id.clone(),
+            format!("room-{room_id}"),
+        ));
+
+        attach_audio_to_subscribers(
+            Arc::clone(&self.sessions),
+            room_id,
+            publisher_member_id,
+            track_id,
+            fanout_track,
+        )
+        .await
+    }
 }
 
 async fn create_answer(
@@ -347,24 +433,45 @@ impl MediaSession {
             .values()
             .map(InboundTrack::snapshot)
             .collect::<Vec<_>>();
+        let outbound_tracks = self
+            .outbound_tracks
+            .values()
+            .map(OutboundTrack::snapshot)
+            .collect::<Vec<_>>();
 
         MediaSessionSnapshot {
             inbound_track_count: tracks.len(),
             audio_track_count: tracks.len(),
             inbound_packet_count: tracks.iter().map(|track| track.packet_count).sum(),
+            outbound_track_count: outbound_tracks.len(),
             tracks,
+            outbound_tracks,
+        }
+    }
+}
+
+impl OutboundTrack {
+    fn snapshot(&self) -> OutboundTrackSnapshot {
+        OutboundTrackSnapshot {
+            publisher_member_id: self.publisher_member_id.clone(),
+            track_id: self.track_id.clone(),
         }
     }
 }
 
 impl InboundTrack {
-    fn from_remote_track(track: &TrackRemote) -> Self {
+    fn from_remote_track(track: &TrackRemote, room_id: &str, member_id: &str) -> Self {
         Self {
             id: track.id(),
             stream_id: track.stream_id(),
             ssrc: track.ssrc(),
             mime_type: track.codec().capability.mime_type,
             packet_count: 0,
+            fanout_track: Arc::new(TrackLocalStaticRTP::new(
+                track.codec().capability,
+                format!("{member_id}:{}", track.id()),
+                format!("room-{room_id}"),
+            )),
         }
     }
 
@@ -381,15 +488,19 @@ impl InboundTrack {
 
 async fn read_inbound_rtp(
     track: Arc<TrackRemote>,
+    fanout_track: Arc<TrackLocalStaticRTP>,
     sessions: Arc<Mutex<SessionMap>>,
     session_key: SessionKey,
     peer_connection: Arc<RTCPeerConnection>,
     track_id: usize,
 ) {
     loop {
-        if track.read_rtp().await.is_err() {
-            break;
-        }
+        let packet = match track.read_rtp().await {
+            Ok((packet, _)) => packet,
+            Err(_) => break,
+        };
+
+        let _ = fanout_track.write_rtp_with_extensions(&packet, &[]).await;
 
         let mut sessions = sessions.lock().await;
         let Some(session) = sessions.get_mut(&session_key) else {
@@ -404,6 +515,52 @@ async fn read_inbound_rtp(
             track.packet_count = track.packet_count.saturating_add(1);
         }
     }
+}
+
+async fn attach_audio_to_subscribers(
+    sessions: Arc<Mutex<SessionMap>>,
+    room_id: &str,
+    publisher_member_id: &str,
+    track_id: String,
+    fanout_track: Arc<TrackLocalStaticRTP>,
+) -> Result<()> {
+    let subscribers = {
+        let sessions = sessions.lock().await;
+        sessions
+            .iter()
+            .filter_map(|((session_room_id, member_id), session)| {
+                if session_room_id == room_id && member_id != publisher_member_id {
+                    Some((
+                        (session_room_id.clone(), member_id.clone()),
+                        Arc::clone(&session.peer_connection),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (subscriber_key, peer_connection) in subscribers {
+        peer_connection
+            .add_track(Arc::clone(&fanout_track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .map_err(|err| Error::Internal(format!("添加下行音频 track 失败: {err}")))?;
+
+        let mut sessions = sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&subscriber_key) {
+            session.outbound_tracks.insert(
+                track_id.clone(),
+                OutboundTrack {
+                    publisher_member_id: publisher_member_id.to_string(),
+                    track_id: track_id.clone(),
+                    fanout_track: Arc::clone(&fanout_track),
+                },
+            );
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -452,6 +609,7 @@ mod tests {
         assert_eq!(snapshot.inbound_track_count, 0);
         assert_eq!(snapshot.audio_track_count, 0);
         assert_eq!(snapshot.inbound_packet_count, 0);
+        assert_eq!(snapshot.outbound_track_count, 0);
 
         media
             .close_member("room-1", "member-1")
@@ -459,6 +617,87 @@ mod tests {
             .expect("关闭媒体会话");
 
         assert!(media.session_snapshot("room-1", "member-1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn 发布者音频会为同房间其他会话挂下行_track() {
+        let media = MediaController::new().expect("创建媒体控制器");
+
+        media
+            .handle_offer("room-1", "publisher-1", create_audio_offer().await)
+            .await
+            .expect("建立发布者会话");
+        media
+            .handle_offer("room-1", "listener-1", create_audio_offer().await)
+            .await
+            .expect("建立听众会话");
+        media
+            .handle_offer("room-2", "listener-2", create_audio_offer().await)
+            .await
+            .expect("建立其他房间会话");
+
+        media
+            .attach_audio_to_subscribers_for_test("room-1", "publisher-1")
+            .await
+            .expect("为同房间听众挂下行 track");
+
+        assert_eq!(
+            media
+                .session_snapshot("room-1", "publisher-1")
+                .await
+                .expect("发布者会话存在")
+                .outbound_track_count,
+            0
+        );
+        let listener_snapshot = media
+            .session_snapshot("room-1", "listener-1")
+            .await
+            .expect("听众会话存在");
+        assert_eq!(listener_snapshot.outbound_track_count, 1);
+        assert_eq!(
+            listener_snapshot.outbound_tracks[0].publisher_member_id,
+            "publisher-1"
+        );
+        assert_eq!(
+            media
+                .session_snapshot("room-2", "listener-2")
+                .await
+                .expect("其他房间会话存在")
+                .outbound_track_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn 听众重新_offer_后保留已挂载的下行_track() {
+        let media = MediaController::new().expect("创建媒体控制器");
+
+        media
+            .handle_offer("room-1", "publisher-1", create_audio_offer().await)
+            .await
+            .expect("建立发布者会话");
+        media
+            .handle_offer("room-1", "listener-1", create_audio_offer().await)
+            .await
+            .expect("建立听众会话");
+        media
+            .attach_audio_to_subscribers_for_test("room-1", "publisher-1")
+            .await
+            .expect("为听众挂下行 track");
+
+        media
+            .handle_offer("room-1", "listener-1", create_audio_offer().await)
+            .await
+            .expect("听众重新 offer");
+
+        assert_eq!(
+            media
+                .session_snapshot("room-1", "listener-1")
+                .await
+                .expect("听众会话存在")
+                .outbound_track_count,
+            1
+        );
     }
 
     #[tokio::test]
