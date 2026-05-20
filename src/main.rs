@@ -1,16 +1,11 @@
-pub mod config;
-
 use tracing_subscriber::EnvFilter;
-use crate::config::settings::init_config;
-
-type R<T> = anyhow::Result<T>;
+use voice::{Result, app, config::settings::init_config};
 
 #[tokio::main]
-async fn main() -> R<()> {
+async fn main() -> Result<()> {
     init_log();
     let config = init_config()?;
-
-    Ok(())
+    app::serve(config).await
 }
 
 /// log
