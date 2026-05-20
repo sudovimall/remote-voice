@@ -17,6 +17,8 @@ pub enum Error {
     NotRoomOwner,
     #[error("成员不存在")]
     MemberNotFound,
+    #[error("媒体层尚未就绪")]
+    MediaNotReady,
     #[error("消息格式无效: {0}")]
     InvalidMessage(String),
     #[error("配置解析失败: {0}")]
@@ -39,6 +41,7 @@ impl Error {
             Error::RoomNotFound | Error::MemberNotFound => StatusCode::NOT_FOUND,
             Error::RoomFull => StatusCode::CONFLICT,
             Error::NotRoomOwner => StatusCode::FORBIDDEN,
+            Error::MediaNotReady => StatusCode::SERVICE_UNAVAILABLE,
             Error::InvalidMessage(_) | Error::Config(_) => StatusCode::BAD_REQUEST,
             Error::Io(_) | Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -50,6 +53,7 @@ impl Error {
             Error::RoomFull => "room_full",
             Error::NotRoomOwner => "not_room_owner",
             Error::MemberNotFound => "member_not_found",
+            Error::MediaNotReady => "media_not_ready",
             Error::InvalidMessage(_) => "invalid_message",
             Error::Config(_) => "config_error",
             Error::Io(_) | Error::Internal(_) => "internal_error",

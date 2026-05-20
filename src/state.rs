@@ -1,5 +1,6 @@
 use crate::{
-    config::settings::Settings, domain::room::RoomStore, transport::http::signaling::SignalHub,
+    config::settings::Settings, domain::room::RoomStore, media::MediaController,
+    transport::http::signaling::SignalHub,
 };
 use std::sync::Arc;
 
@@ -7,6 +8,7 @@ use std::sync::Arc;
 pub struct AppState {
     pub rooms: Arc<RoomStore>,
     pub signals: Arc<SignalHub>,
+    pub media: Arc<MediaController>,
 }
 
 impl AppState {
@@ -14,6 +16,7 @@ impl AppState {
         Self {
             rooms: Arc::new(RoomStore::new(max_members)),
             signals: Arc::new(SignalHub::new()),
+            media: Arc::new(MediaController::new()),
         }
     }
 

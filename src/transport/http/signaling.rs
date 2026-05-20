@@ -9,14 +9,14 @@ use axum::{
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, future::pending, sync::RwLock};
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::mpsc;
 
 const SIGNAL_QUEUE_CAPACITY: usize = 256;
 
 type RoomSignalSenders = HashMap<String, HashMap<String, mpsc::Sender<ServerSignal>>>;
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientSignal {
     JoinRoom {
         request_id: String,
@@ -38,17 +38,14 @@ pub enum ClientSignal {
     },
     WebrtcOffer {
         request_id: Option<String>,
-        target_member_id: String,
         sdp: String,
     },
     WebrtcAnswer {
         request_id: Option<String>,
-        target_member_id: String,
         sdp: String,
     },
     IceCandidate {
         request_id: Option<String>,
-        target_member_id: String,
         candidate: String,
     },
 }
@@ -76,16 +73,10 @@ pub enum ServerSignal {
         room: Room,
         member_id: String,
     },
-    WebrtcOffer {
-        from_member_id: String,
-        sdp: String,
-    },
     WebrtcAnswer {
-        from_member_id: String,
         sdp: String,
     },
     IceCandidate {
-        from_member_id: String,
         candidate: String,
     },
     Error {
@@ -169,40 +160,6 @@ impl SignalHub {
         }
 
         Ok(())
-    }
-
-    pub fn send_to(
-        &self,
-        room_id: &str,
-        target_member_id: &str,
-        signal: ServerSignal,
-    ) -> Result<()> {
-        let mut rooms = self.write_rooms()?;
-        let Some(members) = rooms.get_mut(room_id) else {
-            return Err(Error::MemberNotFound);
-        };
-
-        let Some(sender) = members.get(target_member_id) else {
-            return Err(Error::MemberNotFound);
-        };
-
-        match sender.try_send(signal) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Closed(_)) => {
-                members.remove(target_member_id);
-                if members.is_empty() {
-                    rooms.remove(room_id);
-                }
-                Err(Error::MemberNotFound)
-            }
-            Err(TrySendError::Full(_)) => {
-                members.remove(target_member_id);
-                if members.is_empty() {
-                    rooms.remove(room_id);
-                }
-                Err(Error::Internal("目标信令队列已满".to_string()))
-            }
-        }
     }
 
     fn write_rooms(&self) -> Result<std::sync::RwLockWriteGuard<'_, RoomSignalSenders>> {
@@ -381,45 +338,44 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             }
                         }
                     }
-                    ClientSignal::WebrtcOffer { request_id, target_member_id, sdp } => {
-                        let Some((room_id, from_member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                    ClientSignal::WebrtcOffer { request_id, sdp } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
                             let _ = send_not_joined(&mut sender, request_id).await;
                             continue;
                         };
 
-                        let signal = ServerSignal::WebrtcOffer {
-                            from_member_id: from_member_id.to_string(),
-                            sdp,
-                        };
-                        if let Err(error) = state.signals.send_to(room_id, &target_member_id, signal) {
-                            let _ = send_error(&mut sender, request_id, error).await;
+                        match state.media.handle_offer(room_id, member_id, sdp).await {
+                            Ok(answer) => {
+                                let _ = send_json(
+                                    &mut sender,
+                                    &ServerSignal::WebrtcAnswer { sdp: answer },
+                                )
+                                .await;
+                            }
+                            Err(error) => {
+                                let _ = send_error(&mut sender, request_id, error).await;
+                            }
                         }
                     }
-                    ClientSignal::WebrtcAnswer { request_id, target_member_id, sdp } => {
-                        let Some((room_id, from_member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
-                            let _ = send_not_joined(&mut sender, request_id).await;
-                            continue;
-                        };
-
-                        let signal = ServerSignal::WebrtcAnswer {
-                            from_member_id: from_member_id.to_string(),
-                            sdp,
-                        };
-                        if let Err(error) = state.signals.send_to(room_id, &target_member_id, signal) {
-                            let _ = send_error(&mut sender, request_id, error).await;
-                        }
+                    ClientSignal::WebrtcAnswer { request_id, sdp: _ } => {
+                        let _ = send_error(
+                            &mut sender,
+                            request_id,
+                            Error::InvalidMessage("服务端未发起 offer，不能接收 webrtc_answer".to_string()),
+                        )
+                        .await;
                     }
-                    ClientSignal::IceCandidate { request_id, target_member_id, candidate } => {
-                        let Some((room_id, from_member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                    ClientSignal::IceCandidate { request_id, candidate } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
                             let _ = send_not_joined(&mut sender, request_id).await;
                             continue;
                         };
 
-                        let signal = ServerSignal::IceCandidate {
-                            from_member_id: from_member_id.to_string(),
-                            candidate,
-                        };
-                        if let Err(error) = state.signals.send_to(room_id, &target_member_id, signal) {
+                        if let Err(error) = state
+                            .media
+                            .add_ice_candidate(room_id, member_id, candidate)
+                            .await
+                        {
                             let _ = send_error(&mut sender, request_id, error).await;
                         }
                     }
@@ -443,6 +399,8 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     }
 
     if let (Some(room_id), Some(member_id)) = (joined_room_id, joined_member_id) {
+        let _ = state.media.close_member(&room_id, &member_id).await;
+
         if let Ok(room) = state.rooms.leave_room(&room_id, &member_id) {
             let _ = state.signals.unregister(&room_id, &member_id);
 
@@ -567,73 +525,74 @@ mod tests {
     }
 
     #[test]
-    fn 信令中心_direct_send_只发送给目标成员() {
+    fn 信令中心_broadcast_不会发送给被排除成员() {
         let hub = SignalHub::new();
         let mut member_a = hub.register("room-1", "a").expect("注册成员 A");
         let mut member_b = hub.register("room-1", "b").expect("注册成员 B");
         let mut member_c = hub.register("room-1", "c").expect("注册成员 C");
 
-        hub.send_to(
+        hub.broadcast(
             "room-1",
-            "b",
-            ServerSignal::WebrtcOffer {
-                from_member_id: "a".to_string(),
-                sdp: "offer-sdp".to_string(),
+            ServerSignal::RoomClosed {
+                room_id: "room-1".to_string(),
             },
+            Some("a"),
         )
-        .expect("定向发送给成员 B");
+        .expect("广播房间关闭");
 
         assert!(matches!(member_a.try_recv(), Err(TryRecvError::Empty)));
-        assert!(matches!(member_c.try_recv(), Err(TryRecvError::Empty)));
         assert!(matches!(
             member_b.try_recv(),
-            Ok(ServerSignal::WebrtcOffer { from_member_id, sdp })
-                if from_member_id == "a" && sdp == "offer-sdp"
+            Ok(ServerSignal::RoomClosed { room_id }) if room_id == "room-1"
+        ));
+        assert!(matches!(
+            member_c.try_recv(),
+            Ok(ServerSignal::RoomClosed { room_id }) if room_id == "room-1"
         ));
     }
 
     #[test]
-    fn 信令中心_direct_send_目标队列满后移除成员() {
+    fn 信令中心_broadcast_目标队列满后移除成员() {
         let hub = SignalHub::new();
         let _member = hub.register("room-1", "target").expect("注册目标成员");
 
         for index in 0..SIGNAL_QUEUE_CAPACITY {
-            hub.send_to(
+            hub.broadcast(
                 "room-1",
-                "target",
                 ServerSignal::IceCandidate {
-                    from_member_id: "source".to_string(),
                     candidate: format!("candidate-{index}"),
                 },
+                None,
             )
             .expect("填满目标队列前发送成功");
         }
 
-        let full_error = hub
-            .send_to(
-                "room-1",
-                "target",
-                ServerSignal::IceCandidate {
-                    from_member_id: "source".to_string(),
-                    candidate: "overflow".to_string(),
-                },
-            )
-            .expect_err("目标队列满后发送失败");
+        hub.broadcast(
+            "room-1",
+            ServerSignal::IceCandidate {
+                candidate: "overflow".to_string(),
+            },
+            None,
+        )
+        .expect("广播时会移除队列已满的成员");
 
-        assert!(matches!(full_error, Error::Internal(_)));
+        let mut replacement = hub
+            .register("room-1", "target")
+            .expect("队列失败后成员已从信令中心移除，可以重新注册");
 
-        let removed_error = hub
-            .send_to(
-                "room-1",
-                "target",
-                ServerSignal::IceCandidate {
-                    from_member_id: "source".to_string(),
-                    candidate: "after-remove".to_string(),
-                },
-            )
-            .expect_err("队列失败后成员已从信令中心移除");
+        hub.broadcast(
+            "room-1",
+            ServerSignal::IceCandidate {
+                candidate: "after-remove".to_string(),
+            },
+            None,
+        )
+        .expect("重新注册后可以收到广播");
 
-        assert!(matches!(removed_error, Error::MemberNotFound));
+        assert!(matches!(
+            replacement.try_recv(),
+            Ok(ServerSignal::IceCandidate { candidate }) if candidate == "after-remove"
+        ));
     }
 
     #[test]

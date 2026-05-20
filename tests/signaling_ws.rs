@@ -132,13 +132,13 @@ async fn websocket_加入房间后收到_joined_room() {
 }
 
 #[tokio::test]
-async fn websocket_webrtc_offer_只转发给目标成员() {
+async fn websocket_webrtc_offer_由后端媒体层处理而不是转发给成员() {
     let state = AppState::new(8);
     let created = state.rooms.create_room("房主").expect("创建房间");
     let room_id = created.room.id.clone();
     let ws_url = spawn_app(state).await;
 
-    let (mut member_a_ws, member_a_id) = connect_join(&ws_url, &room_id, "join-a", "成员 A").await;
+    let (mut member_a_ws, _) = connect_join(&ws_url, &room_id, "join-a", "成员 A").await;
     let (mut member_b_ws, member_b_id) = connect_join(&ws_url, &room_id, "join-b", "成员 B").await;
 
     let member_joined = read_until_type(&mut member_a_ws, "member_joined").await;
@@ -149,8 +149,7 @@ async fn websocket_webrtc_offer_只转发给目标成员() {
             json!({
                 "type": "webrtc_offer",
                 "request_id": "offer-1",
-                "target_member_id": member_b_id,
-                "sdp": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n"
+                "sdp": "v=0\r\n"
             })
             .to_string()
             .into(),
@@ -158,15 +157,43 @@ async fn websocket_webrtc_offer_只转发给目标成员() {
         .await
         .expect("发送 webrtc_offer");
 
-    let offer = read_until_type(&mut member_b_ws, "webrtc_offer").await;
-    assert_eq!(offer["from_member_id"], member_a_id);
-    assert_eq!(offer["sdp"], "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n");
+    let error = read_until_type(&mut member_a_ws, "error").await;
+    assert_eq!(error["request_id"], "offer-1");
+    assert_eq!(error["code"], "media_not_ready");
 
-    let sender_message = timeout(Duration::from_millis(200), member_a_ws.next()).await;
+    let forwarded_message = timeout(Duration::from_millis(200), member_b_ws.next()).await;
     assert!(
-        sender_message.is_err(),
-        "发送方不应收到自己的定向 offer: {sender_message:?}"
+        forwarded_message.is_err(),
+        "成员 B 不应收到成员 A 的 webrtc_offer: {forwarded_message:?}"
     );
+}
+
+#[tokio::test]
+async fn websocket_webrtc_offer_携带目标成员字段会被拒绝() {
+    let state = AppState::new(8);
+    let created = state.rooms.create_room("房主").expect("创建房间");
+    let room_id = created.room.id.clone();
+    let ws_url = spawn_app(state).await;
+
+    let (mut member_ws, _) = connect_join(&ws_url, &room_id, "join-a", "成员 A").await;
+
+    member_ws
+        .send(Message::Text(
+            json!({
+                "type": "webrtc_offer",
+                "request_id": "offer-target",
+                "target_member_id": "member-b",
+                "sdp": "v=0\r\n"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送带 target_member_id 的 webrtc_offer");
+
+    let error = read_until_type(&mut member_ws, "error").await;
+    assert_eq!(error["request_id"], "offer-target");
+    assert_eq!(error["code"], "invalid_message");
 }
 
 #[tokio::test]
