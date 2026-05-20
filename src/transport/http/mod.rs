@@ -112,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn 创建房间后可以查询房间() {
-        let app = router(AppState::new(8));
+        let app = router(AppState::new(8).expect("创建应用状态"));
 
         let create_response = app
             .clone()

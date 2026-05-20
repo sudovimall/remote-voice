@@ -4,6 +4,14 @@ use std::time::Duration;
 use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use voice::{app::build_router, state::AppState};
+use webrtc::{
+    api::{
+        APIBuilder, interceptor_registry::register_default_interceptors, media_engine::MediaEngine,
+    },
+    interceptor::registry::Registry,
+    peer_connection::configuration::RTCConfiguration,
+    rtp_transceiver::rtp_codec::RTPCodecType,
+};
 
 type TestWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -103,9 +111,43 @@ async fn read_until_type(ws: &mut TestWebSocket, expected_type: &str) -> Value {
     }
 }
 
+async fn create_audio_offer() -> String {
+    let mut media_engine = MediaEngine::default();
+    media_engine
+        .register_default_codecs()
+        .expect("注册默认 codecs");
+    let registry = register_default_interceptors(Registry::new(), &mut media_engine)
+        .expect("注册默认 interceptors");
+    let api = APIBuilder::new()
+        .with_media_engine(media_engine)
+        .with_interceptor_registry(registry)
+        .build();
+    let peer_connection = api
+        .new_peer_connection(RTCConfiguration::default())
+        .await
+        .expect("创建测试 PeerConnection");
+    peer_connection
+        .add_transceiver_from_kind(RTPCodecType::Audio, None)
+        .await
+        .expect("添加 audio transceiver");
+    let offer = peer_connection
+        .create_offer(None)
+        .await
+        .expect("创建测试 offer");
+    peer_connection
+        .set_local_description(offer.clone())
+        .await
+        .expect("设置测试 local description");
+    peer_connection
+        .close()
+        .await
+        .expect("关闭测试 PeerConnection");
+    offer.sdp
+}
+
 #[tokio::test]
 async fn websocket_加入房间后收到_joined_room() {
-    let state = AppState::new(8);
+    let state = AppState::new(8).expect("创建应用状态");
     let created = state.rooms.create_room("房主").expect("创建房间");
     let ws_url = spawn_app(state).await;
 
@@ -133,7 +175,7 @@ async fn websocket_加入房间后收到_joined_room() {
 
 #[tokio::test]
 async fn websocket_webrtc_offer_由后端媒体层处理而不是转发给成员() {
-    let state = AppState::new(8);
+    let state = AppState::new(8).expect("创建应用状态");
     let created = state.rooms.create_room("房主").expect("创建房间");
     let room_id = created.room.id.clone();
     let ws_url = spawn_app(state).await;
@@ -144,12 +186,14 @@ async fn websocket_webrtc_offer_由后端媒体层处理而不是转发给成员
     let member_joined = read_until_type(&mut member_a_ws, "member_joined").await;
     assert_eq!(member_joined["member_id"], member_b_id);
 
+    let offer_sdp = create_audio_offer().await;
+
     member_a_ws
         .send(Message::Text(
             json!({
                 "type": "webrtc_offer",
                 "request_id": "offer-1",
-                "sdp": "v=0\r\n"
+                "sdp": offer_sdp
             })
             .to_string()
             .into(),
@@ -157,9 +201,14 @@ async fn websocket_webrtc_offer_由后端媒体层处理而不是转发给成员
         .await
         .expect("发送 webrtc_offer");
 
-    let error = read_until_type(&mut member_a_ws, "error").await;
-    assert_eq!(error["request_id"], "offer-1");
-    assert_eq!(error["code"], "media_not_ready");
+    let answer = read_until_type(&mut member_a_ws, "webrtc_answer").await;
+    assert_eq!(answer["request_id"], "offer-1");
+    assert!(
+        answer["sdp"]
+            .as_str()
+            .expect("answer 包含 SDP")
+            .contains("m=audio")
+    );
 
     let forwarded_message = timeout(Duration::from_millis(200), member_b_ws.next()).await;
     assert!(
@@ -170,7 +219,7 @@ async fn websocket_webrtc_offer_由后端媒体层处理而不是转发给成员
 
 #[tokio::test]
 async fn websocket_webrtc_offer_携带目标成员字段会被拒绝() {
-    let state = AppState::new(8);
+    let state = AppState::new(8).expect("创建应用状态");
     let created = state.rooms.create_room("房主").expect("创建房间");
     let room_id = created.room.id.clone();
     let ws_url = spawn_app(state).await;
@@ -198,7 +247,7 @@ async fn websocket_webrtc_offer_携带目标成员字段会被拒绝() {
 
 #[tokio::test]
 async fn websocket_房主用已有成员_id_加入后可以修改成员发言权限() {
-    let state = AppState::new(8);
+    let state = AppState::new(8).expect("创建应用状态");
     let created = state.rooms.create_room("房主").expect("创建房间");
     let room_id = created.room.id.clone();
     let owner_member_id = created.member.id.clone();
@@ -230,7 +279,7 @@ async fn websocket_房主用已有成员_id_加入后可以修改成员发言权
 
 #[tokio::test]
 async fn websocket_重复绑定同一成员_id_返回错误且原连接仍可用() {
-    let state = AppState::new(8);
+    let state = AppState::new(8).expect("创建应用状态");
     let created = state.rooms.create_room("房主").expect("创建房间");
     let room_id = created.room.id.clone();
     let owner_member_id = created.member.id.clone();

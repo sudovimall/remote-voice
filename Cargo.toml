@@ -15,6 +15,7 @@ axum = { version = "0.8", features = ["ws"] }
 thiserror = "2.0"
 futures-util = "0.3"
 rand = "0.9"
+webrtc = "0.17.1"
 
 [dev-dependencies]
 tokio-tungstenite = "0.29"

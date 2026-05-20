@@ -74,6 +74,7 @@ pub enum ServerSignal {
         member_id: String,
     },
     WebrtcAnswer {
+        request_id: Option<String>,
         sdp: String,
     },
     IceCandidate {
@@ -348,7 +349,10 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             Ok(answer) => {
                                 let _ = send_json(
                                     &mut sender,
-                                    &ServerSignal::WebrtcAnswer { sdp: answer },
+                                    &ServerSignal::WebrtcAnswer {
+                                        request_id,
+                                        sdp: answer,
+                                    },
                                 )
                                 .await;
                             }

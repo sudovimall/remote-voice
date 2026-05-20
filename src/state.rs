@@ -1,5 +1,5 @@
 use crate::{
-    config::settings::Settings, domain::room::RoomStore, media::MediaController,
+    Result, config::settings::Settings, domain::room::RoomStore, media::MediaController,
     transport::http::signaling::SignalHub,
 };
 use std::sync::Arc;
@@ -12,15 +12,15 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(max_members: usize) -> Self {
-        Self {
+    pub fn new(max_members: usize) -> Result<Self> {
+        Ok(Self {
             rooms: Arc::new(RoomStore::new(max_members)),
             signals: Arc::new(SignalHub::new()),
-            media: Arc::new(MediaController::new()),
-        }
+            media: Arc::new(MediaController::new()?),
+        })
     }
 
-    pub fn from_settings(settings: &Settings) -> Self {
+    pub fn from_settings(settings: &Settings) -> Result<Self> {
         Self::new(settings.room.max_members)
     }
 }
