@@ -4,8 +4,9 @@ use std::{collections::HashMap, fmt, sync::Arc};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use webrtc::{
     api::{
-        API, APIBuilder, interceptor_registry::register_default_interceptors,
-        media_engine::MediaEngine,
+        API, APIBuilder,
+        interceptor_registry::register_default_interceptors,
+        media_engine::{MIME_TYPE_OPUS, MediaEngine},
     },
     ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit},
     interceptor::registry::Registry,
@@ -13,7 +14,10 @@ use webrtc::{
         RTCPeerConnection, configuration::RTCConfiguration,
         sdp::session_description::RTCSessionDescription,
     },
-    rtp_transceiver::rtp_codec::RTPCodecType,
+    rtp_transceiver::{
+        rtp_codec::{RTCRtpCodecCapability, RTPCodecType},
+        rtp_sender::RTCRtpSender,
+    },
     track::{
         track_local::{TrackLocal, track_local_static_rtp::TrackLocalStaticRTP},
         track_remote::TrackRemote,
@@ -39,6 +43,7 @@ pub enum MediaEvent {
 
 struct MediaSession {
     peer_connection: Arc<RTCPeerConnection>,
+    downlink_sender: Arc<RTCRtpSender>,
     inbound_tracks: HashMap<usize, InboundTrack>,
     outbound_tracks: HashMap<String, OutboundTrack>,
 }
@@ -136,13 +141,17 @@ impl fmt::Debug for MediaController {
 
 impl MediaController {
     pub fn new() -> Result<Self> {
+        Self::with_api_builder(APIBuilder::new())
+    }
+
+    fn with_api_builder(api_builder: APIBuilder) -> Result<Self> {
         let mut media_engine = MediaEngine::default();
         media_engine
             .register_default_codecs()
             .map_err(|err| Error::Internal(format!("注册默认 codecs 失败: {err}")))?;
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)
             .map_err(|err| Error::Internal(format!("注册默认 interceptors 失败: {err}")))?;
-        let api = APIBuilder::new()
+        let api = api_builder
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
             .build();
@@ -152,6 +161,13 @@ impl MediaController {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             event_sender: broadcast::channel(MEDIA_EVENT_QUEUE_CAPACITY).0,
         })
+    }
+
+    #[cfg(test)]
+    fn new_with_vnet_for_test(vnet: Arc<webrtc::util::vnet::net::Net>) -> Result<Self> {
+        let mut setting_engine = webrtc::api::setting_engine::SettingEngine::default();
+        setting_engine.set_vnet(Some(vnet));
+        Self::with_api_builder(APIBuilder::new().with_setting_engine(setting_engine))
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<MediaEvent> {
@@ -170,29 +186,34 @@ impl MediaController {
     ) -> Result<MediaAnswer> {
         let offer = RTCSessionDescription::offer(sdp)
             .map_err(|err| Error::InvalidMessage(format!("无效 SDP offer: {err}")))?;
+        let key = (room_id.to_string(), member_id.to_string());
+        let (local_ice_sender, local_ice_candidates) =
+            mpsc::channel::<IceCandidate>(LOCAL_ICE_QUEUE_CAPACITY);
+        let existing_peer_connection = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(&key)
+                .map(|session| Arc::clone(&session.peer_connection))
+        };
+
+        if let Some(peer_connection) = existing_peer_connection {
+            // 重新协商要沿用已建立的 ICE/DTLS 会话；替换 PeerConnection 会让客户端仍连着旧会话。
+            forward_local_ice_candidates(&peer_connection, local_ice_sender);
+            let answer = create_answer(&peer_connection, offer).await?;
+            return Ok(MediaAnswer {
+                sdp: answer.sdp,
+                local_ice_candidates,
+            });
+        }
+
         let peer_connection = self
             .api
             .new_peer_connection(RTCConfiguration::default())
             .await
             .map_err(|err| Error::Internal(format!("创建 PeerConnection 失败: {err}")))?;
         let peer_connection = Arc::new(peer_connection);
-        let (local_ice_sender, local_ice_candidates) =
-            mpsc::channel::<IceCandidate>(LOCAL_ICE_QUEUE_CAPACITY);
-
-        // webrtc-rs 通过回调异步产出本地 candidate；信令层负责把它们发回当前浏览器。
-        peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
-            let local_ice_sender = local_ice_sender.clone();
-            Box::pin(async move {
-                let Some(candidate) = candidate else {
-                    return;
-                };
-                let Ok(candidate) = candidate.to_json() else {
-                    return;
-                };
-
-                let _ = local_ice_sender.try_send(candidate.into());
-            })
-        }));
+        forward_local_ice_candidates(&peer_connection, local_ice_sender);
+        let downlink_sender = add_downlink_slot(&peer_connection, room_id, member_id).await?;
 
         let sessions = Arc::clone(&self.sessions);
         let session_key = (room_id.to_string(), member_id.to_string());
@@ -240,30 +261,32 @@ impl MediaController {
                         track_id,
                     ));
 
-                    let _ = attach_audio_to_subscribers(
+                    if attach_audio_to_subscribers(
                         Arc::clone(&sessions),
                         &session_key.0,
                         &session_key.1,
                         outbound_track_id,
                         fanout_track,
                     )
-                    .await;
-
-                    let _ = event_sender.send(MediaEvent::InboundAudioTrack {
-                        room_id: session_key.0,
-                        member_id: session_key.1,
-                    });
+                    .await
+                    .is_ok()
+                    {
+                        let _ = event_sender.send(MediaEvent::InboundAudioTrack {
+                            room_id: session_key.0,
+                            member_id: session_key.1,
+                        });
+                    }
                 }
             })
         }));
 
-        let key = (room_id.to_string(), member_id.to_string());
         let previous = {
             let mut sessions = self.sessions.lock().await;
             sessions.insert(
                 key.clone(),
                 MediaSession {
                     peer_connection: Arc::clone(&peer_connection),
+                    downlink_sender,
                     inbound_tracks: HashMap::new(),
                     outbound_tracks: HashMap::new(),
                 },
@@ -426,6 +449,50 @@ async fn create_answer(
     Ok(answer)
 }
 
+fn forward_local_ice_candidates(
+    peer_connection: &RTCPeerConnection,
+    local_ice_sender: mpsc::Sender<IceCandidate>,
+) {
+    // webrtc-rs 通过回调异步产出本地 candidate；信令层负责把它们发回当前浏览器。
+    peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
+        let local_ice_sender = local_ice_sender.clone();
+        Box::pin(async move {
+            let Some(candidate) = candidate else {
+                return;
+            };
+            let Ok(candidate) = candidate.to_json() else {
+                return;
+            };
+
+            let _ = local_ice_sender.try_send(candidate.into());
+        })
+    }));
+}
+
+async fn add_downlink_slot(
+    peer_connection: &RTCPeerConnection,
+    room_id: &str,
+    member_id: &str,
+) -> Result<Arc<RTCRtpSender>> {
+    // 当前客户端 offer 流程由客户端发起；先协商一个音频 sender 槽位，
+    // 后续同房间发布者出现时才可以不新增 m-line 直接替换真实 track。
+    let downlink_slot = Arc::new(TrackLocalStaticRTP::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_OPUS.to_string(),
+            clock_rate: 48000,
+            channels: 2,
+            ..Default::default()
+        },
+        format!("{member_id}:downlink"),
+        format!("room-{room_id}"),
+    ));
+
+    peer_connection
+        .add_track(downlink_slot as Arc<dyn TrackLocal + Send + Sync>)
+        .await
+        .map_err(|err| Error::Internal(format!("创建下行音频槽位失败: {err}")))
+}
+
 impl MediaSession {
     fn snapshot(&self) -> MediaSessionSnapshot {
         let tracks = self
@@ -532,7 +599,7 @@ async fn attach_audio_to_subscribers(
                 if session_room_id == room_id && member_id != publisher_member_id {
                     Some((
                         (session_room_id.clone(), member_id.clone()),
-                        Arc::clone(&session.peer_connection),
+                        Arc::clone(&session.downlink_sender),
                     ))
                 } else {
                     None
@@ -541,14 +608,17 @@ async fn attach_audio_to_subscribers(
             .collect::<Vec<_>>()
     };
 
-    for (subscriber_key, peer_connection) in subscribers {
-        peer_connection
-            .add_track(Arc::clone(&fanout_track) as Arc<dyn TrackLocal + Send + Sync>)
+    for (subscriber_key, downlink_sender) in subscribers {
+        downlink_sender
+            .replace_track(Some(
+                Arc::clone(&fanout_track) as Arc<dyn TrackLocal + Send + Sync>
+            ))
             .await
-            .map_err(|err| Error::Internal(format!("添加下行音频 track 失败: {err}")))?;
+            .map_err(|err| Error::Internal(format!("替换下行音频槽位失败: {err}")))?;
 
         let mut sessions = sessions.lock().await;
         if let Some(session) = sessions.get_mut(&subscriber_key) {
+            session.outbound_tracks.clear();
             session.outbound_tracks.insert(
                 track_id.clone(),
                 OutboundTrack {
@@ -567,14 +637,30 @@ async fn attach_audio_to_subscribers(
 mod tests {
     use super::{IceCandidate, MediaController};
     use crate::Error;
+    use std::{sync::Arc, time::Duration};
+    use tokio::{
+        sync::{Mutex, broadcast, mpsc},
+        time::{sleep, timeout},
+    };
     use webrtc::{
         api::{
-            APIBuilder, interceptor_registry::register_default_interceptors,
-            media_engine::MediaEngine,
+            APIBuilder,
+            interceptor_registry::register_default_interceptors,
+            media_engine::{MIME_TYPE_OPUS, MediaEngine},
+            setting_engine::SettingEngine,
         },
         interceptor::registry::Registry,
-        peer_connection::configuration::RTCConfiguration,
-        rtp_transceiver::rtp_codec::RTPCodecType,
+        peer_connection::{
+            RTCPeerConnection, configuration::RTCConfiguration,
+            peer_connection_state::RTCPeerConnectionState,
+            sdp::session_description::RTCSessionDescription,
+        },
+        rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType},
+        track::track_local::{TrackLocal, track_local_static_rtp::TrackLocalStaticRTP},
+        util::vnet::{
+            net::{Net, NetConfig},
+            router::{Router, RouterConfig},
+        },
     };
 
     #[tokio::test]
@@ -701,6 +787,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn 上行音频_rtp_经后端转发给同房间听众() {
+        let test_network = new_test_network().await;
+        let media = MediaController::new_with_vnet_for_test(Arc::clone(&test_network.server))
+            .expect("创建媒体控制器");
+        let room_id = "room-1";
+        let mut media_events = media.subscribe_events();
+
+        let listener = new_test_peer_connection(Arc::clone(&test_network.listener)).await;
+        listener
+            .add_transceiver_from_kind(RTPCodecType::Audio, None)
+            .await
+            .expect("听众声明音频 transceiver");
+        let (packet_sender, mut packet_receiver) = mpsc::channel(1);
+        listener.on_track(Box::new(move |track, _, _| {
+            let packet_sender = packet_sender.clone();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    if let Ok((packet, _)) = track.read_rtp().await {
+                        let _ = packet_sender.send(packet.payload.to_vec()).await;
+                    }
+                });
+            })
+        }));
+        negotiate_client(&media, room_id, "listener-1", &listener).await;
+        wait_for_connected(&listener).await;
+
+        let publisher = new_test_peer_connection(Arc::clone(&test_network.publisher)).await;
+        let publisher_track = Arc::new(TrackLocalStaticRTP::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_OPUS.to_string(),
+                clock_rate: 48000,
+                channels: 2,
+                ..Default::default()
+            },
+            "publisher-audio".to_string(),
+            "publisher-stream".to_string(),
+        ));
+        publisher
+            .add_track(Arc::clone(&publisher_track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .expect("发布者添加音频 track");
+        negotiate_client(&media, room_id, "publisher-1", &publisher).await;
+        wait_for_connected(&publisher).await;
+
+        send_until_publisher_audio_arrives(&publisher_track, &mut media_events).await;
+        assert_eq!(
+            media
+                .session_snapshot(room_id, "listener-1")
+                .await
+                .expect("听众媒体会话存在")
+                .outbound_track_count,
+            1
+        );
+        negotiate_client(&media, room_id, "listener-1", &listener).await;
+
+        let received_payload = send_until_listener_receives(&publisher_track, &mut packet_receiver)
+            .await
+            .expect("听众收到转发 RTP");
+        assert_eq!(received_payload, vec![0xA5]);
+
+        listener.close().await.expect("关闭听众 PeerConnection");
+        publisher.close().await.expect("关闭发布者 PeerConnection");
+    }
+
+    #[tokio::test]
     async fn 无效_offer_返回_invalid_message() {
         let media = MediaController::new().expect("创建媒体控制器");
 
@@ -765,5 +916,261 @@ mod tests {
             .await
             .expect("关闭测试 PeerConnection");
         offer.sdp
+    }
+
+    struct TestNetwork {
+        _router: Arc<Mutex<Router>>,
+        server: Arc<Net>,
+        listener: Arc<Net>,
+        publisher: Arc<Net>,
+    }
+
+    async fn new_test_network() -> TestNetwork {
+        let router = Arc::new(Mutex::new(
+            Router::new(RouterConfig {
+                cidr: "1.2.3.0/24".to_string(),
+                ..Default::default()
+            })
+            .expect("创建测试 vnet router"),
+        ));
+        let server = attach_test_net(&router, "1.2.3.10").await;
+        let listener = attach_test_net(&router, "1.2.3.11").await;
+        let publisher = attach_test_net(&router, "1.2.3.12").await;
+
+        router.lock().await.start().await.expect("启动测试 vnet");
+
+        TestNetwork {
+            _router: router,
+            server,
+            listener,
+            publisher,
+        }
+    }
+
+    async fn attach_test_net(router: &Arc<Mutex<Router>>, ip: &str) -> Arc<Net> {
+        let vnet = Arc::new(Net::new(Some(NetConfig {
+            static_ips: vec![ip.to_string()],
+            ..Default::default()
+        })));
+        let nic = vnet.get_nic().expect("读取测试 vnet nic");
+
+        router
+            .lock()
+            .await
+            .add_net(Arc::clone(&nic))
+            .await
+            .expect("向测试 router 添加 nic");
+        nic.lock()
+            .await
+            .set_router(Arc::clone(router))
+            .await
+            .expect("测试 nic 绑定 router");
+        vnet
+    }
+
+    async fn new_test_peer_connection(vnet: Arc<Net>) -> Arc<RTCPeerConnection> {
+        let mut media_engine = MediaEngine::default();
+        media_engine
+            .register_default_codecs()
+            .expect("注册默认 codecs");
+        let registry = register_default_interceptors(Registry::new(), &mut media_engine)
+            .expect("注册默认 interceptors");
+        let mut setting_engine = SettingEngine::default();
+        setting_engine.set_vnet(Some(vnet));
+        let api = APIBuilder::new()
+            .with_setting_engine(setting_engine)
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(registry)
+            .build();
+
+        Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("创建客户端 PeerConnection"),
+        )
+    }
+
+    async fn negotiate_client(
+        media: &MediaController,
+        room_id: &str,
+        member_id: &str,
+        peer_connection: &RTCPeerConnection,
+    ) {
+        let (client_candidate_sender, mut client_candidates) = mpsc::channel(16);
+        peer_connection.on_ice_candidate(Box::new(move |candidate| {
+            let client_candidate_sender = client_candidate_sender.clone();
+            Box::pin(async move {
+                let Some(candidate) = candidate else {
+                    return;
+                };
+                let Ok(candidate) = candidate.to_json() else {
+                    return;
+                };
+
+                let _ = client_candidate_sender.try_send(IceCandidate::from(candidate));
+            })
+        }));
+        let offer = peer_connection
+            .create_offer(None)
+            .await
+            .expect("客户端创建 offer");
+        let mut gathering_complete = peer_connection.gathering_complete_promise().await;
+        peer_connection
+            .set_local_description(offer)
+            .await
+            .expect("客户端设置 local offer");
+        timeout(Duration::from_secs(2), gathering_complete.recv())
+            .await
+            .expect("客户端 ICE gathering 完成");
+        let offer_sdp = peer_connection
+            .local_description()
+            .await
+            .expect("客户端 local description 存在")
+            .sdp;
+
+        let mut answer = media
+            .handle_offer(room_id, member_id, offer_sdp)
+            .await
+            .expect("后端处理 offer");
+        let answer_has_candidates = answer.sdp.contains("a=candidate:");
+        let answer_description =
+            RTCSessionDescription::answer(answer.sdp).expect("构造后端 SDP answer");
+        peer_connection
+            .set_remote_description(answer_description)
+            .await
+            .expect("客户端设置后端 answer");
+
+        trickle_candidates_until_connected(
+            media,
+            room_id,
+            member_id,
+            peer_connection,
+            &mut client_candidates,
+            &mut answer.local_ice_candidates,
+            answer_has_candidates,
+        )
+        .await;
+    }
+
+    async fn trickle_candidates_until_connected(
+        media: &MediaController,
+        room_id: &str,
+        member_id: &str,
+        peer_connection: &RTCPeerConnection,
+        client_candidates: &mut mpsc::Receiver<IceCandidate>,
+        server_candidates: &mut mpsc::Receiver<IceCandidate>,
+        answer_has_candidates: bool,
+    ) {
+        timeout(Duration::from_secs(3), async {
+            let mut saw_server_candidate = answer_has_candidates;
+
+            loop {
+                if saw_server_candidate
+                    && peer_connection.connection_state() == RTCPeerConnectionState::Connected
+                {
+                    return;
+                }
+
+                tokio::select! {
+                    Some(candidate) = client_candidates.recv() => {
+                        media
+                            .add_ice_candidate(room_id, member_id, candidate)
+                            .await
+                            .expect("后端添加客户端 ICE candidate");
+                    }
+                    Some(candidate) = server_candidates.recv() => {
+                        saw_server_candidate = true;
+                        peer_connection
+                            .add_ice_candidate(
+                                webrtc::ice_transport::ice_candidate::RTCIceCandidateInit::from(candidate),
+                            )
+                            .await
+                            .expect("客户端添加服务端 ICE candidate");
+                    }
+                    _ = sleep(Duration::from_millis(10)) => {}
+                }
+            }
+        })
+        .await
+        .expect("客户端和后端 ICE 连通");
+    }
+
+    async fn wait_for_connected(peer_connection: &RTCPeerConnection) {
+        timeout(Duration::from_secs(3), async {
+            while peer_connection.connection_state() != RTCPeerConnectionState::Connected {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("客户端 PeerConnection 连接成功");
+    }
+
+    async fn send_until_publisher_audio_arrives(
+        publisher_track: &TrackLocalStaticRTP,
+        media_events: &mut broadcast::Receiver<super::MediaEvent>,
+    ) {
+        timeout(Duration::from_secs(3), async {
+            for sequence_number in 0..200 {
+                publisher_track
+                    .write_rtp_with_extensions(&test_rtp_packet(sequence_number), &[])
+                    .await
+                    .expect("发布测试上行 RTP");
+
+                if let Ok(Ok(event)) = timeout(Duration::from_millis(20), media_events.recv()).await
+                {
+                    assert!(matches!(
+                        event,
+                        super::MediaEvent::InboundAudioTrack { member_id, .. }
+                            if member_id == "publisher-1"
+                    ));
+                    return;
+                }
+
+                sleep(Duration::from_millis(5)).await;
+            }
+
+            panic!("后端未收到发布者上行音频");
+        })
+        .await
+        .expect("等待发布者上行音频未超时");
+    }
+
+    async fn send_until_listener_receives(
+        publisher_track: &TrackLocalStaticRTP,
+        packet_receiver: &mut mpsc::Receiver<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        timeout(Duration::from_secs(3), async {
+            for sequence_number in 200..500 {
+                publisher_track
+                    .write_rtp_with_extensions(&test_rtp_packet(sequence_number), &[])
+                    .await
+                    .expect("发布待转发 RTP");
+
+                if let Ok(Some(payload)) =
+                    timeout(Duration::from_millis(20), packet_receiver.recv()).await
+                {
+                    return Some(payload);
+                }
+
+                sleep(Duration::from_millis(5)).await;
+            }
+
+            None
+        })
+        .await
+        .expect("等待听众 RTP 未超时")
+    }
+
+    fn test_rtp_packet(sequence_number: u16) -> webrtc::rtp::packet::Packet {
+        webrtc::rtp::packet::Packet {
+            header: webrtc::rtp::header::Header {
+                version: 2,
+                payload_type: 111,
+                sequence_number,
+                timestamp: u32::from(sequence_number) * 960,
+                ..Default::default()
+            },
+            payload: vec![0xA5].into(),
+        }
     }
 }
