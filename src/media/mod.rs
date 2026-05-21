@@ -33,6 +33,8 @@ pub struct MediaController {
     api: API,
     // 每个成员只维护一条到后端的 PeerConnection；上行轨道也挂在同一个会话里。
     sessions: Arc<Mutex<SessionMap>>,
+    // 房间权限可能先于媒体 offer 到达，先按成员记住，建会话时再带入 RTP 转发路径。
+    member_can_speak: Arc<Mutex<HashMap<SessionKey, bool>>>,
     event_sender: broadcast::Sender<MediaEvent>,
 }
 
@@ -44,6 +46,7 @@ pub enum MediaEvent {
 struct MediaSession {
     peer_connection: Arc<RTCPeerConnection>,
     downlink_sender: Arc<RTCRtpSender>,
+    can_speak: bool,
     inbound_tracks: HashMap<usize, InboundTrack>,
     outbound_tracks: HashMap<String, OutboundTrack>,
 }
@@ -159,6 +162,7 @@ impl MediaController {
         Ok(Self {
             api,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            member_can_speak: Arc::new(Mutex::new(HashMap::new())),
             event_sender: broadcast::channel(MEDIA_EVENT_QUEUE_CAPACITY).0,
         })
     }
@@ -281,12 +285,20 @@ impl MediaController {
         }));
 
         let previous = {
+            let can_speak = self
+                .member_can_speak
+                .lock()
+                .await
+                .get(&key)
+                .copied()
+                .unwrap_or(true);
             let mut sessions = self.sessions.lock().await;
             sessions.insert(
                 key.clone(),
                 MediaSession {
                     peer_connection: Arc::clone(&peer_connection),
                     downlink_sender,
+                    can_speak,
                     inbound_tracks: HashMap::new(),
                     outbound_tracks: HashMap::new(),
                 },
@@ -375,6 +387,7 @@ impl MediaController {
     /// 关闭成员的媒体会话。房间状态清理由领域层负责。
     pub async fn close_member(&self, room_id: &str, member_id: &str) -> Result<()> {
         let key = (room_id.to_string(), member_id.to_string());
+        self.member_can_speak.lock().await.remove(&key);
         let session = {
             let mut sessions = self.sessions.lock().await;
             sessions.remove(&key)
@@ -386,6 +399,26 @@ impl MediaController {
                 .close()
                 .await
                 .map_err(|err| Error::Internal(format!("关闭 PeerConnection 失败: {err}")))?;
+        }
+
+        Ok(())
+    }
+
+    /// 同步房间层的发言权限；没有媒体会话时缓存到该成员后续的 offer。
+    pub async fn set_member_can_speak(
+        &self,
+        room_id: &str,
+        member_id: &str,
+        can_speak: bool,
+    ) -> Result<()> {
+        let key = (room_id.to_string(), member_id.to_string());
+        self.member_can_speak
+            .lock()
+            .await
+            .insert(key.clone(), can_speak);
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&key) {
+            session.can_speak = can_speak;
         }
 
         Ok(())
@@ -568,19 +601,26 @@ async fn read_inbound_rtp(
             Err(_) => break,
         };
 
-        let _ = fanout_track.write_rtp_with_extensions(&packet, &[]).await;
+        let should_forward = {
+            let mut sessions = sessions.lock().await;
+            let Some(session) = sessions.get_mut(&session_key) else {
+                break;
+            };
 
-        let mut sessions = sessions.lock().await;
-        let Some(session) = sessions.get_mut(&session_key) else {
-            break;
+            if !Arc::ptr_eq(&session.peer_connection, &peer_connection) {
+                break;
+            }
+
+            if let Some(track) = session.inbound_tracks.get_mut(&track_id) {
+                track.packet_count = track.packet_count.saturating_add(1);
+            }
+
+            // 服务端在 RTP 边界执行房间发言权限，避免被禁言客户端继续推音频。
+            session.can_speak
         };
 
-        if !Arc::ptr_eq(&session.peer_connection, &peer_connection) {
-            break;
-        }
-
-        if let Some(track) = session.inbound_tracks.get_mut(&track_id) {
-            track.packet_count = track.packet_count.saturating_add(1);
+        if should_forward {
+            let _ = fanout_track.write_rtp_with_extensions(&packet, &[]).await;
         }
     }
 }
@@ -716,7 +756,9 @@ mod tests {
             sdp::session_description::RTCSessionDescription,
         },
         rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType},
-        track::track_local::{TrackLocal, track_local_static_rtp::TrackLocalStaticRTP},
+        track::track_local::{
+            TrackLocal, TrackLocalWriter, track_local_static_rtp::TrackLocalStaticRTP,
+        },
         util::vnet::{
             net::{Net, NetConfig},
             router::{Router, RouterConfig},
@@ -923,6 +965,111 @@ mod tests {
             .await
             .expect("新听众收到发布者 RTP");
         assert_eq!(received_payload, vec![0xA5]);
+
+        listener.close().await.expect("关闭听众 PeerConnection");
+        publisher.close().await.expect("关闭发布者 PeerConnection");
+    }
+
+    #[tokio::test]
+    async fn 禁止发言成员的上行音频不会转发给听众() {
+        let test_network = new_test_network().await;
+        let media = MediaController::new_with_vnet_for_test(Arc::clone(&test_network.server))
+            .expect("创建媒体控制器");
+        let room_id = "room-1";
+        let mut media_events = media.subscribe_events();
+
+        let listener = new_test_peer_connection(Arc::clone(&test_network.listener)).await;
+        listener
+            .add_transceiver_from_kind(RTPCodecType::Audio, None)
+            .await
+            .expect("听众声明音频 transceiver");
+        let mut packet_receiver = receive_first_track_packet(&listener);
+        negotiate_client(&media, room_id, "listener-1", &listener).await;
+        wait_for_connected(&listener).await;
+
+        let publisher = new_test_peer_connection(Arc::clone(&test_network.publisher)).await;
+        let publisher_track = new_publisher_track();
+        publisher
+            .add_track(Arc::clone(&publisher_track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .expect("发布者添加音频 track");
+        negotiate_client(&media, room_id, "publisher-1", &publisher).await;
+        wait_for_connected(&publisher).await;
+        media
+            .set_member_can_speak(room_id, "publisher-1", false)
+            .await
+            .expect("禁止发布者发言");
+
+        send_until_publisher_audio_arrives(&publisher_track, &mut media_events).await;
+        negotiate_client(&media, room_id, "listener-1", &listener).await;
+
+        for sequence_number in 1..=5 {
+            publisher_track
+                .write_rtp(&test_rtp_packet(sequence_number))
+                .await
+                .expect("发布者发送 RTP");
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            timeout(Duration::from_millis(200), packet_receiver.recv())
+                .await
+                .is_err(),
+            "禁止发言成员的上行 RTP 不应转发给听众"
+        );
+
+        listener.close().await.expect("关闭听众 PeerConnection");
+        publisher.close().await.expect("关闭发布者 PeerConnection");
+    }
+
+    #[tokio::test]
+    async fn 禁止发言权限在发布者媒体会话建立前生效() {
+        let test_network = new_test_network().await;
+        let media = MediaController::new_with_vnet_for_test(Arc::clone(&test_network.server))
+            .expect("创建媒体控制器");
+        let room_id = "room-1";
+        let mut media_events = media.subscribe_events();
+
+        let listener = new_test_peer_connection(Arc::clone(&test_network.listener)).await;
+        listener
+            .add_transceiver_from_kind(RTPCodecType::Audio, None)
+            .await
+            .expect("听众声明音频 transceiver");
+        let mut packet_receiver = receive_first_track_packet(&listener);
+        negotiate_client(&media, room_id, "listener-1", &listener).await;
+        wait_for_connected(&listener).await;
+
+        media
+            .set_member_can_speak(room_id, "publisher-1", false)
+            .await
+            .expect("提前禁止发布者发言");
+
+        let publisher = new_test_peer_connection(Arc::clone(&test_network.publisher)).await;
+        let publisher_track = new_publisher_track();
+        publisher
+            .add_track(Arc::clone(&publisher_track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .expect("发布者添加音频 track");
+        negotiate_client(&media, room_id, "publisher-1", &publisher).await;
+        wait_for_connected(&publisher).await;
+
+        send_until_publisher_audio_arrives(&publisher_track, &mut media_events).await;
+        negotiate_client(&media, room_id, "listener-1", &listener).await;
+
+        for sequence_number in 1..=5 {
+            publisher_track
+                .write_rtp(&test_rtp_packet(sequence_number))
+                .await
+                .expect("发布者发送 RTP");
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            timeout(Duration::from_millis(200), packet_receiver.recv())
+                .await
+                .is_err(),
+            "媒体会话建立前禁言也应丢弃发布者 RTP"
+        );
 
         listener.close().await.expect("关闭听众 PeerConnection");
         publisher.close().await.expect("关闭发布者 PeerConnection");

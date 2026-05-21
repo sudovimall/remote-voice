@@ -346,6 +346,11 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 
                         match state.rooms.set_member_can_speak(room_id, actor_member_id, &member_id, can_speak) {
                             Ok(room) => {
+                                // 房间层是权限真源；媒体层只消费当前值决定是否转发上行 RTP。
+                                let _ = state
+                                    .media
+                                    .set_member_can_speak(room_id, &member_id, can_speak)
+                                    .await;
                                 let _ = state.signals.broadcast(
                                     room_id,
                                     ServerSignal::MemberUpdated { room, member_id },
