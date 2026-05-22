@@ -1,4 +1,8 @@
-use crate::{Result, domain::room::Room, state::AppState};
+use crate::{
+    Result,
+    domain::room::{Room, RoomSummary},
+    state::AppState,
+};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -8,6 +12,7 @@ use serde::Deserialize;
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/api/rooms", get(list_rooms))
         .route("/api/rooms/{room_id}", get(get_room))
         .route(
             "/api/rooms/{room_id}/members/{member_id}/speaking",
@@ -26,6 +31,10 @@ async fn get_room(
     Path(room_id): Path<String>,
 ) -> Result<Json<Room>> {
     Ok(Json(state.rooms.get_room(&room_id)?))
+}
+
+async fn list_rooms(State(state): State<AppState>) -> Result<Json<Vec<RoomSummary>>> {
+    Ok(Json(state.rooms.list_room_summaries()?))
 }
 
 async fn set_member_can_speak(
@@ -81,6 +90,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn 可以查询房间列表和人数() {
+        let state = AppState::new(8).expect("创建应用状态");
+        let first = state.rooms.create_room("房主 1").expect("创建房间");
+        state
+            .rooms
+            .join_room(&first.room.id, "成员 1")
+            .expect("加入房间");
+        let second = state.rooms.create_room("房主 2").expect("创建第二个房间");
+        let app = router().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/rooms")
+                    .body(Body::empty())
+                    .expect("构造查询房间列表请求"),
+            )
+            .await
+            .expect("查询房间列表响应");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("读取房间列表响应体");
+        let rooms: serde_json::Value = serde_json::from_slice(&body).expect("列表响应是 JSON");
+        let rooms = rooms.as_array().expect("列表响应是数组");
+
+        assert!(rooms.iter().any(|room| {
+            room["id"] == first.room.id
+                && room["member_count"] == 2
+                && room.get("members").is_none()
+        }));
+        assert!(rooms.iter().any(|room| {
+            room["id"] == second.room.id
+                && room["member_count"] == 1
+                && room.get("members").is_none()
+        }));
+    }
+
+    #[tokio::test]
     async fn http_不再创建或加入房间() {
         let state = AppState::new(8).expect("创建应用状态");
         let created = state.rooms.create_room("房主").expect("创建房间");
@@ -98,7 +148,7 @@ mod tests {
             )
             .await
             .expect("读取创建房间响应");
-        assert_eq!(create_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(create_response.status(), StatusCode::METHOD_NOT_ALLOWED);
 
         let join_response = app
             .oneshot(

@@ -25,6 +25,9 @@ function serviceCandidate(candidate) {
   return typeof candidate.toJSON === "function" ? candidate.toJSON() : candidate;
 }
 
+// The first sendrecv audio m-line carries one remote track; reserve the rest for a full 8-member room.
+const EXTRA_REMOTE_AUDIO_SLOTS = 6;
+
 export class MediaSession {
   constructor(client, options = {}) {
     this.client = client;
@@ -60,6 +63,9 @@ export class MediaSession {
 
     for (const track of this.localStream.getAudioTracks()) {
       this.peerConnection.addTrack(track, this.localStream);
+    }
+    for (let index = 0; index < EXTRA_REMOTE_AUDIO_SLOTS; index += 1) {
+      this.peerConnection.addTransceiver("audio", { direction: "recvonly" });
     }
 
     await this.negotiate();

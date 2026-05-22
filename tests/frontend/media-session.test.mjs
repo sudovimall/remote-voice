@@ -46,6 +46,7 @@ function mediaHarness(options = {}) {
   class FakePeerConnection {
     constructor() {
       this.addedTracks = [];
+      this.transceivers = [];
       this.candidates = [];
       this.localDescriptions = [];
       this.remoteDescriptions = [];
@@ -61,6 +62,10 @@ function mediaHarness(options = {}) {
 
     addTrack(addedTrack, addedStream) {
       this.addedTracks.push([addedTrack, addedStream]);
+    }
+
+    addTransceiver(kind, options) {
+      this.transceivers.push([kind, options]);
     }
 
     async addIceCandidate(candidate) {
@@ -165,6 +170,21 @@ test("media session starts microphone and applies an answer", async () => {
     },
   ]);
   assert.equal(harness.states.some((state) => state.device === "authorized"), true);
+});
+
+test("media session reserves remote audio slots for multi-member rooms", async () => {
+  const harness = mediaHarness();
+
+  await harness.session.start();
+
+  assert.deepEqual(harness.peerConnections[0].transceivers, [
+    ["audio", { direction: "recvonly" }],
+    ["audio", { direction: "recvonly" }],
+    ["audio", { direction: "recvonly" }],
+    ["audio", { direction: "recvonly" }],
+    ["audio", { direction: "recvonly" }],
+    ["audio", { direction: "recvonly" }],
+  ]);
 });
 
 test("media session forwards local and remote ICE", async () => {

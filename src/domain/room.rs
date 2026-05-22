@@ -47,6 +47,12 @@ pub struct RoomJoin {
     pub resume_token: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomSummary {
+    pub id: String,
+    pub member_count: usize,
+}
+
 #[derive(Debug)]
 pub struct RoomStore {
     rooms: RwLock<HashMap<String, Room>>,
@@ -149,6 +155,19 @@ impl RoomStore {
     pub fn get_room(&self, room_id: &str) -> Result<Room> {
         let rooms = self.read_rooms()?;
         rooms.get(room_id).cloned().ok_or(Error::RoomNotFound)
+    }
+
+    pub fn list_room_summaries(&self) -> Result<Vec<RoomSummary>> {
+        let rooms = self.read_rooms()?;
+        let mut summaries = rooms
+            .values()
+            .map(|room| RoomSummary {
+                id: room.id.clone(),
+                member_count: room.members.len(),
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(summaries)
     }
 
     pub fn set_member_can_speak(
