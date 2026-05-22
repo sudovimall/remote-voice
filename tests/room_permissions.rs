@@ -80,6 +80,72 @@ fn 成员可以更新自己的本地静音状态() {
 }
 
 #[test]
+fn 成员可以停止并恢复接收另一成员语音() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间");
+    let member = store.join_room(&owner.room.id, "队友").expect("加入房间");
+
+    let blocked = store
+        .set_member_listening(&owner.room.id, &owner.member.id, &member.member.id, false)
+        .expect("成员可以不听另一成员");
+    assert_eq!(
+        blocked.not_listening_member_ids,
+        vec![member.member.id.clone()]
+    );
+
+    let listening = store
+        .set_member_listening(&owner.room.id, &owner.member.id, &member.member.id, true)
+        .expect("成员可以恢复接收");
+    assert!(listening.not_listening_member_ids.is_empty());
+}
+
+#[test]
+fn 成员恢复原身份后保留不听名单() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间");
+    let member = store.join_room(&owner.room.id, "队友").expect("加入房间");
+
+    store
+        .set_member_listening(&owner.room.id, &owner.member.id, &member.member.id, false)
+        .expect("写入不听名单");
+    store
+        .mark_member_disconnected(&owner.room.id, &owner.member.id)
+        .expect("房主断线");
+
+    let resumed = store
+        .resume_room(&owner.room.id, &owner.member.id, &owner.resume_token)
+        .expect("恢复房间");
+    assert_eq!(
+        resumed.member.not_listening_member_ids(),
+        vec![member.member.id.clone()]
+    );
+}
+
+#[test]
+fn 成员不能屏蔽自己且目标离开后清理不听引用() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间");
+    let member = store.join_room(&owner.room.id, "队友").expect("加入房间");
+
+    let error = store
+        .set_member_listening(&owner.room.id, &owner.member.id, &owner.member.id, false)
+        .expect_err("不能不听自己");
+    assert!(matches!(error, Error::InvalidMessage(_)));
+
+    store
+        .set_member_listening(&owner.room.id, &owner.member.id, &member.member.id, false)
+        .expect("写入不听名单");
+    store
+        .leave_room(&owner.room.id, &member.member.id)
+        .expect("成员离开");
+
+    let state = store
+        .member_listening_state(&owner.room.id, &owner.member.id)
+        .expect("读取当前名单");
+    assert!(state.not_listening_member_ids.is_empty());
+}
+
+#[test]
 fn 普通成员离开后房间保留() {
     let store = RoomStore::new(8);
     let owner = store.create_room("房主").expect("创建房间成功");

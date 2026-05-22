@@ -2,7 +2,7 @@ use crate::{Error, Result};
 use rand::{Rng, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         RwLock,
         atomic::{AtomicU64, Ordering},
@@ -27,8 +27,21 @@ pub struct Member {
     pub can_speak: bool,
     pub self_muted: bool,
     pub connected: bool,
+    #[serde(skip, default)]
+    not_listening_member_ids: HashSet<String>,
     #[serde(skip)]
     resume_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemberListeningState {
+    pub not_listening_member_ids: Vec<String>,
+}
+
+impl Member {
+    pub fn not_listening_member_ids(&self) -> Vec<String> {
+        sorted_member_ids(&self.not_listening_member_ids)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +222,56 @@ impl RoomStore {
         Ok(room.clone())
     }
 
+    pub fn member_listening_state(
+        &self,
+        room_id: &str,
+        member_id: &str,
+    ) -> Result<MemberListeningState> {
+        let rooms = self.read_rooms()?;
+        let room = rooms.get(room_id).ok_or(Error::RoomNotFound)?;
+        let member = room.members.get(member_id).ok_or(Error::MemberNotFound)?;
+
+        Ok(MemberListeningState {
+            not_listening_member_ids: member.not_listening_member_ids(),
+        })
+    }
+
+    pub fn set_member_listening(
+        &self,
+        room_id: &str,
+        listener_member_id: &str,
+        publisher_member_id: &str,
+        listening: bool,
+    ) -> Result<MemberListeningState> {
+        let mut rooms = self.write_rooms()?;
+        let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
+
+        if listener_member_id == publisher_member_id {
+            return Err(Error::InvalidMessage("不能屏蔽自己的语音".to_string()));
+        }
+
+        if !room.members.contains_key(publisher_member_id) {
+            return Err(Error::MemberNotFound);
+        }
+
+        let listener = room
+            .members
+            .get_mut(listener_member_id)
+            .ok_or(Error::MemberNotFound)?;
+        if listening {
+            listener.not_listening_member_ids.remove(publisher_member_id);
+        } else {
+            listener
+                .not_listening_member_ids
+                .insert(publisher_member_id.to_string());
+        }
+        room.last_active_epoch_seconds = now_epoch_seconds();
+
+        Ok(MemberListeningState {
+            not_listening_member_ids: listener.not_listening_member_ids(),
+        })
+    }
+
     pub fn mark_member_disconnected(&self, room_id: &str, member_id: &str) -> Result<Room> {
         let mut rooms = self.write_rooms()?;
         let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
@@ -243,6 +306,7 @@ impl RoomStore {
         }
 
         room.members.remove(member_id);
+        remove_listening_references(room, member_id);
         room.last_active_epoch_seconds = now_epoch_seconds();
 
         Ok(Some(room.clone()))
@@ -263,6 +327,7 @@ impl RoomStore {
         }
 
         room.members.remove(member_id);
+        remove_listening_references(room, member_id);
         room.last_active_epoch_seconds = now_epoch_seconds();
 
         Ok(room.clone())
@@ -276,6 +341,7 @@ impl RoomStore {
             can_speak: true,
             self_muted: false,
             connected: true,
+            not_listening_member_ids: HashSet::new(),
             resume_token: new_resume_token(),
         }
     }
@@ -304,6 +370,18 @@ impl RoomStore {
             .write()
             .map_err(|_| Error::Internal("房间写锁已损坏".to_string()))
     }
+}
+
+fn remove_listening_references(room: &mut Room, member_id: &str) {
+    for member in room.members.values_mut() {
+        member.not_listening_member_ids.remove(member_id);
+    }
+}
+
+fn sorted_member_ids(member_ids: &HashSet<String>) -> Vec<String> {
+    let mut member_ids = member_ids.iter().cloned().collect::<Vec<_>>();
+    member_ids.sort();
+    member_ids
 }
 
 fn now_epoch_seconds() -> u64 {
