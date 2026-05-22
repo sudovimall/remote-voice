@@ -19,6 +19,8 @@ pub struct RoomSettings {
     pub max_members: usize,
     #[serde(default = "default_disconnect_grace_seconds")]
     pub disconnect_grace_seconds: u64,
+    #[serde(default = "default_chat_history_limit")]
+    pub chat_history_limit: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +38,7 @@ impl Default for RoomSettings {
         Self {
             max_members: default_max_members(),
             disconnect_grace_seconds: default_disconnect_grace_seconds(),
+            chat_history_limit: default_chat_history_limit(),
         }
     }
 }
@@ -58,6 +61,10 @@ fn default_disconnect_grace_seconds() -> u64 {
     30
 }
 
+fn default_chat_history_limit() -> usize {
+    100
+}
+
 fn default_udp_port_min() -> u16 {
     40000
 }
@@ -70,10 +77,11 @@ impl Display for Settings {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "[监听端口 = {}, 房间人数上限 = {}, 断线保留秒数 = {}, 媒体 UDP 端口范围 = {}-{}, 对外媒体 IP = {}]",
+            "[监听端口 = {}, 房间人数上限 = {}, 断线保留秒数 = {}, 聊天历史条数 = {}, 媒体 UDP 端口范围 = {}-{}, 对外媒体 IP = {}]",
             self.port,
             self.room.max_members,
             self.room.disconnect_grace_seconds,
+            self.room.chat_history_limit,
             self.media.udp_port_min,
             self.media.udp_port_max,
             self.media.public_ip.as_deref().unwrap_or("未配置")
@@ -88,6 +96,7 @@ pub fn init_config() -> Result<Settings> {
             port: 8080
             room:
               max_members: 8
+              chat_history_limit: 100
             media:
               udp_port_min: 40000
               udp_port_max: 40100
@@ -110,6 +119,7 @@ mod tests {
         assert_eq!(settings.port, 9000);
         assert_eq!(settings.room.max_members, 8);
         assert_eq!(settings.room.disconnect_grace_seconds, 30);
+        assert_eq!(settings.room.chat_history_limit, 100);
         assert_eq!(settings.media.udp_port_min, 40000);
         assert_eq!(settings.media.udp_port_max, 40100);
         assert_eq!(settings.media.public_ip, None);
@@ -147,6 +157,7 @@ mod tests {
             room:
               max_members: 12
               disconnect_grace_seconds: 45
+              chat_history_limit: 25
             media:
               udp_port_min: 41000
               udp_port_max: 41015
@@ -158,6 +169,7 @@ mod tests {
         assert!(display.contains("监听端口 = 9000"));
         assert!(display.contains("房间人数上限 = 12"));
         assert!(display.contains("断线保留秒数 = 45"));
+        assert!(display.contains("聊天历史条数 = 25"));
         assert!(display.contains("媒体 UDP 端口范围 = 41000-41015"));
         assert!(display.contains("对外媒体 IP = 未配置"));
     }

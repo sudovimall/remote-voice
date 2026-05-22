@@ -11,6 +11,8 @@ use std::{
 };
 
 const ROOM_ID_LENGTH: usize = 6;
+const CHAT_MESSAGE_ID_LENGTH: usize = 22;
+const CHAT_MESSAGE_MAX_CHARS: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +53,8 @@ pub struct Room {
     pub members: HashMap<String, Member>,
     pub created_at_epoch_seconds: u64,
     pub last_active_epoch_seconds: u64,
+    #[serde(skip, default)]
+    chat_messages: Vec<ChatMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,10 +70,21 @@ pub struct RoomSummary {
     pub member_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub id: String,
+    pub room_id: String,
+    pub member_id: String,
+    pub nickname: String,
+    pub content: String,
+    pub sent_at_epoch_millis: u64,
+}
+
 #[derive(Debug)]
 pub struct RoomStore {
     rooms: RwLock<HashMap<String, Room>>,
     max_members: usize,
+    chat_history_limit: usize,
     room_id_seed: u64,
     next_room_seq: AtomicU64,
 }
@@ -79,9 +94,15 @@ impl RoomStore {
         Self {
             rooms: RwLock::new(HashMap::new()),
             max_members,
+            chat_history_limit: 100,
             room_id_seed: new_room_id_seed(),
             next_room_seq: AtomicU64::new(1),
         }
+    }
+
+    pub fn with_chat_history_limit(mut self, chat_history_limit: usize) -> Self {
+        self.chat_history_limit = chat_history_limit;
+        self
     }
 
     pub fn create_room(&self, nickname: impl Into<String>) -> Result<RoomJoin> {
@@ -100,6 +121,7 @@ impl RoomStore {
             members: HashMap::from([(member.id.clone(), member.clone())]),
             created_at_epoch_seconds: now,
             last_active_epoch_seconds: now,
+            chat_messages: Vec::new(),
         };
 
         rooms.insert(room_id, room.clone());
@@ -259,7 +281,9 @@ impl RoomStore {
             .get_mut(listener_member_id)
             .ok_or(Error::MemberNotFound)?;
         if listening {
-            listener.not_listening_member_ids.remove(publisher_member_id);
+            listener
+                .not_listening_member_ids
+                .remove(publisher_member_id);
         } else {
             listener
                 .not_listening_member_ids
@@ -270,6 +294,50 @@ impl RoomStore {
         Ok(MemberListeningState {
             not_listening_member_ids: listener.not_listening_member_ids(),
         })
+    }
+
+    pub fn send_chat_message(
+        &self,
+        room_id: &str,
+        member_id: &str,
+        content: &str,
+    ) -> Result<ChatMessage> {
+        let content = content.trim();
+        if content.is_empty() {
+            return Err(Error::InvalidMessage("聊天消息不能为空".to_string()));
+        }
+        if content.chars().count() > CHAT_MESSAGE_MAX_CHARS {
+            return Err(Error::InvalidMessage(format!(
+                "聊天消息不能超过 {CHAT_MESSAGE_MAX_CHARS} 个字符"
+            )));
+        }
+
+        let mut rooms = self.write_rooms()?;
+        let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
+        let member = room.members.get(member_id).ok_or(Error::MemberNotFound)?;
+        let message = ChatMessage {
+            id: new_chat_message_id(),
+            room_id: room_id.to_string(),
+            member_id: member_id.to_string(),
+            nickname: member.nickname.clone(),
+            content: content.to_string(),
+            sent_at_epoch_millis: now_epoch_millis(),
+        };
+
+        room.chat_messages.push(message.clone());
+        if room.chat_messages.len() > self.chat_history_limit {
+            let overflow = room.chat_messages.len() - self.chat_history_limit;
+            room.chat_messages.drain(0..overflow);
+        }
+        room.last_active_epoch_seconds = now_epoch_seconds();
+
+        Ok(message)
+    }
+
+    pub fn chat_history(&self, room_id: &str) -> Result<Vec<ChatMessage>> {
+        let rooms = self.read_rooms()?;
+        let room = rooms.get(room_id).ok_or(Error::RoomNotFound)?;
+        Ok(room.chat_messages.clone())
     }
 
     pub fn mark_member_disconnected(&self, room_id: &str, member_id: &str) -> Result<Room> {
@@ -391,6 +459,13 @@ fn now_epoch_seconds() -> u64 {
         .unwrap_or_default()
 }
 
+fn now_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 fn new_room_id_seed() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -419,6 +494,17 @@ fn new_resume_token() -> String {
         .collect();
 
     format!("r_{suffix}")
+}
+
+fn new_chat_message_id() -> String {
+    let mut rng = rand::rng();
+    let suffix: String = (&mut rng)
+        .sample_iter(Alphanumeric)
+        .take(CHAT_MESSAGE_ID_LENGTH)
+        .map(char::from)
+        .collect();
+
+    format!("c_{suffix}")
 }
 
 fn mix64(mut value: u64) -> u64 {

@@ -146,6 +146,50 @@ fn 成员不能屏蔽自己且目标离开后清理不听引用() {
 }
 
 #[test]
+fn 房间聊天会保存最近消息并裁剪历史() {
+    let store = RoomStore::new(8).with_chat_history_limit(2);
+    let owner = store.create_room("房主").expect("创建房间");
+    let member = store.join_room(&owner.room.id, "队友").expect("加入房间");
+
+    let first = store
+        .send_chat_message(&owner.room.id, &owner.member.id, "第一条")
+        .expect("发送第一条");
+    let second = store
+        .send_chat_message(&owner.room.id, &member.member.id, " 第二条 ")
+        .expect("发送第二条");
+    let third = store
+        .send_chat_message(&owner.room.id, &owner.member.id, "第三条")
+        .expect("发送第三条");
+
+    assert!(first.id.starts_with("c_"));
+    assert_eq!(second.content, "第二条");
+    assert_eq!(second.nickname, "队友");
+    assert!(third.sent_at_epoch_millis >= second.sent_at_epoch_millis);
+
+    let history = store.chat_history(&owner.room.id).expect("读取历史");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].content, "第二条");
+    assert_eq!(history[1].content, "第三条");
+}
+
+#[test]
+fn 房间聊天拒绝空消息和超长消息() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间");
+
+    let empty = store
+        .send_chat_message(&owner.room.id, &owner.member.id, "   ")
+        .expect_err("空消息应拒绝");
+    assert!(matches!(empty, Error::InvalidMessage(_)));
+
+    let too_long = "a".repeat(501);
+    let error = store
+        .send_chat_message(&owner.room.id, &owner.member.id, &too_long)
+        .expect_err("超长消息应拒绝");
+    assert!(matches!(error, Error::InvalidMessage(_)));
+}
+
+#[test]
 fn 普通成员离开后房间保留() {
     let store = RoomStore::new(8);
     let owner = store.create_room("房主").expect("创建房间成功");

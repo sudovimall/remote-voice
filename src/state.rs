@@ -31,7 +31,10 @@ impl AppState {
 
     pub fn from_settings(settings: &Settings) -> Result<Self> {
         Ok(Self {
-            rooms: Arc::new(RoomStore::new(settings.room.max_members)),
+            rooms: Arc::new(
+                RoomStore::new(settings.room.max_members)
+                    .with_chat_history_limit(settings.room.chat_history_limit),
+            ),
             signals: Arc::new(SignalHub::new()),
             media: Arc::new(MediaController::new_with_udp_port_range(
                 settings.media.udp_port_min,
