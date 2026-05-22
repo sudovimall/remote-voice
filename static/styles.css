@@ -39,6 +39,10 @@ body {
   font-family: "Source Han Sans SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
 }
 
+body[data-page="voice-room"] {
+  overflow: hidden;
+}
+
 button,
 input,
 textarea {
@@ -332,12 +336,14 @@ h2 {
 
 .room-shell {
   width: min(1260px, calc(100% - 48px));
-  min-height: 100vh;
+  height: 100dvh;
   margin: 0 auto;
   display: grid;
-  align-content: start;
-  gap: 24px;
-  padding: 38px 0;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  align-content: stretch;
+  gap: 16px;
+  overflow: hidden;
+  padding: clamp(14px, 3vh, 28px) 0;
 }
 
 .room-topbar,
@@ -351,11 +357,11 @@ h2 {
 }
 
 .room-topbar {
-  min-height: 132px;
+  min-height: clamp(76px, 12vh, 112px);
   align-items: end;
   justify-content: space-between;
   gap: 24px;
-  padding: 0 0 24px;
+  padding: 0 0 16px;
   border-bottom: 1px solid var(--ink);
 }
 
@@ -413,11 +419,12 @@ h2 {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(330px, 410px);
   gap: 24px;
+  min-height: 0;
 }
 
 .members-pane,
 .voice-pane {
-  min-height: 610px;
+  min-height: 0;
   padding: clamp(22px, 3vw, 32px);
   border: 1px solid var(--line-strong);
   background: rgb(252 253 248 / 94%);
@@ -425,6 +432,8 @@ h2 {
 
 .members-pane {
   position: relative;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
 }
 
@@ -432,6 +441,7 @@ h2 {
   display: grid;
   align-content: start;
   gap: 22px;
+  overflow: auto;
   color: var(--paper-bright);
   background: var(--ink);
 }
@@ -466,7 +476,10 @@ h2 {
 
 .member-list {
   display: grid;
+  align-content: start;
   gap: 12px;
+  min-height: 0;
+  overflow: auto;
   padding-top: 24px;
 }
 
@@ -572,7 +585,7 @@ h2 {
 }
 
 .chat-panel {
-  min-height: 520px;
+  min-height: 0;
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
   gap: 16px;
@@ -580,8 +593,7 @@ h2 {
 }
 
 .chat-messages {
-  min-height: 390px;
-  max-height: 52vh;
+  min-height: 0;
   overflow: auto;
   display: grid;
   align-content: start;
@@ -851,9 +863,23 @@ h2 {
 }
 
 @media (max-width: 900px) {
+  body[data-page="voice-room"] {
+    overflow: auto;
+  }
+
   .lobby-shell,
   .room-grid {
     grid-template-columns: 1fr;
+  }
+
+  .room-shell {
+    height: auto;
+    min-height: 100dvh;
+    overflow: visible;
+  }
+
+  .room-grid {
+    min-height: auto;
   }
 
   .lobby-shell,
@@ -868,6 +894,12 @@ h2 {
   .members-pane,
   .voice-pane {
     min-height: auto;
+    overflow: visible;
+  }
+
+  .member-list,
+  .chat-messages {
+    overflow: visible;
   }
 }
 
