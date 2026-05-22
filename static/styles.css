@@ -23,6 +23,10 @@
   letter-spacing: 0;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 body {
   min-height: 100vh;
   margin: 0;
@@ -470,14 +474,15 @@ h2 {
   position: absolute;
   top: -1px;
   right: -1px;
-  width: 78px;
-  height: 78px;
+  width: 72px;
+  height: 72px;
   min-height: 0;
   padding: 0;
   border: 0;
   border-radius: 0;
   color: var(--paper-bright);
   background: transparent;
+  overflow: visible;
 }
 
 .panel-switch::before {
@@ -485,7 +490,41 @@ h2 {
   position: absolute;
   inset: 0;
   clip-path: polygon(100% 0, 100% 100%, 0 0);
-  background: var(--ink);
+  background:
+    linear-gradient(
+      135deg,
+      var(--paper-bright) 0 28%,
+      var(--surface-strong) 28% 32%,
+      var(--accent) 32% 100%
+    );
+  box-shadow: -10px 10px 24px rgb(21 25 22 / 12%);
+  transition:
+    background 150ms ease,
+    transform 150ms ease;
+}
+
+.panel-switch::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 70px;
+  height: 70px;
+  clip-path: polygon(100% 0, 100% 100%, 0 0);
+  border-top: 1px solid rgb(21 25 22 / 24%);
+  border-right: 1px solid rgb(21 25 22 / 24%);
+  pointer-events: none;
+}
+
+.panel-switch:hover::before {
+  background:
+    linear-gradient(
+      135deg,
+      var(--paper-bright) 0 24%,
+      var(--accent-bright) 24% 30%,
+      var(--ink) 30% 100%
+    );
+  transform: translate(-1px, 1px);
 }
 
 .panel-switch:focus-visible {
@@ -493,19 +532,30 @@ h2 {
   outline-offset: 2px;
 }
 
-.panel-switch-icon {
+.panel-switch-tab {
   position: absolute;
-  top: 12px;
-  right: 12px;
+  top: 9px;
+  right: 9px;
   z-index: 1;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgb(252 253 248 / 52%);
+  border-radius: 999px;
+  background: rgb(21 25 22 / 22%);
+  box-shadow: 0 8px 18px rgb(21 25 22 / 16%);
+}
+
+.panel-switch-icon {
   font-size: 0.84rem;
   font-weight: 850;
 }
 
 .chat-unread {
   position: absolute;
-  top: 8px;
-  right: 38px;
+  top: 7px;
+  right: 36px;
   z-index: 2;
   min-width: 20px;
   height: 20px;
