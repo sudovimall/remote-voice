@@ -9,7 +9,7 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 pub async fn serve(settings: Settings) -> Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], settings.port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], settings.port));
     let state = AppState::from_settings(&settings)?;
     let app = build_router(state);
     let listener = TcpListener::bind(addr).await?;

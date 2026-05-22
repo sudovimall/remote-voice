@@ -27,6 +27,8 @@ pub struct Member {
     pub can_speak: bool,
     pub self_muted: bool,
     pub connected: bool,
+    #[serde(skip)]
+    resume_token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +44,7 @@ pub struct Room {
 pub struct RoomJoin {
     pub room: Room,
     pub member: Member,
+    pub resume_token: String,
 }
 
 #[derive(Debug)]
@@ -82,7 +85,11 @@ impl RoomStore {
 
         rooms.insert(room_id, room.clone());
 
-        Ok(RoomJoin { room, member })
+        Ok(RoomJoin {
+            room,
+            resume_token: member.resume_token.clone(),
+            member,
+        })
     }
 
     pub fn join_room(&self, room_id: &str, nickname: impl Into<String>) -> Result<RoomJoin> {
@@ -106,6 +113,35 @@ impl RoomStore {
 
         Ok(RoomJoin {
             room: room.clone(),
+            resume_token: member.resume_token.clone(),
+            member,
+        })
+    }
+
+    pub fn resume_room(
+        &self,
+        room_id: &str,
+        member_id: &str,
+        resume_token: &str,
+    ) -> Result<RoomJoin> {
+        let mut rooms = self.write_rooms()?;
+        let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
+        let member = room
+            .members
+            .get_mut(member_id)
+            .ok_or(Error::MemberNotFound)?;
+
+        if member.resume_token != resume_token {
+            return Err(Error::InvalidResumeToken);
+        }
+
+        member.connected = true;
+        let member = member.clone();
+        room.last_active_epoch_seconds = now_epoch_seconds();
+
+        Ok(RoomJoin {
+            room: room.clone(),
+            resume_token: member.resume_token.clone(),
             member,
         })
     }
@@ -154,6 +190,45 @@ impl RoomStore {
         Ok(room.clone())
     }
 
+    pub fn mark_member_disconnected(&self, room_id: &str, member_id: &str) -> Result<Room> {
+        let mut rooms = self.write_rooms()?;
+        let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
+        let member = room
+            .members
+            .get_mut(member_id)
+            .ok_or(Error::MemberNotFound)?;
+
+        member.connected = false;
+        room.last_active_epoch_seconds = now_epoch_seconds();
+
+        Ok(room.clone())
+    }
+
+    pub fn expire_disconnected_member(
+        &self,
+        room_id: &str,
+        member_id: &str,
+    ) -> Result<Option<Room>> {
+        let mut rooms = self.write_rooms()?;
+        let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
+        let member = room.members.get(member_id).ok_or(Error::MemberNotFound)?;
+
+        if member.connected {
+            return Ok(None);
+        }
+
+        if room.owner_member_id == member_id {
+            let room = room.clone();
+            rooms.remove(room_id);
+            return Ok(Some(room));
+        }
+
+        room.members.remove(member_id);
+        room.last_active_epoch_seconds = now_epoch_seconds();
+
+        Ok(Some(room.clone()))
+    }
+
     pub fn leave_room(&self, room_id: &str, member_id: &str) -> Result<Room> {
         let mut rooms = self.write_rooms()?;
         let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
@@ -182,6 +257,7 @@ impl RoomStore {
             can_speak: true,
             self_muted: false,
             connected: true,
+            resume_token: new_resume_token(),
         }
     }
 
@@ -235,6 +311,17 @@ fn new_member_id() -> String {
         .collect();
 
     format!("m_{suffix}")
+}
+
+fn new_resume_token() -> String {
+    let mut rng = rand::rng();
+    let suffix: String = (&mut rng)
+        .sample_iter(Alphanumeric)
+        .take(48)
+        .map(char::from)
+        .collect();
+
+    format!("r_{suffix}")
 }
 
 fn mix64(mut value: u64) -> u64 {

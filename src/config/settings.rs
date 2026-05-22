@@ -15,12 +15,15 @@ pub struct Settings {
 pub struct RoomSettings {
     #[serde(default = "default_max_members")]
     pub max_members: usize,
+    #[serde(default = "default_disconnect_grace_seconds")]
+    pub disconnect_grace_seconds: u64,
 }
 
 impl Default for RoomSettings {
     fn default() -> Self {
         Self {
             max_members: default_max_members(),
+            disconnect_grace_seconds: default_disconnect_grace_seconds(),
         }
     }
 }
@@ -29,12 +32,16 @@ fn default_max_members() -> usize {
     8
 }
 
+fn default_disconnect_grace_seconds() -> u64 {
+    30
+}
+
 impl Display for Settings {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "[port = {}, room.max_members = {}]",
-            self.port, self.room.max_members
+            "[port = {}, room.max_members = {}, room.disconnect_grace_seconds = {}]",
+            self.port, self.room.max_members, self.room.disconnect_grace_seconds
         )?;
         Ok(())
     }
@@ -64,5 +71,6 @@ mod tests {
 
         assert_eq!(settings.port, 9000);
         assert_eq!(settings.room.max_members, 8);
+        assert_eq!(settings.room.disconnect_grace_seconds, 30);
     }
 }

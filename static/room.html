@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Remote Voice Room</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/assets/styles.css">
+    <script type="module" src="/assets/room.js"></script>
+  </head>
+  <body data-page="voice-room">
+    <main class="room-shell">
+      <header class="room-topbar">
+        <div class="room-heading">
+          <p class="eyebrow">语音房间</p>
+          <h1>房间 <span id="room-id">--</span></h1>
+        </div>
+        <div class="room-meta">
+          <span id="room-connection" class="status-pill">未连接</span>
+          <a class="quiet-button" href="/">离开</a>
+        </div>
+      </header>
+
+      <div id="room-error" class="room-alert" role="status" hidden></div>
+
+      <section class="room-grid">
+        <section class="members-pane" aria-labelledby="members-title">
+          <div class="pane-head">
+            <h2 id="members-title">成员</h2>
+            <span id="members-meta" class="meta-copy">等待房间状态</span>
+          </div>
+
+          <div id="member-list" class="member-list" aria-label="成员列表"></div>
+        </section>
+
+        <aside class="voice-pane" aria-labelledby="voice-title">
+          <div class="pane-head">
+            <h2 id="voice-title">本地语音</h2>
+            <span class="meta-copy">单房间会话</span>
+          </div>
+
+          <button id="mic-state" class="mic-button" type="button" disabled>
+            <span aria-hidden="true"></span>
+            麦克风未连接
+          </button>
+
+          <div class="signal-stack">
+            <p>
+              <span>设备状态</span>
+              <strong id="device-state">未请求权限</strong>
+            </p>
+            <p>
+              <span>媒体状态</span>
+              <strong id="media-state">等待连接</strong>
+            </p>
+            <p>
+              <span>下行音频</span>
+              <strong id="downlink-state">等待其他成员</strong>
+            </p>
+          </div>
+
+          <div id="permission-note" class="permission-note">麦克风权限待确认。</div>
+
+          <div class="voice-actions">
+            <button id="mute-self" type="button" class="quiet-button quiet-button-wide" disabled>
+              静音
+            </button>
+            <button id="leave-room" type="button" class="quiet-button quiet-button-wide">
+              断开
+            </button>
+          </div>
+        </aside>
+      </section>
+      <div id="remote-audio" hidden aria-hidden="true"></div>
+    </main>
+  </body>
+</html>

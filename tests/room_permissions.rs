@@ -117,3 +117,84 @@ fn 房主离开后关闭房间() {
 
     assert!(matches!(err, Error::RoomNotFound));
 }
+
+#[test]
+fn 成员断线后可以使用恢复凭据回到原身份() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间成功");
+    let member = store
+        .join_room(&owner.room.id, "队友")
+        .expect("成员加入成功");
+
+    let room = store
+        .mark_member_disconnected(&owner.room.id, &member.member.id)
+        .expect("成员可以被标记断线");
+    assert!(!room.members[&member.member.id].connected);
+
+    let resumed = store
+        .resume_room(&owner.room.id, &member.member.id, &member.resume_token)
+        .expect("恢复凭据有效");
+
+    assert_eq!(resumed.member.id, member.member.id);
+    assert_eq!(resumed.member.nickname, "队友");
+    assert!(resumed.room.members[&member.member.id].connected);
+    assert!(!member.resume_token.is_empty());
+}
+
+#[test]
+fn 恢复房间需要匹配成员的恢复凭据() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间成功");
+
+    let err = store
+        .resume_room(&owner.room.id, &owner.member.id, "wrong-token")
+        .expect_err("错误凭据不能恢复房间");
+
+    assert!(matches!(err, Error::InvalidResumeToken));
+}
+
+#[test]
+fn 普通成员断线超时后被移出房间() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间成功");
+    let member = store
+        .join_room(&owner.room.id, "队友")
+        .expect("成员加入成功");
+
+    store
+        .mark_member_disconnected(&owner.room.id, &member.member.id)
+        .expect("成员可以被标记断线");
+    let expired = store
+        .expire_disconnected_member(&owner.room.id, &member.member.id)
+        .expect("断线成员超时清理成功")
+        .expect("断线成员会被移除");
+
+    assert!(!expired.members.contains_key(&member.member.id));
+    assert!(
+        store
+            .get_room(&owner.room.id)
+            .expect("房间仍存在")
+            .members
+            .contains_key(&owner.member.id)
+    );
+}
+
+#[test]
+fn 房主断线超时后关闭房间() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间成功");
+
+    store
+        .mark_member_disconnected(&owner.room.id, &owner.member.id)
+        .expect("房主可以被标记断线");
+    let expired = store
+        .expire_disconnected_member(&owner.room.id, &owner.member.id)
+        .expect("断线房主超时清理成功")
+        .expect("房主断线超时关闭房间");
+
+    assert_eq!(expired.id, owner.room.id);
+    assert!(matches!(
+        store.get_room(&owner.room.id),
+        Err(Error::RoomNotFound)
+    ));
+}

@@ -23,11 +23,20 @@ type RoomSignalSenders = HashMap<String, HashMap<String, mpsc::Sender<ServerSign
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientSignal {
+    CreateRoom {
+        request_id: String,
+        nickname: String,
+    },
     JoinRoom {
         request_id: String,
         room_id: String,
         nickname: String,
-        member_id: Option<String>,
+    },
+    ResumeRoom {
+        request_id: String,
+        room_id: String,
+        member_id: String,
+        resume_token: String,
     },
     LeaveRoom {
         request_id: Option<String>,
@@ -65,6 +74,7 @@ pub enum ServerSignal {
         request_id: String,
         room: Room,
         member_id: String,
+        resume_token: String,
     },
     MemberJoined {
         room: Room,
@@ -198,6 +208,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     let mut outbound: Option<mpsc::Receiver<ServerSignal>> = None;
     let mut local_ice_candidates: Option<mpsc::Receiver<IceCandidate>> = None;
     let mut media_events = state.media.subscribe_events();
+    let mut explicit_leave = false;
 
     loop {
         tokio::select! {
@@ -228,7 +239,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                 };
 
                 match signal {
-                    ClientSignal::JoinRoom { request_id, room_id, nickname, member_id } => {
+                    ClientSignal::CreateRoom { request_id, nickname } => {
                         if joined_room_id.is_some() {
                             let _ = send_json(&mut sender, &ServerSignal::Error {
                                 request_id: Some(request_id),
@@ -238,75 +249,129 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             continue;
                         }
 
-                        if let Some(member_id) = member_id {
-                            let room = match state.rooms.get_room(&room_id) {
-                                Ok(room) => room,
-                                Err(error) => {
-                                    let _ = send_error(&mut sender, Some(request_id), error).await;
-                                    continue;
-                                }
-                            };
-
-                            if !room.members.contains_key(&member_id) {
-                                let _ = send_error(&mut sender, Some(request_id), Error::MemberNotFound).await;
+                        let join = match state.rooms.create_room(nickname) {
+                            Ok(join) => join,
+                            Err(error) => {
+                                let _ = send_error(&mut sender, Some(request_id), error).await;
                                 continue;
                             }
+                        };
 
-                            let room_receiver = match state.signals.register(&room_id, &member_id) {
-                                Ok(receiver) => receiver,
-                                Err(error) => {
-                                    let _ = send_error(&mut sender, Some(request_id), error).await;
-                                    continue;
-                                }
-                            };
+                        let room_id = join.room.id.clone();
+                        let member_id = join.member.id.clone();
+                        let room_receiver = match state.signals.register(&room_id, &member_id) {
+                            Ok(receiver) => receiver,
+                            Err(error) => {
+                                let _ = state.rooms.leave_room(&room_id, &member_id);
+                                let _ = send_error(&mut sender, Some(request_id), error).await;
+                                continue;
+                            }
+                        };
 
-                            joined_room_id = Some(room_id.clone());
-                            joined_member_id = Some(member_id.clone());
-                            outbound = Some(room_receiver);
+                        joined_room_id = Some(room_id);
+                        joined_member_id = Some(member_id.clone());
+                        outbound = Some(room_receiver);
 
-                            let _ = send_json(&mut sender, &ServerSignal::JoinedRoom {
-                                request_id,
-                                room,
-                                member_id,
+                        let _ = send_json(&mut sender, &ServerSignal::JoinedRoom {
+                            request_id,
+                            room: join.room,
+                            member_id,
+                            resume_token: join.resume_token,
+                        }).await;
+                    }
+                    ClientSignal::JoinRoom { request_id, room_id, nickname } => {
+                        if joined_room_id.is_some() {
+                            let _ = send_json(&mut sender, &ServerSignal::Error {
+                                request_id: Some(request_id),
+                                code: "invalid_message",
+                                message: "已经加入房间".to_string(),
                             }).await;
-                        } else {
-                            let join = match state.rooms.join_room(&room_id, nickname) {
-                                Ok(join) => join,
-                                Err(error) => {
-                                    let _ = send_error(&mut sender, Some(request_id), error).await;
-                                    continue;
-                                }
-                            };
-
-                            let member_id = join.member.id.clone();
-                            let room_receiver = match state.signals.register(&room_id, &member_id) {
-                                Ok(receiver) => receiver,
-                                Err(error) => {
-                                    let _ = state.rooms.leave_room(&room_id, &member_id);
-                                    let _ = send_error(&mut sender, Some(request_id), error).await;
-                                    continue;
-                                }
-                            };
-
-                            joined_room_id = Some(room_id.clone());
-                            joined_member_id = Some(member_id.clone());
-                            outbound = Some(room_receiver);
-
-                            let _ = send_json(&mut sender, &ServerSignal::JoinedRoom {
-                                request_id,
-                                room: join.room.clone(),
-                                member_id: member_id.clone(),
-                            }).await;
-
-                            let _ = state.signals.broadcast(
-                                &room_id,
-                                ServerSignal::MemberJoined {
-                                    room: join.room,
-                                    member_id: member_id.clone(),
-                                },
-                                Some(&member_id),
-                            );
+                            continue;
                         }
+
+                        let join = match state.rooms.join_room(&room_id, nickname) {
+                            Ok(join) => join,
+                            Err(error) => {
+                                let _ = send_error(&mut sender, Some(request_id), error).await;
+                                continue;
+                            }
+                        };
+
+                        let member_id = join.member.id.clone();
+                        let room_receiver = match state.signals.register(&room_id, &member_id) {
+                            Ok(receiver) => receiver,
+                            Err(error) => {
+                                let _ = state.rooms.leave_room(&room_id, &member_id);
+                                let _ = send_error(&mut sender, Some(request_id), error).await;
+                                continue;
+                            }
+                        };
+
+                        joined_room_id = Some(room_id.clone());
+                        joined_member_id = Some(member_id.clone());
+                        outbound = Some(room_receiver);
+
+                        let _ = send_json(&mut sender, &ServerSignal::JoinedRoom {
+                            request_id,
+                            room: join.room.clone(),
+                            member_id: member_id.clone(),
+                            resume_token: join.resume_token,
+                        }).await;
+
+                        let _ = state.signals.broadcast(
+                            &room_id,
+                            ServerSignal::MemberJoined {
+                                room: join.room,
+                                member_id: member_id.clone(),
+                            },
+                            Some(&member_id),
+                        );
+                    }
+                    ClientSignal::ResumeRoom { request_id, room_id, member_id, resume_token } => {
+                        if joined_room_id.is_some() {
+                            let _ = send_json(&mut sender, &ServerSignal::Error {
+                                request_id: Some(request_id),
+                                code: "invalid_message",
+                                message: "已经加入房间".to_string(),
+                            }).await;
+                            continue;
+                        }
+
+                        let join = match state.rooms.resume_room(&room_id, &member_id, &resume_token) {
+                            Ok(join) => join,
+                            Err(error) => {
+                                let _ = send_error(&mut sender, Some(request_id), error).await;
+                                continue;
+                            }
+                        };
+
+                        let room_receiver = match state.signals.register(&room_id, &member_id) {
+                            Ok(receiver) => receiver,
+                            Err(error) => {
+                                let _ = send_error(&mut sender, Some(request_id), error).await;
+                                continue;
+                            }
+                        };
+
+                        joined_room_id = Some(room_id.clone());
+                        joined_member_id = Some(member_id.clone());
+                        outbound = Some(room_receiver);
+
+                        let _ = send_json(&mut sender, &ServerSignal::JoinedRoom {
+                            request_id,
+                            room: join.room.clone(),
+                            member_id: member_id.clone(),
+                            resume_token: join.resume_token,
+                        }).await;
+
+                        let _ = state.signals.broadcast(
+                            &room_id,
+                            ServerSignal::MemberUpdated {
+                                room: join.room,
+                                member_id: member_id.clone(),
+                            },
+                            Some(&member_id),
+                        );
                     }
                     ClientSignal::LeaveRoom { request_id } => {
                         if joined_room_id.is_none() {
@@ -314,6 +379,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             continue;
                         }
 
+                        explicit_leave = true;
                         break;
                     }
                     ClientSignal::SetSelfMuted { request_id, self_muted } => {
@@ -463,30 +529,75 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 
     if let (Some(room_id), Some(member_id)) = (joined_room_id, joined_member_id) {
         let _ = state.media.close_member(&room_id, &member_id).await;
+        let _ = state.signals.unregister(&room_id, &member_id);
 
-        if let Ok(room) = state.rooms.leave_room(&room_id, &member_id) {
-            let _ = state.signals.unregister(&room_id, &member_id);
-
-            if room.owner_member_id == member_id {
-                let _ = state.signals.broadcast(
-                    &room_id,
-                    ServerSignal::RoomClosed {
-                        room_id: room_id.clone(),
-                    },
-                    None,
-                );
-                let _ = state.signals.clear_room(&room_id);
-            } else {
-                let _ = state.signals.broadcast(
-                    &room_id,
-                    ServerSignal::MemberLeft { room, member_id },
-                    None,
-                );
-            }
-        } else {
-            let _ = state.signals.unregister(&room_id, &member_id);
+        if explicit_leave {
+            broadcast_explicit_leave(&state, &room_id, &member_id);
+        } else if let Ok(room) = state.rooms.mark_member_disconnected(&room_id, &member_id) {
+            let _ = state.signals.broadcast(
+                &room_id,
+                ServerSignal::MemberUpdated {
+                    room,
+                    member_id: member_id.clone(),
+                },
+                None,
+            );
+            schedule_disconnected_cleanup(state, room_id, member_id);
         }
     }
+}
+
+fn broadcast_explicit_leave(state: &AppState, room_id: &str, member_id: &str) {
+    let Ok(room) = state.rooms.leave_room(room_id, member_id) else {
+        return;
+    };
+
+    if room.owner_member_id == member_id {
+        let _ = state.signals.broadcast(
+            room_id,
+            ServerSignal::RoomClosed {
+                room_id: room_id.to_string(),
+            },
+            None,
+        );
+        let _ = state.signals.clear_room(room_id);
+    } else {
+        let _ = state.signals.broadcast(
+            room_id,
+            ServerSignal::MemberLeft {
+                room,
+                member_id: member_id.to_string(),
+            },
+            None,
+        );
+    }
+}
+
+fn schedule_disconnected_cleanup(state: AppState, room_id: String, member_id: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(state.disconnect_grace_period).await;
+
+        let Ok(Some(room)) = state.rooms.expire_disconnected_member(&room_id, &member_id) else {
+            return;
+        };
+
+        if room.owner_member_id == member_id {
+            let _ = state.signals.broadcast(
+                &room_id,
+                ServerSignal::RoomClosed {
+                    room_id: room_id.clone(),
+                },
+                None,
+            );
+            let _ = state.signals.clear_room(&room_id);
+        } else {
+            let _ = state.signals.broadcast(
+                &room_id,
+                ServerSignal::MemberLeft { room, member_id },
+                None,
+            );
+        }
+    });
 }
 
 fn request_id_from_text(text: &str) -> Option<String> {
@@ -598,12 +709,10 @@ mod tests {
             ClientSignal::JoinRoom {
                 request_id,
                 room_id,
-                nickname,
-                member_id
+                nickname
             } if request_id == "req-1"
                 && room_id == "ABC123"
                 && nickname == "小明"
-                && member_id.is_none()
         ));
     }
 

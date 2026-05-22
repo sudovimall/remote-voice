@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Remote Voice</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/assets/styles.css">
+    <script type="module" src="/assets/lobby.js"></script>
+  </head>
+  <body data-page="voice-lobby">
+    <main class="lobby-shell">
+      <section class="brand-rail" aria-labelledby="lobby-title">
+        <div class="brand-lockup">
+          <p class="eyebrow">Remote Voice</p>
+          <h1 id="lobby-title">进入语音房间</h1>
+        </div>
+
+        <div class="channel-board" aria-hidden="true">
+          <div class="channel-board-head">
+            <span>Voice</span>
+            <span>SFU</span>
+          </div>
+          <div class="channel-line channel-line-live">
+            <span></span>
+            <strong></strong>
+            <i></i>
+          </div>
+          <div class="channel-line">
+            <span></span>
+            <strong></strong>
+            <i></i>
+          </div>
+          <div class="channel-line channel-line-short">
+            <span></span>
+            <strong></strong>
+            <i></i>
+          </div>
+        </div>
+
+        <div class="stage-strip" aria-live="polite">
+          <span class="stage-dot" aria-hidden="true"></span>
+          <span id="lobby-status">准备进入</span>
+        </div>
+      </section>
+
+      <section class="lobby-actions" aria-label="房间入口">
+        <label class="field field-wide">
+          <span>昵称</span>
+          <input
+            id="nickname"
+            name="nickname"
+            autocomplete="nickname"
+            maxlength="32"
+            placeholder="输入昵称"
+          >
+        </label>
+
+        <div id="lobby-error" class="inline-message" role="status" hidden></div>
+
+        <form id="create-room" class="action-band">
+          <div>
+            <h2>创建房间</h2>
+            <p>生成新的语音空间。</p>
+          </div>
+          <button type="submit">创建</button>
+        </form>
+
+        <form id="join-room" class="action-band join-band">
+          <label class="field">
+            <span>房间号</span>
+            <input
+              id="room-id"
+              name="room_id"
+              autocomplete="off"
+              autocapitalize="characters"
+              maxlength="12"
+              placeholder="ABC123"
+            >
+          </label>
+          <button type="submit">加入</button>
+        </form>
+      </section>
+    </main>
+  </body>
+</html>
