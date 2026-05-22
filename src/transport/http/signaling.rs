@@ -50,6 +50,11 @@ pub enum ClientSignal {
         member_id: String,
         can_speak: bool,
     },
+    SetMemberListening {
+        request_id: Option<String>,
+        member_id: String,
+        listening: bool,
+    },
     // 浏览器发给后端 PeerConnection 的 offer；不再携带目标成员，也不会被转发给其他成员。
     WebrtcOffer {
         request_id: Option<String>,
@@ -75,6 +80,7 @@ pub enum ServerSignal {
         room: Room,
         member_id: String,
         resume_token: String,
+        not_listening_member_ids: Vec<String>,
     },
     MemberJoined {
         room: Room,
@@ -90,6 +96,10 @@ pub enum ServerSignal {
     MemberUpdated {
         room: Room,
         member_id: String,
+    },
+    MemberListeningUpdated {
+        request_id: Option<String>,
+        not_listening_member_ids: Vec<String>,
     },
     WebrtcAnswer {
         request_id: Option<String>,
@@ -277,6 +287,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             room: join.room,
                             member_id,
                             resume_token: join.resume_token,
+                            not_listening_member_ids: join.member.not_listening_member_ids(),
                         }).await;
                     }
                     ClientSignal::JoinRoom { request_id, room_id, nickname } => {
@@ -316,6 +327,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             room: join.room.clone(),
                             member_id: member_id.clone(),
                             resume_token: join.resume_token,
+                            not_listening_member_ids: join.member.not_listening_member_ids(),
                         }).await;
 
                         let _ = state.signals.broadcast(
@@ -362,6 +374,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             room: join.room.clone(),
                             member_id: member_id.clone(),
                             resume_token: join.resume_token,
+                            not_listening_member_ids: join.member.not_listening_member_ids(),
                         }).await;
 
                         let _ = state.signals.broadcast(
@@ -422,6 +435,43 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                                     ServerSignal::MemberUpdated { room, member_id },
                                     None,
                                 );
+                            }
+                            Err(error) => {
+                                let _ = send_error(&mut sender, request_id, error).await;
+                            }
+                        }
+                    }
+                    ClientSignal::SetMemberListening { request_id, member_id, listening } => {
+                        let Some((room_id, listener_member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                            let _ = send_not_joined(&mut sender, request_id).await;
+                            continue;
+                        };
+
+                        match state
+                            .rooms
+                            .set_member_listening(room_id, listener_member_id, &member_id, listening)
+                        {
+                            Ok(listening_state) => {
+                                match state
+                                    .media
+                                    .set_member_listening(room_id, listener_member_id, &member_id, listening)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        let _ = send_json(
+                                            &mut sender,
+                                            &ServerSignal::MemberListeningUpdated {
+                                                request_id,
+                                                not_listening_member_ids: listening_state
+                                                    .not_listening_member_ids,
+                                            },
+                                        )
+                                        .await;
+                                    }
+                                    Err(error) => {
+                                        let _ = send_error(&mut sender, request_id, error).await;
+                                    }
+                                }
                             }
                             Err(error) => {
                                 let _ = send_error(&mut sender, request_id, error).await;

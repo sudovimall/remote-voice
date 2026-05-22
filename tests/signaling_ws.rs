@@ -497,6 +497,82 @@ async fn websocket_房主用已有成员_id_加入后可以修改成员发言权
 }
 
 #[tokio::test]
+async fn websocket_监听状态只回给当前听众并在恢复后返回() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, room_id, owner_id, owner_resume_token) =
+        connect_create_with_resume(&ws_url, "create-owner", "房主").await;
+    let (mut member_ws, member_id) = connect_join(&ws_url, &room_id, "join-member", "队友").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "type": "set_member_listening",
+                "request_id": "listen-off",
+                "member_id": member_id,
+                "listening": false
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送监听控制");
+
+    let updated = read_until_type(&mut owner_ws, "member_listening_updated").await;
+    assert_eq!(updated["request_id"], "listen-off");
+    assert_eq!(updated["not_listening_member_ids"], json!([member_id]));
+    assert!(
+        timeout(Duration::from_millis(200), member_ws.next())
+            .await
+            .is_err()
+    );
+
+    owner_ws.close(None).await.expect("关闭房主 ws");
+    let (mut resumed, _) = connect_async(&ws_url).await.expect("连接恢复 ws");
+    resumed
+        .send(Message::Text(
+            json!({
+                "type": "resume_room",
+                "request_id": "resume-owner",
+                "room_id": room_id,
+                "member_id": owner_id,
+                "resume_token": owner_resume_token
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送 resume_room");
+    let joined = read_until_type(&mut resumed, "joined_room").await;
+    assert_eq!(joined["not_listening_member_ids"], json!([member_id]));
+}
+
+#[tokio::test]
+async fn websocket_监听控制拒绝屏蔽自己() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut ws, _room_id, owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+
+    ws.send(Message::Text(
+        json!({
+            "type": "set_member_listening",
+            "request_id": "listen-self",
+            "member_id": owner_id,
+            "listening": false
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("发送监听控制");
+
+    let error = read_until_type(&mut ws, "error").await;
+    assert_eq!(error["request_id"], "listen-self");
+    assert_eq!(error["code"], "invalid_message");
+}
+
+#[tokio::test]
 async fn websocket_重复绑定同一成员_id_返回错误且原连接仍可用() {
     let state = AppState::new(8).expect("创建应用状态");
     let created = state.rooms.create_room("房主").expect("创建房间");
