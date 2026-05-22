@@ -4,9 +4,11 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
-    # Host networking makes WebRTC ICE host candidates and ephemeral UDP
-    # media sockets reachable to LAN clients instead of Docker bridge only.
+    # Host networking makes WebRTC ICE host candidates and the UDP media
+    # sockets reachable outside Docker bridge networking.
     network_mode: host
+    volumes:
+      - ./application.yaml:/app/application.yaml:ro
 
   nginx:
     image: nginx

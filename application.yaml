@@ -2,3 +2,6 @@ port: 8080
 room:
   max_members: 8
   disconnect_grace_seconds: 30
+media:
+  udp_port_min: 40000
+  udp_port_max: 40100

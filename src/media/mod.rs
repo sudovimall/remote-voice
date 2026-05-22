@@ -7,8 +7,13 @@ use webrtc::{
         API, APIBuilder,
         interceptor_registry::register_default_interceptors,
         media_engine::{MIME_TYPE_OPUS, MediaEngine},
+        setting_engine::SettingEngine,
     },
-    ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit},
+    ice::udp_network::{EphemeralUDP, UDPNetwork},
+    ice_transport::{
+        ice_candidate::{RTCIceCandidate, RTCIceCandidateInit},
+        ice_candidate_type::RTCIceCandidateType,
+    },
     interceptor::registry::Registry,
     peer_connection::{
         RTCPeerConnection, configuration::RTCConfiguration,
@@ -147,6 +152,24 @@ impl MediaController {
         Self::with_api_builder(APIBuilder::new())
     }
 
+    pub fn new_with_udp_port_range(
+        udp_port_min: u16,
+        udp_port_max: u16,
+        public_ip: Option<String>,
+    ) -> Result<Self> {
+        let udp_ports = EphemeralUDP::new(udp_port_min, udp_port_max).map_err(|err| {
+            Error::Internal(format!(
+                "配置 WebRTC UDP 端口范围 {udp_port_min}-{udp_port_max} 失败: {err}"
+            ))
+        })?;
+        let mut setting_engine = SettingEngine::default();
+        setting_engine.set_udp_network(UDPNetwork::Ephemeral(udp_ports));
+        if let Some(public_ip) = public_ip {
+            setting_engine.set_nat_1to1_ips(vec![public_ip], RTCIceCandidateType::Host);
+        }
+        Self::with_api_builder(APIBuilder::new().with_setting_engine(setting_engine))
+    }
+
     fn with_api_builder(api_builder: APIBuilder) -> Result<Self> {
         let mut media_engine = MediaEngine::default();
         media_engine
@@ -169,7 +192,7 @@ impl MediaController {
 
     #[cfg(test)]
     fn new_with_vnet_for_test(vnet: Arc<webrtc::util::vnet::net::Net>) -> Result<Self> {
-        let mut setting_engine = webrtc::api::setting_engine::SettingEngine::default();
+        let mut setting_engine = SettingEngine::default();
         setting_engine.set_vnet(Some(vnet));
         Self::with_api_builder(APIBuilder::new().with_setting_engine(setting_engine))
     }
@@ -776,6 +799,75 @@ mod tests {
             .expect("根据 offer 生成 answer");
 
         assert!(answer.sdp.contains("m=audio"));
+    }
+
+    #[tokio::test]
+    async fn udp_端口范围成为服务端_ice_candidate_端口() {
+        let udp_port = free_udp_port().await;
+        let media = MediaController::new_with_udp_port_range(udp_port, udp_port, None)
+            .expect("创建固定 UDP 端口范围媒体控制器");
+
+        let mut answer = media
+            .handle_offer("room-1", "member-1", create_audio_offer().await)
+            .await
+            .expect("根据 offer 生成 answer");
+        let candidate = timeout(Duration::from_secs(2), answer.local_ice_candidates.recv())
+            .await
+            .expect("服务端 ICE candidate 未超时")
+            .expect("服务端 ICE candidate 存在");
+        let candidate_port = candidate
+            .candidate
+            .split_whitespace()
+            .nth(5)
+            .expect("candidate 带端口")
+            .parse::<u16>()
+            .expect("candidate 端口可解析");
+
+        assert_eq!(candidate_port, udp_port);
+    }
+
+    #[tokio::test]
+    async fn 公网_ip_成为_nat_后的服务端_host_candidate() {
+        let udp_port = free_udp_port().await;
+        let media = MediaController::new_with_udp_port_range(
+            udp_port,
+            udp_port,
+            Some("203.0.113.10".to_string()),
+        )
+        .expect("创建公网 ICE 媒体控制器");
+
+        let mut answer = media
+            .handle_offer("room-1", "member-1", create_audio_offer().await)
+            .await
+            .expect("根据 offer 生成 answer");
+        let mut candidates = Vec::new();
+        let mut saw_public_ip = false;
+        for _ in 0..8 {
+            let candidate = timeout(Duration::from_secs(2), answer.local_ice_candidates.recv())
+                .await
+                .expect("服务端 ICE candidate 未超时")
+                .expect("服务端 ICE candidate 存在");
+            saw_public_ip |= candidate.candidate.contains("203.0.113.10");
+            candidates.push(candidate.candidate);
+            if saw_public_ip {
+                break;
+            }
+        }
+
+        assert!(
+            saw_public_ip,
+            "配置的公网 IP 应进入 candidate: {}",
+            candidates.join(" | ")
+        );
+    }
+
+    async fn free_udp_port() -> u16 {
+        tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("绑定测试 UDP 端口")
+            .local_addr()
+            .expect("读取测试 UDP 端口")
+            .port()
     }
 
     #[tokio::test]

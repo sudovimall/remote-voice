@@ -30,9 +30,15 @@ impl AppState {
     }
 
     pub fn from_settings(settings: &Settings) -> Result<Self> {
-        Self::with_disconnect_grace_period(
-            settings.room.max_members,
-            Duration::from_secs(settings.room.disconnect_grace_seconds),
-        )
+        Ok(Self {
+            rooms: Arc::new(RoomStore::new(settings.room.max_members)),
+            signals: Arc::new(SignalHub::new()),
+            media: Arc::new(MediaController::new_with_udp_port_range(
+                settings.media.udp_port_min,
+                settings.media.udp_port_max,
+                settings.media.public_ip.clone(),
+            )?),
+            disconnect_grace_period: Duration::from_secs(settings.room.disconnect_grace_seconds),
+        })
     }
 }

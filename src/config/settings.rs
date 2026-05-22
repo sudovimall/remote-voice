@@ -9,6 +9,8 @@ pub struct Settings {
     pub port: u16,
     #[serde(default)]
     pub room: RoomSettings,
+    #[serde(default)]
+    pub media: MediaSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,11 +21,31 @@ pub struct RoomSettings {
     pub disconnect_grace_seconds: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaSettings {
+    #[serde(default = "default_udp_port_min")]
+    pub udp_port_min: u16,
+    #[serde(default = "default_udp_port_max")]
+    pub udp_port_max: u16,
+    #[serde(default)]
+    pub public_ip: Option<String>,
+}
+
 impl Default for RoomSettings {
     fn default() -> Self {
         Self {
             max_members: default_max_members(),
             disconnect_grace_seconds: default_disconnect_grace_seconds(),
+        }
+    }
+}
+
+impl Default for MediaSettings {
+    fn default() -> Self {
+        Self {
+            udp_port_min: default_udp_port_min(),
+            udp_port_max: default_udp_port_max(),
+            public_ip: None,
         }
     }
 }
@@ -36,12 +58,25 @@ fn default_disconnect_grace_seconds() -> u64 {
     30
 }
 
+fn default_udp_port_min() -> u16 {
+    40000
+}
+
+fn default_udp_port_max() -> u16 {
+    40100
+}
+
 impl Display for Settings {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "[port = {}, room.max_members = {}, room.disconnect_grace_seconds = {}]",
-            self.port, self.room.max_members, self.room.disconnect_grace_seconds
+            "[port = {}, room.max_members = {}, room.disconnect_grace_seconds = {}, media.udp_port_range = {}-{}, media.public_ip = {}]",
+            self.port,
+            self.room.max_members,
+            self.room.disconnect_grace_seconds,
+            self.media.udp_port_min,
+            self.media.udp_port_max,
+            self.media.public_ip.as_deref().unwrap_or("unset")
         )?;
         Ok(())
     }
@@ -53,6 +88,9 @@ pub fn init_config() -> Result<Settings> {
             port: 8080
             room:
               max_members: 8
+            media:
+              udp_port_min: 40000
+              udp_port_max: 40100
            "#
         .to_string()
     });
@@ -72,5 +110,36 @@ mod tests {
         assert_eq!(settings.port, 9000);
         assert_eq!(settings.room.max_members, 8);
         assert_eq!(settings.room.disconnect_grace_seconds, 30);
+        assert_eq!(settings.media.udp_port_min, 40000);
+        assert_eq!(settings.media.udp_port_max, 40100);
+        assert_eq!(settings.media.public_ip, None);
+    }
+
+    #[test]
+    fn 媒体_udp_端口范围可以配置并显示() {
+        let settings: Settings = serde_yaml::from_str(
+            r#"
+            port: 9000
+            media:
+              udp_port_min: 41000
+              udp_port_max: 41015
+              public_ip: 111.228.39.21
+            "#,
+        )
+        .expect("解析媒体配置");
+
+        assert_eq!(settings.media.udp_port_min, 41000);
+        assert_eq!(settings.media.udp_port_max, 41015);
+        assert_eq!(settings.media.public_ip.as_deref(), Some("111.228.39.21"));
+        assert!(
+            settings
+                .to_string()
+                .contains("media.udp_port_range = 41000-41015")
+        );
+        assert!(
+            settings
+                .to_string()
+                .contains("media.public_ip = 111.228.39.21")
+        );
     }
 }

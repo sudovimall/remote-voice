@@ -26,7 +26,21 @@ port: 8080
 room:
   max_members: 8
   disconnect_grace_seconds: 30
+media:
+  udp_port_min: 40000
+  udp_port_max: 40100
 ```
+
+如果服务部署在云厂商公网 IP 到实例私网 IP 的 NAT 后面，还要配置对外发布的公网 IP：
+
+```yaml
+media:
+  udp_port_min: 40000
+  udp_port_max: 40100
+  public_ip: 111.228.39.21
+```
+
+不配置 `media.public_ip` 时，服务端只按本机网卡地址收集 ICE host candidate，适合本机或局域网直连测试。
 
 ## Docker HTTPS 部署
 
@@ -61,6 +75,7 @@ docker compose up --build -d
 | HTTP 跳转 HTTPS | `80` | `80` | TCP |
 | HTTPS 页面和 WSS | `10000` | `443` | TCP |
 | Rust 服务内部入口 | `8080` | host network | TCP |
+| WebRTC 媒体端口范围 | `40000-40100` | host network | UDP |
 
 访问示例：
 
@@ -73,27 +88,23 @@ Nginx 会把普通页面请求和 `/ws` WebSocket 请求转发到宿主机 `8080
 
 ### 3. 防火墙和媒体 UDP 端口
 
-当前代码没有固定 WebRTC 媒体 UDP 端口。`webrtc-rs` 当前走默认的 ephemeral UDP 模式，ICE 收集时由宿主机系统分配临时 UDP 端口。
+服务端 WebRTC 媒体使用受限 UDP 端口范围。默认配置在 `application.yaml` 中固定为：
 
-Linux 上查看部署机临时端口范围：
-
-```bash
-cat /proc/sys/net/ipv4/ip_local_port_range
+```yaml
+media:
+  udp_port_min: 40000
+  udp_port_max: 40100
 ```
 
-本开发机当前输出为：
-
-```text
-32768 60999
-```
-
-部署时以目标宿主机自己的输出为准。局域网或服务器防火墙至少要允许：
+局域网或服务器防火墙至少要允许：
 
 - `80/tcp`
 - `10000/tcp`
-- 宿主机临时 UDP 端口范围，例如 `32768-60999/udp`
+- `40000-40100/udp`，或你在 `media.udp_port_min` 到 `media.udp_port_max` 中改成的范围
 
-如果部署环境不能放行临时 UDP 端口范围，后续需要把媒体层改成受控 UDP 端口范围或 UDP mux，而不是只改 Nginx。
+每个 WebRTC 会话会从这个范围内申请 UDP socket。范围过小、端口已被占用或被系统拒绝时，新的媒体会话可能无法建立；服务不会自动回退到范围外的随机 UDP 端口。
+
+如果部署机网卡上只有私网地址，例如 `172.16.x.x`，但用户通过云厂商公网 IP 访问，必须把该公网 IP 配到 `media.public_ip`。否则浏览器收到的服务端 ICE candidate 仍是私网地址，页面和 WebSocket 可以连通，媒体会协商失败。
 
 ### 4. 查看状态
 
@@ -106,8 +117,9 @@ docker compose logs -f voice nginx
 
 1. 是否通过 `https://<宿主机地址>:10000` 访问。
 2. `voice` 服务是否仍为 `network_mode: host`。
-3. 宿主机 UDP 临时端口范围是否被防火墙拦截。
-4. 浏览器麦克风权限是否允许。
+3. `media.udp_port_min` 到 `media.udp_port_max` 对应的 UDP 端口范围是否已放行，且没有被其他进程占满。
+4. 云主机 NAT 部署时 `media.public_ip` 是否等于对外访问的公网 IP。
+5. 浏览器麦克风权限是否允许。
 
 ## Docker 镜像构建和打包
 
