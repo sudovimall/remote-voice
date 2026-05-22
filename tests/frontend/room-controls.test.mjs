@@ -3,7 +3,10 @@ import test from "node:test";
 
 import {
   canManageMember,
+  canToggleMemberListening,
   memberCanSpeakSignal,
+  memberListeningLabel,
+  memberListeningSignal,
   memberPermissionLabel,
   selfMutedSignal,
 } from "../../static/room-controls.mjs";
@@ -42,4 +45,16 @@ test("only the owner manages another room member", () => {
 test("permission control label describes its next action", () => {
   assert.equal(memberPermissionLabel({ can_speak: true }), "禁言");
   assert.equal(memberPermissionLabel({ can_speak: false }), "允许发言");
+});
+
+test("member listening controls describe current private receive choice", () => {
+  assert.deepEqual(memberListeningSignal("m_member", false), {
+    type: "set_member_listening",
+    member_id: "m_member",
+    listening: false,
+  });
+  assert.equal(canToggleMemberListening("m_owner", { id: "m_member" }), true);
+  assert.equal(canToggleMemberListening("m_owner", { id: "m_owner" }), false);
+  assert.equal(memberListeningLabel(false), "不听");
+  assert.equal(memberListeningLabel(true), "接收");
 });

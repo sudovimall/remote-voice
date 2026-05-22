@@ -16,7 +16,10 @@ import {
 } from "/assets/room-state.mjs";
 import {
   canManageMember,
+  canToggleMemberListening,
   memberCanSpeakSignal,
+  memberListeningLabel,
+  memberListeningSignal,
   memberPermissionLabel,
   selfMutedSignal,
 } from "/assets/room-controls.mjs";
@@ -47,6 +50,7 @@ let roomSession = null;
 let intentionalShutdown = false;
 let pageHidden = false;
 let reconnectTimer = null;
+let notListeningMemberIds = new Set();
 const voiceState = {
   device: "idle",
   media: "waiting",
@@ -76,6 +80,10 @@ function setConnection(message) {
 
 function ownMember() {
   return currentRoom?.members?.[ownMemberId] ?? null;
+}
+
+function rememberListeningState(memberIds = []) {
+  notListeningMemberIds = new Set(memberIds);
 }
 
 function sendRoomControl(signal) {
@@ -215,6 +223,20 @@ function renderMember(member, room) {
   }
   signals.append(permission);
 
+  if (canToggleMemberListening(ownMemberId, member)) {
+    const notListening = notListeningMemberIds.has(member.id);
+    const listening = textNode(
+      "button",
+      "member-toggle member-listening-toggle",
+      memberListeningLabel(notListening),
+    );
+    listening.type = "button";
+    listening.addEventListener("click", () => {
+      sendRoomControl(memberListeningSignal(member.id, notListening));
+    });
+    signals.append(listening);
+  }
+
   row.append(identity, signals);
   return row;
 }
@@ -260,10 +282,18 @@ function handleRoomSignal(signal) {
     mediaSession?.close();
     clearRoomSession(window.sessionStorage);
     roomSession = null;
+    rememberListeningState();
     setConnection("房间已关闭");
     membersMeta.textContent = "房间已关闭";
     renderEmptyMembers("房主已离开。");
     showError("房主已离开，房间已关闭。");
+    return;
+  }
+  if (signal.type === "member_listening_updated") {
+    rememberListeningState(signal.not_listening_member_ids);
+    if (currentRoom) {
+      renderRoom(currentRoom);
+    }
     return;
   }
 
@@ -344,6 +374,7 @@ async function connectRoom(intent) {
     await nextClient.connect();
     const joined = await nextClient.request(entrySignal(intent));
     rememberJoinedRoom(joined, intent);
+    rememberListeningState(joined.not_listening_member_ids);
     currentRoom = joined.room;
     ownMemberId = joined.member_id;
     clearRoomEntryIntent(window.sessionStorage);
@@ -367,6 +398,7 @@ async function connectRoom(intent) {
     if (intent.mode === "resume") {
       clearRoomSession(window.sessionStorage);
       roomSession = null;
+      rememberListeningState();
     }
     setConnection("未加入");
     renderEmptyMembers("返回大厅重新进入。");
@@ -414,6 +446,7 @@ leaveRoom.addEventListener("click", () => {
   }
   clearRoomSession(window.sessionStorage);
   roomSession = null;
+  rememberListeningState();
   mediaSession?.close();
   client?.close();
   window.location.assign("/");

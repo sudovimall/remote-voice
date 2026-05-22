@@ -544,6 +544,10 @@ h2 {
   font-size: 0.86rem;
 }
 
+.member-listening-toggle {
+  min-width: 52px;
+}
+
 .mic-button {
   width: 100%;
   min-height: 102px;
