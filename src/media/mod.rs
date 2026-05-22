@@ -1,6 +1,10 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use webrtc::{
     api::{
@@ -42,6 +46,8 @@ pub struct MediaController {
     sessions: Arc<Mutex<SessionMap>>,
     // 房间权限可能先于媒体 offer 到达，先按成员记住，建会话时再带入 RTP 转发路径。
     member_can_speak: Arc<Mutex<HashMap<SessionKey, bool>>>,
+    // 每个听众私有的“不接收哪些发布者”策略，信令层只回传给当前听众。
+    member_not_listening: Arc<Mutex<HashMap<SessionKey, HashSet<String>>>>,
     event_sender: broadcast::Sender<MediaEvent>,
 }
 
@@ -197,6 +203,7 @@ impl MediaController {
             downlink_slot_count: downlink_slot_count.max(1),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             member_can_speak: Arc::new(Mutex::new(HashMap::new())),
+            member_not_listening: Arc::new(Mutex::new(HashMap::new())),
             event_sender: broadcast::channel(MEDIA_EVENT_QUEUE_CAPACITY).0,
         })
     }
@@ -263,6 +270,7 @@ impl MediaController {
         .await?;
 
         let sessions = Arc::clone(&self.sessions);
+        let member_not_listening = Arc::clone(&self.member_not_listening);
         let session_key = (room_id.to_string(), member_id.to_string());
         let event_sender = self.event_sender.clone();
         let track_peer_connection = Arc::clone(&peer_connection);
@@ -272,6 +280,7 @@ impl MediaController {
             let session_key = session_key.clone();
             let event_sender = event_sender.clone();
             let track_peer_connection = Arc::clone(&track_peer_connection);
+            let member_not_listening = Arc::clone(&member_not_listening);
 
             Box::pin(async move {
                 if track.kind() != RTPCodecType::Audio {
@@ -310,6 +319,7 @@ impl MediaController {
 
                     if attach_audio_to_subscribers(
                         Arc::clone(&sessions),
+                        Arc::clone(&member_not_listening),
                         &session_key.0,
                         &session_key.1,
                         outbound_track_id,
@@ -403,7 +413,13 @@ impl MediaController {
                 return Err(error);
             }
         };
-        attach_existing_audio_to_subscriber(Arc::clone(&self.sessions), room_id, member_id).await?;
+        attach_existing_audio_to_subscriber(
+            Arc::clone(&self.sessions),
+            Arc::clone(&self.member_not_listening),
+            room_id,
+            member_id,
+        )
+        .await?;
 
         if let Some(previous) = previous {
             // 新连接已经保存成功，旧连接关闭失败不应让本次 answer 回滚。
@@ -444,6 +460,13 @@ impl MediaController {
     pub async fn close_member(&self, room_id: &str, member_id: &str) -> Result<()> {
         let key = (room_id.to_string(), member_id.to_string());
         self.member_can_speak.lock().await.remove(&key);
+        {
+            let mut policies = self.member_not_listening.lock().await;
+            policies.remove(&key);
+            for blocked in policies.values_mut() {
+                blocked.remove(member_id);
+            }
+        }
         let session = {
             let mut sessions = self.sessions.lock().await;
             sessions.remove(&key)
@@ -458,6 +481,45 @@ impl MediaController {
         }
 
         Ok(())
+    }
+
+    /// 同步当前听众对某个发布者的下行接收偏好。
+    pub async fn set_member_listening(
+        &self,
+        room_id: &str,
+        listener_member_id: &str,
+        publisher_member_id: &str,
+        listening: bool,
+    ) -> Result<()> {
+        let listener_key = (room_id.to_string(), listener_member_id.to_string());
+        {
+            let mut policies = self.member_not_listening.lock().await;
+            let blocked = policies.entry(listener_key.clone()).or_default();
+            if listening {
+                blocked.remove(publisher_member_id);
+            } else {
+                blocked.insert(publisher_member_id.to_string());
+            }
+        }
+
+        if listening {
+            attach_existing_publisher_audio_to_subscriber(
+                Arc::clone(&self.sessions),
+                Arc::clone(&self.member_not_listening),
+                room_id,
+                listener_member_id,
+                publisher_member_id,
+            )
+            .await
+        } else {
+            detach_publisher_audio_from_subscriber(
+                Arc::clone(&self.sessions),
+                room_id,
+                listener_member_id,
+                publisher_member_id,
+            )
+            .await
+        }
     }
 
     /// 同步房间层的发言权限；没有媒体会话时缓存到该成员后续的 offer。
@@ -509,14 +571,41 @@ impl MediaController {
             format!("room-{room_id}"),
         ));
 
+        self.store_test_inbound_track(room_id, publisher_member_id, Arc::clone(&fanout_track))
+            .await?;
         attach_audio_to_subscribers(
             Arc::clone(&self.sessions),
+            Arc::clone(&self.member_not_listening),
             room_id,
             publisher_member_id,
             track_id,
             fanout_track,
         )
         .await
+    }
+
+    #[cfg(test)]
+    async fn store_test_inbound_track(
+        &self,
+        room_id: &str,
+        publisher_member_id: &str,
+        fanout_track: Arc<TrackLocalStaticRTP>,
+    ) -> Result<()> {
+        let key = (room_id.to_string(), publisher_member_id.to_string());
+        let mut sessions = self.sessions.lock().await;
+        let publisher = sessions.get_mut(&key).ok_or(Error::MemberNotFound)?;
+        publisher.inbound_tracks.insert(
+            usize::MAX,
+            InboundTrack {
+                id: "test-audio".to_string(),
+                stream_id: format!("room-{room_id}"),
+                ssrc: 0,
+                mime_type: "audio/opus".to_string(),
+                packet_count: 0,
+                fanout_track,
+            },
+        );
+        Ok(())
     }
 }
 
@@ -568,25 +657,32 @@ async fn add_downlink_slots(
     // 客户端发 offer 时预留多个音频 m-line；服务端把每个发布者放到独立 sender 槽位。
     let mut downlink_senders = Vec::with_capacity(slot_count);
     for slot_index in 0..slot_count {
-        let downlink_slot = Arc::new(TrackLocalStaticRTP::new(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_OPUS.to_string(),
-                clock_rate: 48000,
-                channels: 2,
-                ..Default::default()
-            },
-            format!("{member_id}:downlink-{slot_index}"),
-            format!("room-{room_id}"),
-        ));
-
         let downlink_sender = peer_connection
-            .add_track(downlink_slot as Arc<dyn TrackLocal + Send + Sync>)
+            .add_track(new_downlink_slot_track(room_id, member_id, slot_index)
+                as Arc<dyn TrackLocal + Send + Sync>)
             .await
             .map_err(|err| Error::Internal(format!("创建下行音频槽位失败: {err}")))?;
         downlink_senders.push(downlink_sender);
     }
 
     Ok(downlink_senders)
+}
+
+fn new_downlink_slot_track(
+    room_id: &str,
+    member_id: &str,
+    slot_index: usize,
+) -> Arc<TrackLocalStaticRTP> {
+    Arc::new(TrackLocalStaticRTP::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_OPUS.to_string(),
+            clock_rate: 48000,
+            channels: 2,
+            ..Default::default()
+        },
+        format!("{member_id}:downlink-{slot_index}"),
+        format!("room-{room_id}"),
+    ))
 }
 
 impl MediaSession {
@@ -689,6 +785,7 @@ async fn read_inbound_rtp(
 
 async fn attach_audio_to_subscribers(
     sessions: Arc<Mutex<SessionMap>>,
+    member_not_listening: Arc<Mutex<HashMap<SessionKey, HashSet<String>>>>,
     room_id: &str,
     publisher_member_id: &str,
     track_id: String,
@@ -709,6 +806,16 @@ async fn attach_audio_to_subscribers(
     };
 
     for subscriber_key in subscriber_keys {
+        if !listener_accepts_publisher(
+            Arc::clone(&member_not_listening),
+            &subscriber_key,
+            publisher_member_id,
+        )
+        .await
+        {
+            continue;
+        }
+
         attach_audio_to_subscriber(
             Arc::clone(&sessions),
             subscriber_key,
@@ -720,6 +827,17 @@ async fn attach_audio_to_subscribers(
     }
 
     Ok(())
+}
+
+async fn listener_accepts_publisher(
+    policies: Arc<Mutex<HashMap<SessionKey, HashSet<String>>>>,
+    listener_key: &SessionKey,
+    publisher_member_id: &str,
+) -> bool {
+    let policies = policies.lock().await;
+    !policies
+        .get(listener_key)
+        .is_some_and(|blocked| blocked.contains(publisher_member_id))
 }
 
 async fn attach_audio_to_subscriber(
@@ -775,8 +893,58 @@ async fn attach_audio_to_subscriber(
         .map_err(|err| Error::Internal(format!("替换下行音频槽位失败: {err}")))
 }
 
+async fn detach_publisher_audio_from_subscriber(
+    sessions: Arc<Mutex<SessionMap>>,
+    room_id: &str,
+    listener_member_id: &str,
+    publisher_member_id: &str,
+) -> Result<()> {
+    let subscriber_key = (room_id.to_string(), listener_member_id.to_string());
+    let downlink_slots = {
+        let mut sessions = sessions.lock().await;
+        let Some(subscriber) = sessions.get_mut(&subscriber_key) else {
+            return Ok(());
+        };
+
+        let track_ids = subscriber
+            .outbound_tracks
+            .iter()
+            .filter_map(|(track_id, outbound_track)| {
+                if outbound_track.publisher_member_id == publisher_member_id {
+                    Some(track_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        track_ids
+            .into_iter()
+            .filter_map(|track_id| {
+                let outbound_track = subscriber.outbound_tracks.remove(&track_id)?;
+                let downlink_sender = subscriber
+                    .downlink_senders
+                    .get(outbound_track.downlink_slot_index)
+                    .cloned()?;
+                Some((outbound_track.downlink_slot_index, downlink_sender))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (slot_index, downlink_sender) in downlink_slots {
+        let empty_slot = new_downlink_slot_track(room_id, listener_member_id, slot_index);
+        downlink_sender
+            .replace_track(Some(empty_slot as Arc<dyn TrackLocal + Send + Sync>))
+            .await
+            .map_err(|err| Error::Internal(format!("移除下行音频槽位失败: {err}")))?;
+    }
+
+    Ok(())
+}
+
 async fn attach_existing_audio_to_subscriber(
     sessions: Arc<Mutex<SessionMap>>,
+    member_not_listening: Arc<Mutex<HashMap<SessionKey, HashSet<String>>>>,
     room_id: &str,
     member_id: &str,
 ) -> Result<()> {
@@ -810,6 +978,16 @@ async fn attach_existing_audio_to_subscriber(
     };
 
     for (publisher_member_id, track_id, fanout_track) in existing_audio {
+        if !listener_accepts_publisher(
+            Arc::clone(&member_not_listening),
+            &subscriber_key,
+            &publisher_member_id,
+        )
+        .await
+        {
+            continue;
+        }
+
         attach_audio_to_subscriber(
             Arc::clone(&sessions),
             subscriber_key.clone(),
@@ -819,6 +997,62 @@ async fn attach_existing_audio_to_subscriber(
         )
         .await
         .map_err(|err| Error::Internal(format!("晚加入听众接入下行音频失败: {err}")))?;
+    }
+
+    Ok(())
+}
+
+async fn attach_existing_publisher_audio_to_subscriber(
+    sessions: Arc<Mutex<SessionMap>>,
+    member_not_listening: Arc<Mutex<HashMap<SessionKey, HashSet<String>>>>,
+    room_id: &str,
+    listener_member_id: &str,
+    publisher_member_id: &str,
+) -> Result<()> {
+    let subscriber_key = (room_id.to_string(), listener_member_id.to_string());
+    if !listener_accepts_publisher(
+        Arc::clone(&member_not_listening),
+        &subscriber_key,
+        publisher_member_id,
+    )
+    .await
+    {
+        return Ok(());
+    }
+
+    let existing_audio = {
+        let sessions = sessions.lock().await;
+        if !sessions.contains_key(&subscriber_key) {
+            return Ok(());
+        }
+
+        let publisher_key = (room_id.to_string(), publisher_member_id.to_string());
+        let Some(publisher) = sessions.get(&publisher_key) else {
+            return Ok(());
+        };
+
+        publisher
+            .inbound_tracks
+            .values()
+            .map(|track| {
+                (
+                    format!("{}:{}", publisher_member_id, track.id),
+                    Arc::clone(&track.fanout_track),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (track_id, fanout_track) in existing_audio {
+        attach_audio_to_subscriber(
+            Arc::clone(&sessions),
+            subscriber_key.clone(),
+            publisher_member_id,
+            &track_id,
+            fanout_track,
+        )
+        .await
+        .map_err(|err| Error::Internal(format!("恢复下行音频失败: {err}")))?;
     }
 
     Ok(())
@@ -1052,6 +1286,84 @@ mod tests {
                 .outbound_tracks
                 .iter()
                 .any(|track| track.publisher_member_id == "publisher-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn 发布者音频跳过不听该成员的听众() {
+        let media = MediaController::new().expect("创建媒体控制器");
+        for member_id in ["publisher-1", "listener-1", "listener-2"] {
+            media
+                .handle_offer("room-1", member_id, create_audio_offer().await)
+                .await
+                .expect("建立媒体会话");
+        }
+        media
+            .set_member_listening("room-1", "listener-1", "publisher-1", false)
+            .await
+            .expect("听众屏蔽发布者");
+
+        media
+            .attach_audio_to_subscribers_for_test("room-1", "publisher-1")
+            .await
+            .expect("挂发布者音轨");
+
+        assert_eq!(
+            media
+                .session_snapshot("room-1", "listener-1")
+                .await
+                .expect("屏蔽听众存在")
+                .outbound_track_count,
+            0
+        );
+        assert_eq!(
+            media
+                .session_snapshot("room-1", "listener-2")
+                .await
+                .expect("普通听众存在")
+                .outbound_track_count,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn 听众停止并恢复接收已存在发布者音轨() {
+        let media = MediaController::new().expect("创建媒体控制器");
+        for member_id in ["publisher-1", "listener-1"] {
+            media
+                .handle_offer("room-1", member_id, create_audio_offer().await)
+                .await
+                .expect("建立媒体会话");
+        }
+        media
+            .attach_audio_to_subscribers_for_test("room-1", "publisher-1")
+            .await
+            .expect("挂发布者音轨");
+
+        media
+            .set_member_listening("room-1", "listener-1", "publisher-1", false)
+            .await
+            .expect("停止接收");
+        assert_eq!(
+            media
+                .session_snapshot("room-1", "listener-1")
+                .await
+                .expect("听众存在")
+                .outbound_track_count,
+            0
+        );
+
+        media
+            .set_member_listening("room-1", "listener-1", "publisher-1", true)
+            .await
+            .expect("恢复接收");
+        assert_eq!(
+            media
+                .session_snapshot("room-1", "listener-1")
+                .await
+                .expect("听众存在")
+                .outbound_track_count,
+            1
         );
     }
 
