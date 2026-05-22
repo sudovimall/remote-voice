@@ -10,6 +10,10 @@ function normalizedRoomId(value) {
   return trimmed(value).toUpperCase();
 }
 
+function prefilledLobbyPath(roomId) {
+  return `/?room=${encodeURIComponent(roomId)}`;
+}
+
 function normalizeIntent(intent) {
   const nickname = trimmed(intent?.nickname);
   if (!nickname) {
@@ -63,6 +67,34 @@ export function loadNickname(storage) {
   } catch (_error) {
     return "";
   }
+}
+
+export function lobbyRoomId(search) {
+  try {
+    return normalizedRoomId(new URLSearchParams(search).get("room"));
+  } catch (_error) {
+    return "";
+  }
+}
+
+export function directRoomEntry(storage, routeRoomId) {
+  const roomId = normalizedRoomId(routeRoomId);
+  if (!roomId || roomId === "NEW") {
+    return null;
+  }
+
+  const nickname = loadNickname(storage);
+  if (!nickname) {
+    return {
+      lobbyPath: prefilledLobbyPath(roomId),
+    };
+  }
+
+  return {
+    mode: "join",
+    roomId,
+    nickname,
+  };
 }
 
 export function saveNickname(storage, nickname) {

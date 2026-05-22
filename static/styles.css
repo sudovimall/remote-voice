@@ -260,8 +260,60 @@ h2 {
 
 .join-band {
   min-height: 146px;
-  border-bottom: 0;
-  padding-bottom: 0;
+}
+
+.lobby-room-browser {
+  display: grid;
+  gap: 16px;
+  padding-top: 24px;
+}
+
+.lobby-room-head {
+  padding-bottom: 16px;
+}
+
+.lobby-room-head p,
+.lobby-room-list p {
+  margin: 7px 0 0;
+}
+
+.lobby-room-list {
+  display: grid;
+  gap: 10px;
+}
+
+.lobby-room-row {
+  min-height: 72px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px 10px 16px;
+  background: var(--paper-bright);
+}
+
+.lobby-room-row div {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.lobby-room-row strong,
+.lobby-room-row span {
+  overflow-wrap: anywhere;
+}
+
+.lobby-room-row span {
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+}
+
+.lobby-room-row button,
+.lobby-room-head button {
+  min-width: 76px;
+  padding: 0 16px;
 }
 
 .room-shell {
@@ -603,6 +655,7 @@ h2 {
   }
 
   .action-band,
+  .lobby-room-row,
   .room-topbar,
   .member-row {
     grid-template-columns: 1fr;
@@ -614,6 +667,10 @@ h2 {
   }
 
   .action-band button {
+    width: 100%;
+  }
+
+  .lobby-room-row button {
     width: 100%;
   }
 

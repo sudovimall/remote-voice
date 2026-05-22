@@ -38,6 +38,7 @@ async fn asset(Path(asset): Path<String>) -> Response {
         )
             .into_response(),
         "lobby.js" => javascript(include_str!("../../../static/lobby.js")),
+        "lobby-rooms.mjs" => javascript(include_str!("../../../static/lobby-rooms.mjs")),
         "room.js" => javascript(include_str!("../../../static/room.js")),
         "room-entry.mjs" => javascript(include_str!("../../../static/room-entry.mjs")),
         "room-state.mjs" => javascript(include_str!("../../../static/room-state.mjs")),
@@ -113,6 +114,7 @@ mod tests {
         for asset in [
             "styles.css",
             "lobby.js",
+            "lobby-rooms.mjs",
             "room.js",
             "room-entry.mjs",
             "room-state.mjs",

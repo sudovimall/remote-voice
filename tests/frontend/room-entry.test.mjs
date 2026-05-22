@@ -7,7 +7,9 @@ import {
   ROOM_SESSION_KEY,
   clearRoomEntryIntent,
   clearRoomSession,
+  directRoomEntry,
   loadNickname,
+  lobbyRoomId,
   loadRoomEntryIntent,
   loadRoomSession,
   saveNickname,
@@ -84,6 +86,22 @@ test("room entry intent rejects a mismatched join route and can be cleared", () 
   assert.equal(loadRoomEntryIntent(storage, "OTHER"), null);
   clearRoomEntryIntent(storage);
   assert.equal(storage.value(ENTRY_INTENT_KEY), undefined);
+});
+
+test("direct room links join with a saved nickname or return to a prefilled lobby", () => {
+  const storage = memoryStorage();
+  saveNickname(storage, " 队友 ");
+
+  assert.deepEqual(directRoomEntry(storage, " uin90k "), {
+    mode: "join",
+    roomId: "UIN90K",
+    nickname: "队友",
+  });
+  assert.deepEqual(directRoomEntry(memoryStorage(), " uin90k "), {
+    lobbyPath: "/?room=UIN90K",
+  });
+  assert.equal(lobbyRoomId("?room=uin90k"), "UIN90K");
+  assert.equal(lobbyRoomId("?other=value"), "");
 });
 
 test("room session stores resume credentials for the matching route", () => {

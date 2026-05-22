@@ -1,8 +1,10 @@
 import {
+  lobbyRoomId,
   loadNickname,
   saveNickname,
   saveRoomEntryIntent,
 } from "/assets/room-entry.mjs";
+import { fetchRoomSummaries } from "/assets/lobby-rooms.mjs";
 
 const nickname = document.querySelector("#nickname");
 const roomId = document.querySelector("#room-id");
@@ -10,8 +12,12 @@ const error = document.querySelector("#lobby-error");
 const status = document.querySelector("#lobby-status");
 const createRoomForm = document.querySelector("#create-room");
 const joinRoomForm = document.querySelector("#join-room");
+const roomBrowserMeta = document.querySelector("#room-browser-meta");
+const roomBrowserList = document.querySelector("#room-browser-list");
+const refreshRooms = document.querySelector("#refresh-rooms");
 
 nickname.value = loadNickname(window.localStorage);
+roomId.value = lobbyRoomId(window.location.search);
 
 function showError(message) {
   error.textContent = message;
@@ -24,7 +30,7 @@ function showPending(message) {
 }
 
 function submittedNickname(event) {
-  event.preventDefault();
+  event?.preventDefault();
 
   const value = nickname.value.trim();
   if (!value) {
@@ -49,6 +55,70 @@ function enterRoom(intent, path, pendingMessage) {
     window.location.assign(path);
   } catch (entryError) {
     showError(entryError.message || "无法准备房间入口。");
+  }
+}
+
+function joinRoom(roomIdValue, nicknameValue) {
+  enterRoom(
+    {
+      mode: "join",
+      roomId: roomIdValue,
+      nickname: nicknameValue,
+    },
+    `/rooms/${encodeURIComponent(roomIdValue)}`,
+    `正在连接房间 ${roomIdValue}。`,
+  );
+}
+
+function roomSummaryRow(room) {
+  const row = document.createElement("article");
+  row.className = "lobby-room-row";
+
+  const copy = document.createElement("div");
+  copy.append(
+    textNode("strong", room.id),
+    textNode("span", `${room.memberCount} 位成员`),
+  );
+
+  const join = textNode("button", "加入");
+  join.type = "button";
+  join.addEventListener("click", () => {
+    const nicknameValue = submittedNickname();
+    if (nicknameValue) {
+      joinRoom(room.id, nicknameValue);
+    }
+  });
+
+  row.append(copy, join);
+  return row;
+}
+
+function textNode(tag, text) {
+  const node = document.createElement(tag);
+  node.textContent = text;
+  return node;
+}
+
+function renderRooms(rooms) {
+  roomBrowserMeta.textContent = `${rooms.length} 个房间`;
+  if (rooms.length === 0) {
+    roomBrowserList.replaceChildren(textNode("p", "当前没有房间。"));
+    return;
+  }
+
+  roomBrowserList.replaceChildren(...rooms.map(roomSummaryRow));
+}
+
+async function loadRooms() {
+  refreshRooms.disabled = true;
+  roomBrowserMeta.textContent = "正在刷新";
+  try {
+    renderRooms(await fetchRoomSummaries(window.fetch.bind(window)));
+  } catch (roomsError) {
+    roomBrowserMeta.textContent = "刷新失败";
+    roomBrowserList.replaceChildren(textNode("p", roomsError.message || "房间列表不可用。"));
+  } finally {
+    refreshRooms.disabled = false;
   }
 }
 
@@ -81,13 +151,11 @@ joinRoomForm.addEventListener("submit", (event) => {
     return;
   }
 
-  enterRoom(
-    {
-      mode: "join",
-      roomId: roomId.value,
-      nickname: nicknameValue,
-    },
-    `/rooms/${encodeURIComponent(roomId.value)}`,
-    `正在连接房间 ${roomId.value}。`,
-  );
+  joinRoom(roomId.value, nicknameValue);
 });
+
+refreshRooms.addEventListener("click", () => {
+  void loadRooms();
+});
+
+void loadRooms();

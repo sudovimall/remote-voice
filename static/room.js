@@ -1,6 +1,7 @@
 import {
   clearRoomEntryIntent,
   clearRoomSession,
+  directRoomEntry,
   loadRoomEntryIntent,
   loadRoomSession,
   saveRoomSession,
@@ -433,10 +434,17 @@ if (!routeRoomId) {
     roomSession = session;
     connectRoom({ mode: "resume", session });
   } else {
-    setConnection("未加入");
-    membersMeta.textContent = "缺少进入信息";
-    renderEmptyMembers("从大厅创建或加入房间后再进入。");
-    showError("当前标签页没有这个房间的进入信息。");
+    const directEntry = directRoomEntry(window.localStorage, routeRoomId);
+    if (directEntry?.mode === "join") {
+      connectRoom(directEntry);
+    } else if (directEntry?.lobbyPath) {
+      window.location.replace(directEntry.lobbyPath);
+    } else {
+      setConnection("未加入");
+      membersMeta.textContent = "缺少进入信息";
+      renderEmptyMembers("从大厅创建或加入房间后再进入。");
+      showError("当前标签页没有这个房间的进入信息。");
+    }
   }
 }
 

@@ -80,6 +80,17 @@
           </label>
           <button type="submit">加入</button>
         </form>
+
+        <section class="lobby-room-browser" aria-labelledby="room-browser-title">
+          <div class="pane-head lobby-room-head">
+            <div>
+              <h2 id="room-browser-title">全部房间</h2>
+              <p id="room-browser-meta" class="meta-copy">正在读取</p>
+            </div>
+            <button id="refresh-rooms" type="button" class="quiet-button">刷新</button>
+          </div>
+          <div id="room-browser-list" class="lobby-room-list" aria-live="polite"></div>
+        </section>
       </section>
     </main>
   </body>
