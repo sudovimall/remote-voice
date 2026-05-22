@@ -44,6 +44,7 @@ async fn asset(Path(asset): Path<String>) -> Response {
         "room-state.mjs" => javascript(include_str!("../../../static/room-state.mjs")),
         "room-connection.mjs" => javascript(include_str!("../../../static/room-connection.mjs")),
         "room-controls.mjs" => javascript(include_str!("../../../static/room-controls.mjs")),
+        "chat-controls.mjs" => javascript(include_str!("../../../static/chat-controls.mjs")),
         "media-session.mjs" => javascript(include_str!("../../../static/media-session.mjs")),
         "signaling-client.mjs" => javascript(include_str!("../../../static/signaling-client.mjs")),
         _ => StatusCode::NOT_FOUND.into_response(),
@@ -121,6 +122,7 @@ mod tests {
             "room-state.mjs",
             "room-connection.mjs",
             "room-controls.mjs",
+            "chat-controls.mjs",
             "media-session.mjs",
             "signaling-client.mjs",
         ] {

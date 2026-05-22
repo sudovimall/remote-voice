@@ -24,13 +24,38 @@
       <div id="room-error" class="room-alert" role="status" hidden></div>
 
       <section class="room-grid">
-        <section class="members-pane" aria-labelledby="members-title">
+        <section id="side-panel" class="members-pane" aria-labelledby="members-title">
           <div class="pane-head">
-            <h2 id="members-title">成员</h2>
-            <span id="members-meta" class="meta-copy">等待房间状态</span>
+            <div>
+              <h2 id="members-title">成员</h2>
+              <span id="members-meta" class="meta-copy">等待房间状态</span>
+            </div>
+            <button
+              id="panel-toggle"
+              class="panel-switch"
+              type="button"
+              aria-label="切换到聊天"
+              title="切换到聊天"
+            >
+              <span id="panel-toggle-icon" class="panel-switch-icon" aria-hidden="true">聊</span>
+              <span id="chat-unread" class="chat-unread" hidden></span>
+            </button>
           </div>
 
           <div id="member-list" class="member-list" aria-label="成员列表"></div>
+          <section id="chat-panel" class="chat-panel" aria-label="文字聊天" hidden>
+            <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
+            <form id="chat-form" class="chat-form">
+              <textarea
+                id="chat-input"
+                maxlength="500"
+                rows="3"
+                aria-label="聊天消息"
+                placeholder="输入文字消息"
+              ></textarea>
+              <button id="chat-send" type="submit">发送</button>
+            </form>
+          </section>
         </section>
 
         <aside class="voice-pane" aria-labelledby="voice-title">

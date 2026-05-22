@@ -23,14 +23,29 @@ import {
   memberPermissionLabel,
   selfMutedSignal,
 } from "/assets/room-controls.mjs";
+import {
+  chatMessageView,
+  chatUnreadBadgeText,
+  nextChatUnreadCount,
+  sendChatMessageSignal,
+} from "/assets/chat-controls.mjs";
 import { MediaSession } from "/assets/media-session.mjs";
-import { SignalingClient } from "/assets/signaling-client.mjs";
+import { RoomConnection } from "/assets/room-connection.mjs";
 
 const roomIdNode = document.querySelector("#room-id");
 const roomError = document.querySelector("#room-error");
 const connection = document.querySelector("#room-connection");
+const sidePanel = document.querySelector("#side-panel");
+const membersTitle = document.querySelector("#members-title");
 const membersMeta = document.querySelector("#members-meta");
 const memberList = document.querySelector("#member-list");
+const panelToggle = document.querySelector("#panel-toggle");
+const panelToggleIcon = document.querySelector("#panel-toggle-icon");
+const chatUnread = document.querySelector("#chat-unread");
+const chatPanel = document.querySelector("#chat-panel");
+const chatMessagesNode = document.querySelector("#chat-messages");
+const chatForm = document.querySelector("#chat-form");
+const chatInput = document.querySelector("#chat-input");
 const micState = document.querySelector("#mic-state");
 const deviceState = document.querySelector("#device-state");
 const mediaState = document.querySelector("#media-state");
@@ -51,6 +66,9 @@ let intentionalShutdown = false;
 let pageHidden = false;
 let reconnectTimer = null;
 let notListeningMemberIds = new Set();
+let activeSidePanel = "members";
+let chatMessages = [];
+let unreadChatCount = 0;
 const voiceState = {
   device: "idle",
   media: "waiting",
@@ -76,6 +94,32 @@ function showError(message) {
 
 function setConnection(message) {
   connection.textContent = message;
+}
+
+function setActiveSidePanel(panel) {
+  activeSidePanel = panel;
+  const chatActive = panel === "chat";
+  memberList.hidden = chatActive;
+  chatPanel.hidden = !chatActive;
+  sidePanel.dataset.activePanel = panel;
+  membersTitle.textContent = chatActive ? "聊天" : "成员";
+  panelToggle.setAttribute("aria-label", chatActive ? "切换到成员" : "切换到聊天");
+  panelToggle.title = chatActive ? "切换到成员" : "切换到聊天";
+  panelToggleIcon.textContent = chatActive ? "员" : "聊";
+  if (chatActive) {
+    unreadChatCount = 0;
+    renderUnreadBadge();
+    requestAnimationFrame(() => {
+      chatMessagesNode.scrollTop = chatMessagesNode.scrollHeight;
+      chatInput.focus({ preventScroll: true });
+    });
+  }
+}
+
+function renderUnreadBadge() {
+  const label = chatUnreadBadgeText(unreadChatCount);
+  chatUnread.hidden = !label;
+  chatUnread.textContent = label;
 }
 
 function ownMember() {
@@ -174,6 +218,54 @@ function textNode(tag, className, text) {
   }
   node.textContent = text;
   return node;
+}
+
+function renderChatMessage(message) {
+  const view = chatMessageView(message, ownMemberId);
+  const row = document.createElement("article");
+  row.className = view.own ? "chat-message chat-message-own" : "chat-message";
+
+  const avatar = textNode("span", "chat-avatar", view.avatar);
+  const bubble = textNode("div", "chat-bubble", "");
+  const meta = textNode("div", "chat-message-meta", "");
+  meta.append(
+    textNode("strong", "", view.nickname),
+    textNode("time", "", view.timeLabel),
+  );
+  bubble.append(meta, textNode("p", "", view.content));
+  row.append(avatar, bubble);
+  return row;
+}
+
+function renderChatMessages() {
+  if (!chatMessages.length) {
+    const empty = textNode("div", "chat-empty", "还没有消息");
+    chatMessagesNode.replaceChildren(empty);
+    return;
+  }
+
+  chatMessagesNode.replaceChildren(...chatMessages.map(renderChatMessage));
+  chatMessagesNode.scrollTop = chatMessagesNode.scrollHeight;
+}
+
+function rememberChatMessages(messages = []) {
+  chatMessages = messages;
+  renderChatMessages();
+}
+
+function handleChatMessage(message) {
+  if (!message) {
+    return;
+  }
+  chatMessages = [...chatMessages, message];
+  unreadChatCount = nextChatUnreadCount(
+    unreadChatCount,
+    activeSidePanel,
+    message,
+    ownMemberId,
+  );
+  renderUnreadBadge();
+  renderChatMessages();
 }
 
 function renderMember(member, room) {
@@ -286,6 +378,7 @@ function handleRoomSignal(signal) {
     setConnection("房间已关闭");
     membersMeta.textContent = "房间已关闭";
     renderEmptyMembers("房主已离开。");
+    rememberChatMessages();
     showError("房主已离开，房间已关闭。");
     return;
   }
@@ -349,9 +442,10 @@ function scheduleReconnect() {
 
 async function connectRoom(intent) {
   setConnection("连接中");
-  const nextClient = new SignalingClient(websocketUrl(window.location));
+  const nextClient = new RoomConnection(websocketUrl(window.location));
   client = nextClient;
   nextClient.onSignal(handleRoomSignal);
+  nextClient.onChatMessage(handleChatMessage);
   nextClient.onProtocolError(() => showError("收到无法解析的房间信令。"));
   nextClient.onError(() => showError("房间信令连接失败。"));
   nextClient.onClose(() => {
@@ -372,11 +466,12 @@ async function connectRoom(intent) {
 
   try {
     await nextClient.connect();
-    const joined = await nextClient.request(entrySignal(intent));
+    const joined = await nextClient.enter(entrySignal(intent));
     rememberJoinedRoom(joined, intent);
     rememberListeningState(joined.not_listening_member_ids);
     currentRoom = joined.room;
     ownMemberId = joined.member_id;
+    rememberChatMessages(joined.chat_messages);
     clearRoomEntryIntent(window.sessionStorage);
     roomIdNode.textContent = joined.room.id;
     renderRoom(joined.room);
@@ -399,6 +494,7 @@ async function connectRoom(intent) {
       clearRoomSession(window.sessionStorage);
       roomSession = null;
       rememberListeningState();
+      rememberChatMessages();
     }
     setConnection("未加入");
     renderEmptyMembers("返回大厅重新进入。");
@@ -434,6 +530,42 @@ muteSelf.addEventListener("click", () => {
   sendRoomControl(selfMutedSignal(nextMuted));
 });
 
+panelToggle.addEventListener("click", () => {
+  setActiveSidePanel(activeSidePanel === "members" ? "chat" : "members");
+});
+
+chatForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  let signal;
+  try {
+    signal = sendChatMessageSignal(chatInput.value);
+  } catch (error) {
+    showError(error.message || "聊天消息无效。");
+    return;
+  }
+
+  chatInput.value = "";
+  chatInput.focus();
+  try {
+    if (!client) {
+      throw new Error("房间信令尚未连接。");
+    }
+    await client.sendChatMessage(signal.content, signal.request_id);
+  } catch (error) {
+    chatInput.value = signal.content;
+    showError(error.message || "聊天消息发送失败。");
+  }
+});
+
+chatInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.shiftKey || event.isComposing) {
+    return;
+  }
+
+  event.preventDefault();
+  chatForm.requestSubmit();
+});
+
 leaveRoom.addEventListener("click", () => {
   intentionalShutdown = true;
   if (reconnectTimer) {
@@ -447,6 +579,7 @@ leaveRoom.addEventListener("click", () => {
   clearRoomSession(window.sessionStorage);
   roomSession = null;
   rememberListeningState();
+  rememberChatMessages();
   mediaSession?.close();
   client?.close();
   window.location.assign("/");
@@ -456,6 +589,7 @@ if (!routeRoomId) {
   setConnection("地址无效");
   membersMeta.textContent = "缺少房间号";
   renderEmptyMembers("返回大厅重新进入。");
+  rememberChatMessages();
   showError("房间地址缺少房间号。");
 } else {
   roomIdNode.textContent = routeRoomId === "NEW" ? "创建中" : routeRoomId;
@@ -476,6 +610,7 @@ if (!routeRoomId) {
       setConnection("未加入");
       membersMeta.textContent = "缺少进入信息";
       renderEmptyMembers("从大厅创建或加入房间后再进入。");
+      rememberChatMessages();
       showError("当前标签页没有这个房间的进入信息。");
     }
   }
