@@ -1,6 +1,6 @@
 use crate::{
     Error, Result,
-    domain::room::Room,
+    domain::room::{ChatMessage, Room},
     media::{IceCandidate, MediaEvent},
     state::AppState,
 };
@@ -55,6 +55,10 @@ pub enum ClientSignal {
         member_id: String,
         listening: bool,
     },
+    SendChatMessage {
+        request_id: Option<String>,
+        content: String,
+    },
     // 浏览器发给后端 PeerConnection 的 offer；不再携带目标成员，也不会被转发给其他成员。
     WebrtcOffer {
         request_id: Option<String>,
@@ -81,6 +85,7 @@ pub enum ServerSignal {
         member_id: String,
         resume_token: String,
         not_listening_member_ids: Vec<String>,
+        chat_messages: Vec<ChatMessage>,
     },
     MemberJoined {
         room: Room,
@@ -100,6 +105,13 @@ pub enum ServerSignal {
     MemberListeningUpdated {
         request_id: Option<String>,
         not_listening_member_ids: Vec<String>,
+    },
+    ChatMessageSent {
+        request_id: Option<String>,
+        message: ChatMessage,
+    },
+    ChatMessage {
+        message: ChatMessage,
     },
     WebrtcAnswer {
         request_id: Option<String>,
@@ -288,6 +300,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             member_id,
                             resume_token: join.resume_token,
                             not_listening_member_ids: join.member.not_listening_member_ids(),
+                            chat_messages: Vec::new(),
                         }).await;
                     }
                     ClientSignal::JoinRoom { request_id, room_id, nickname } => {
@@ -328,6 +341,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             member_id: member_id.clone(),
                             resume_token: join.resume_token,
                             not_listening_member_ids: join.member.not_listening_member_ids(),
+                            chat_messages: state.rooms.chat_history(&room_id).unwrap_or_default(),
                         }).await;
 
                         let _ = state.signals.broadcast(
@@ -375,6 +389,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             member_id: member_id.clone(),
                             resume_token: join.resume_token,
                             not_listening_member_ids: join.member.not_listening_member_ids(),
+                            chat_messages: state.rooms.chat_history(&room_id).unwrap_or_default(),
                         }).await;
 
                         let _ = state.signals.broadcast(
@@ -472,6 +487,33 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                                         let _ = send_error(&mut sender, request_id, error).await;
                                     }
                                 }
+                            }
+                            Err(error) => {
+                                let _ = send_error(&mut sender, request_id, error).await;
+                            }
+                        }
+                    }
+                    ClientSignal::SendChatMessage { request_id, content } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                            let _ = send_not_joined(&mut sender, request_id).await;
+                            continue;
+                        };
+
+                        match state.rooms.send_chat_message(room_id, member_id, &content) {
+                            Ok(message) => {
+                                let _ = send_json(
+                                    &mut sender,
+                                    &ServerSignal::ChatMessageSent {
+                                        request_id,
+                                        message: message.clone(),
+                                    },
+                                )
+                                .await;
+                                let _ = state.signals.broadcast(
+                                    room_id,
+                                    ServerSignal::ChatMessage { message },
+                                    Some(member_id),
+                                );
                             }
                             Err(error) => {
                                 let _ = send_error(&mut sender, request_id, error).await;

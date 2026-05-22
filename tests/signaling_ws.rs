@@ -250,6 +250,78 @@ async fn websocket_创建房间后收到_joined_room() {
 }
 
 #[tokio::test]
+async fn websocket_聊天消息会确认给发送者并广播给其他成员() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, room_id, owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut member_ws, member_id) = connect_join(&ws_url, &room_id, "join-member", "队友").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "type": "send_chat_message",
+                "request_id": "chat-1",
+                "content": " 晚上打哪张图？ "
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送聊天消息");
+
+    let sent = read_until_type(&mut owner_ws, "chat_message_sent").await;
+    assert_eq!(sent["request_id"], "chat-1");
+    assert_eq!(sent["message"]["room_id"], room_id);
+    assert_eq!(sent["message"]["member_id"], owner_id);
+    assert_eq!(sent["message"]["nickname"], "房主");
+    assert_eq!(sent["message"]["content"], "晚上打哪张图？");
+
+    let received = read_until_type(&mut member_ws, "chat_message").await;
+    assert_eq!(received["message"], sent["message"]);
+    assert_eq!(received["message"]["member_id"], owner_id);
+    assert_ne!(received["message"]["member_id"], member_id);
+}
+
+#[tokio::test]
+async fn websocket_joined_room_返回聊天历史() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, room_id, _owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "type": "send_chat_message",
+                "request_id": "chat-1",
+                "content": "历史消息"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送聊天消息");
+    let _ = read_until_type(&mut owner_ws, "chat_message_sent").await;
+
+    let (mut member_ws, _) = connect_async(&ws_url).await.expect("连接 ws");
+    member_ws
+        .send(Message::Text(
+            json!({
+                "type": "join_room",
+                "request_id": "join-member",
+                "room_id": room_id,
+                "nickname": "队友",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送 join_room");
+    let joined = read_until_type(&mut member_ws, "joined_room").await;
+    assert_eq!(joined["chat_messages"][0]["content"], "历史消息");
+}
+
+#[tokio::test]
 async fn websocket_joined_room_返回恢复凭据() {
     let state = AppState::new(8).expect("创建应用状态");
     let ws_url = spawn_app(state).await;
