@@ -8,7 +8,7 @@ async fn main() -> Result<()> {
     app::serve(config).await
 }
 
-/// log
+/// 初始化后端日志。
 fn init_log() {
     tracing_subscriber::fmt()
         .with_env_filter(

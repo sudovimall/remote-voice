@@ -70,13 +70,13 @@ impl Display for Settings {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "[port = {}, room.max_members = {}, room.disconnect_grace_seconds = {}, media.udp_port_range = {}-{}, media.public_ip = {}]",
+            "[监听端口 = {}, 房间人数上限 = {}, 断线保留秒数 = {}, 媒体 UDP 端口范围 = {}-{}, 对外媒体 IP = {}]",
             self.port,
             self.room.max_members,
             self.room.disconnect_grace_seconds,
             self.media.udp_port_min,
             self.media.udp_port_max,
-            self.media.public_ip.as_deref().unwrap_or("unset")
+            self.media.public_ip.as_deref().unwrap_or("未配置")
         )?;
         Ok(())
     }
@@ -95,7 +95,7 @@ pub fn init_config() -> Result<Settings> {
         .to_string()
     });
     let config = serde_yaml::from_str::<Settings>(s.as_str())?;
-    info!(%config, "VoiceConfig:");
+    info!("后端配置已加载：{config}");
     Ok(config)
 }
 
@@ -134,12 +134,31 @@ mod tests {
         assert!(
             settings
                 .to_string()
-                .contains("media.udp_port_range = 41000-41015")
+                .contains("媒体 UDP 端口范围 = 41000-41015")
         );
-        assert!(
-            settings
-                .to_string()
-                .contains("media.public_ip = 111.228.39.21")
-        );
+        assert!(settings.to_string().contains("对外媒体 IP = 111.228.39.21"));
+    }
+
+    #[test]
+    fn 配置日志展示使用中文字段名() {
+        let settings: Settings = serde_yaml::from_str(
+            r#"
+            port: 9000
+            room:
+              max_members: 12
+              disconnect_grace_seconds: 45
+            media:
+              udp_port_min: 41000
+              udp_port_max: 41015
+            "#,
+        )
+        .expect("解析配置");
+
+        let display = settings.to_string();
+        assert!(display.contains("监听端口 = 9000"));
+        assert!(display.contains("房间人数上限 = 12"));
+        assert!(display.contains("断线保留秒数 = 45"));
+        assert!(display.contains("媒体 UDP 端口范围 = 41000-41015"));
+        assert!(display.contains("对外媒体 IP = 未配置"));
     }
 }

@@ -14,7 +14,7 @@ pub async fn serve(settings: Settings) -> Result<()> {
     let app = build_router(state);
     let listener = TcpListener::bind(addr).await?;
 
-    info!(%addr, "HTTP 服务启动");
+    info!("HTTP 服务已启动，监听地址：{addr}");
     axum::serve(listener, app).await?;
 
     Ok(())
