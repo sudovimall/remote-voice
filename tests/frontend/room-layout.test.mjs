@@ -32,6 +32,19 @@ test("room screen panel contains sharing controls and popout", () => {
   assert.match(css, /\.screen-popout\b/);
 });
 
+test("room screen panel tolerates optional meta copy", () => {
+  assert.match(roomJs, /if\s*\(\s*screenShareMeta\s*\)\s*\{[\s\S]*screenShareMeta\.textContent/);
+});
+
+test("room keeps negotiated remote screen stream across inactive sharing state", () => {
+  assert.match(roomJs, /let remoteScreenStream = null;/);
+  assert.match(roomJs, /function activeScreenStream\(\)/);
+  assert.doesNotMatch(
+    roomJs,
+    /if\s*\(\s*!sharing\s*\)\s*\{[\s\S]*attachScreenStream\(null\)/,
+  );
+});
+
 test("room chat mentions use inline picker, highlight, and passive reminder", () => {
   assert.match(html, /id="mention-picker"[\s\S]*class="mention-picker"[\s\S]*hidden/);
   assert.match(html, /id="mention-reminder"[\s\S]*class="mention-reminder"[\s\S]*hidden/);

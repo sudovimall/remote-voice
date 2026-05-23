@@ -116,7 +116,8 @@ let mentionReminderTimer = null;
 let latencySnapshot = { serverMs: null, members: {} };
 let memberVolumes = new Map();
 let microphoneGainLevel = loadMicrophoneGain(window.localStorage);
-let screenStream = null;
+let localScreenStream = null;
+let remoteScreenStream = null;
 let speakingMemberIds = new Set();
 let speakingTimers = new Map();
 const SPEAKING_TTL_MS = 1800;
@@ -192,12 +193,36 @@ function canStopScreenShare() {
   return Boolean(share && (share.member_id === ownMemberId || self?.role === "owner"));
 }
 
-function attachScreenStream(stream) {
-  screenStream = stream;
-  screenVideo.srcObject = stream;
-  screenPopoutVideo.srcObject = stream;
+function activeScreenStream() {
+  const share = currentScreenShare();
+  if (!share) {
+    return null;
+  }
+
+  return share.member_id === ownMemberId ? localScreenStream : remoteScreenStream;
+}
+
+function renderScreenVideoState() {
+  const stream = activeScreenStream();
+  if (screenVideo.srcObject !== stream) {
+    screenVideo.srcObject = stream;
+  }
+  if (screenPopoutVideo.srcObject !== stream) {
+    screenPopoutVideo.srcObject = stream;
+  }
+
   screenVideo.classList.toggle("screen-video-active", Boolean(stream));
   screenVideoPlaceholder.classList.toggle("screen-video-placeholder-hidden", Boolean(stream));
+}
+
+function attachLocalScreenStream(stream) {
+  localScreenStream = stream;
+  renderScreenVideoState();
+}
+
+function attachRemoteScreenStream(stream) {
+  remoteScreenStream = stream;
+  renderScreenVideoState();
 }
 
 function renderScreenSharePanel() {
@@ -205,31 +230,34 @@ function renderScreenSharePanel() {
   const sharing = Boolean(share);
   const selfSharing = share?.member_id === ownMemberId;
   const canShare = mediaSession?.canShareScreen?.() ?? Boolean(navigator.mediaDevices?.getDisplayMedia);
+  const stream = activeScreenStream();
 
   screenShareTitle.textContent = sharing
     ? `${share.nickname || "成员"} 正在共享屏幕`
     : "当前没有屏幕共享";
-  screenShareMeta.textContent = sharing
-    ? "语音沟通继续使用麦克风。"
-    : "切到共享后不会影响语音连接。";
+  if (screenShareMeta) {
+    screenShareMeta.textContent = sharing
+      ? "语音沟通继续使用麦克风。"
+      : "切到共享后不会影响语音连接。";
+  }
   startScreenShare.hidden = sharing;
   startScreenShare.disabled = !mediaReady || !canShare;
   startScreenShare.title = canShare ? "开始共享屏幕" : "当前浏览器不支持屏幕共享";
   stopScreenShare.hidden = !canStopScreenShare();
   stopScreenShare.textContent = selfSharing ? "停止共享" : "停止对方共享";
-  openScreenPopout.disabled = !sharing || !screenStream;
-  fullscreenScreenShare.disabled = !sharing || !screenStream;
+  openScreenPopout.disabled = !sharing || !stream;
+  fullscreenScreenShare.disabled = !sharing || !stream;
   screenPopoutTitle.textContent = sharing
     ? `${share.nickname || "成员"} 的屏幕共享`
     : "屏幕共享";
+  renderScreenVideoState();
   if (!sharing) {
-    attachScreenStream(null);
     screenPopout.hidden = true;
   }
 }
 
 function openScreenSharePopout() {
-  if (!currentScreenShare() || !screenStream) {
+  if (!currentScreenShare() || !activeScreenStream()) {
     return;
   }
   screenPopout.hidden = false;
@@ -831,7 +859,7 @@ function handleRoomSignal(signal) {
       mediaSession
         ?.startScreenShare()
         .then((stream) => {
-          attachScreenStream(stream);
+          attachLocalScreenStream(stream);
           renderScreenSharePanel();
         })
         .catch((error) => {
@@ -843,11 +871,11 @@ function handleRoomSignal(signal) {
   }
   if (signal.type === "screen_share_stopped") {
     if (signal.member_id === ownMemberId) {
-      mediaSession?.stopScreenShare().catch((error) => {
+      attachLocalScreenStream(null);
+      mediaSession?.stopScreenShare({ notify: false }).catch((error) => {
         showError(error.message || "停止屏幕共享失败。");
       });
     }
-    attachScreenStream(null);
     renderScreenSharePanel();
     return;
   }
@@ -970,13 +998,15 @@ async function connectRoom(intent) {
 async function startMedia() {
   mediaSession?.close();
   mediaReady = false;
+  localScreenStream = null;
+  remoteScreenStream = null;
   mediaSession = new MediaSession(client, {
     audioHost: remoteAudio,
     onState: renderVoiceState,
     onLatency: rememberLatencySnapshot,
     onSpeaking: sendMemberSpeaking,
     onScreenStream(stream) {
-      attachScreenStream(stream);
+      attachRemoteScreenStream(stream);
       renderScreenSharePanel();
     },
     onScreenShareEnded() {
