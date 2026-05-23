@@ -37,7 +37,7 @@ media:
 media:
   udp_port_min: 40000
   udp_port_max: 40100
-  public_ip: 111.228.39.21
+  public_ip: 
 ```
 
 不配置 `media.public_ip` 时，服务端只按本机网卡地址收集 ICE host candidate，适合本机或局域网直连测试。
