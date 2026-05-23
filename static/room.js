@@ -12,6 +12,8 @@ import {
   membersForRoom,
   nextRoomSnapshot,
   resumeRoomSignal,
+  startScreenShareSignal,
+  stopScreenShareSignal,
   websocketUrl,
 } from "/assets/room-state.mjs";
 import {
@@ -56,8 +58,7 @@ const sidePanel = document.querySelector("#side-panel");
 const membersTitle = document.querySelector("#members-title");
 const membersMeta = document.querySelector("#members-meta");
 const memberList = document.querySelector("#member-list");
-const panelToggle = document.querySelector("#panel-toggle");
-const panelToggleIcon = document.querySelector("#panel-toggle-icon");
+const panelTabs = Array.from(document.querySelectorAll("[data-panel]"));
 const chatUnread = document.querySelector("#chat-unread");
 const chatPanel = document.querySelector("#chat-panel");
 const chatMessagesNode = document.querySelector("#chat-messages");
@@ -67,6 +68,22 @@ const mentionReminderText = document.querySelector("#mention-reminder-text");
 const chatForm = document.querySelector("#chat-form");
 const mentionPicker = document.querySelector("#mention-picker");
 const chatInput = document.querySelector("#chat-input");
+const screenPanel = document.querySelector("#screen-panel");
+const screenShareTitle = document.querySelector("#screen-share-title");
+const screenShareMeta = document.querySelector("#screen-share-meta");
+const startScreenShare = document.querySelector("#start-screen-share");
+const stopScreenShare = document.querySelector("#stop-screen-share");
+const openScreenPopout = document.querySelector("#open-screen-popout");
+const fullscreenScreenShare = document.querySelector("#fullscreen-screen-share");
+const screenVideoFrame = document.querySelector("#screen-video-frame");
+const screenVideo = document.querySelector("#screen-video");
+const screenVideoPlaceholder = document.querySelector("#screen-video-placeholder");
+const screenPopout = document.querySelector("#screen-popout");
+const screenPopoutTitle = document.querySelector("#screen-popout-title");
+const screenPopoutFrame = document.querySelector("#screen-popout-frame");
+const screenPopoutVideo = document.querySelector("#screen-popout-video");
+const closeScreenPopout = document.querySelector("#close-screen-popout");
+const popoutFullscreenScreenShare = document.querySelector("#popout-fullscreen-screen-share");
 const micState = document.querySelector("#mic-state");
 const deviceState = document.querySelector("#device-state");
 const mediaState = document.querySelector("#media-state");
@@ -99,6 +116,7 @@ let mentionReminderTimer = null;
 let latencySnapshot = { serverMs: null, members: {} };
 let memberVolumes = new Map();
 let microphoneGainLevel = loadMicrophoneGain(window.localStorage);
+let screenStream = null;
 let speakingMemberIds = new Set();
 let speakingTimers = new Map();
 const SPEAKING_TTL_MS = 1800;
@@ -133,13 +151,17 @@ function setConnection(message) {
 function setActiveSidePanel(panel) {
   activeSidePanel = panel;
   const chatActive = panel === "chat";
-  memberList.hidden = chatActive;
+  const screenActive = panel === "screen";
+  memberList.hidden = chatActive || screenActive;
   chatPanel.hidden = !chatActive;
+  screenPanel.hidden = !screenActive;
   sidePanel.dataset.activePanel = panel;
-  membersTitle.textContent = chatActive ? "聊天" : "成员";
-  panelToggle.setAttribute("aria-label", chatActive ? "切换到成员" : "切换到聊天");
-  panelToggle.title = chatActive ? "切换到成员" : "切换到聊天";
-  panelToggleIcon.textContent = chatActive ? "员" : "聊";
+  membersTitle.textContent = screenActive ? "共享" : chatActive ? "聊天" : "成员";
+  for (const tab of panelTabs) {
+    const active = tab.dataset.panel === panel;
+    tab.classList.toggle("panel-tab-active", active);
+    tab.setAttribute("aria-selected", String(active));
+  }
   if (chatActive) {
     unreadChatCount = 0;
     renderUnreadBadge();
@@ -149,12 +171,83 @@ function setActiveSidePanel(panel) {
       chatInput.focus({ preventScroll: true });
     });
   }
+  if (screenActive) {
+    renderScreenSharePanel();
+  }
 }
 
 function renderUnreadBadge() {
   const label = chatUnreadBadgeText(unreadChatCount);
   chatUnread.hidden = !label;
   chatUnread.textContent = label;
+}
+
+function currentScreenShare() {
+  return currentRoom?.screen_share ?? null;
+}
+
+function canStopScreenShare() {
+  const share = currentScreenShare();
+  const self = ownMember();
+  return Boolean(share && (share.member_id === ownMemberId || self?.role === "owner"));
+}
+
+function attachScreenStream(stream) {
+  screenStream = stream;
+  screenVideo.srcObject = stream;
+  screenPopoutVideo.srcObject = stream;
+  screenVideo.classList.toggle("screen-video-active", Boolean(stream));
+  screenVideoPlaceholder.classList.toggle("screen-video-placeholder-hidden", Boolean(stream));
+}
+
+function renderScreenSharePanel() {
+  const share = currentScreenShare();
+  const sharing = Boolean(share);
+  const selfSharing = share?.member_id === ownMemberId;
+  const canShare = mediaSession?.canShareScreen?.() ?? Boolean(navigator.mediaDevices?.getDisplayMedia);
+
+  screenShareTitle.textContent = sharing
+    ? `${share.nickname || "成员"} 正在共享屏幕`
+    : "当前没有屏幕共享";
+  screenShareMeta.textContent = sharing
+    ? "语音沟通继续使用麦克风。"
+    : "切到共享后不会影响语音连接。";
+  startScreenShare.hidden = sharing;
+  startScreenShare.disabled = !mediaReady || !canShare;
+  startScreenShare.title = canShare ? "开始共享屏幕" : "当前浏览器不支持屏幕共享";
+  stopScreenShare.hidden = !canStopScreenShare();
+  stopScreenShare.textContent = selfSharing ? "停止共享" : "停止对方共享";
+  openScreenPopout.disabled = !sharing || !screenStream;
+  fullscreenScreenShare.disabled = !sharing || !screenStream;
+  screenPopoutTitle.textContent = sharing
+    ? `${share.nickname || "成员"} 的屏幕共享`
+    : "屏幕共享";
+  if (!sharing) {
+    attachScreenStream(null);
+    screenPopout.hidden = true;
+  }
+}
+
+function openScreenSharePopout() {
+  if (!currentScreenShare() || !screenStream) {
+    return;
+  }
+  screenPopout.hidden = false;
+}
+
+async function requestScreenFullscreen(target = screenVideoFrame) {
+  try {
+    if (!target?.requestFullscreen) {
+      throw new Error("当前浏览器不支持全屏。");
+    }
+    await target.requestFullscreen();
+  } catch (error) {
+    showError(error.message || "无法进入全屏。");
+  }
+}
+
+function startScreenShareRequestId() {
+  return `screen-${Date.now()}`;
 }
 
 function clearMentionReminder() {
@@ -684,6 +777,7 @@ function renderRoom(room) {
   membersMeta.textContent = `${members.length} 位成员`;
   memberList.replaceChildren(...members.map((member) => renderMember(member, room)));
   renderVoiceState();
+  renderScreenSharePanel();
 }
 
 function handleRoomSignal(signal) {
@@ -729,6 +823,32 @@ function handleRoomSignal(signal) {
   }
   if (signal.type === "member_latency_updated") {
     rememberMemberLatency(signal.member_id, signal.server_ms);
+    return;
+  }
+  if (signal.type === "screen_share_started") {
+    renderScreenSharePanel();
+    if (signal.member_id === ownMemberId) {
+      mediaSession
+        ?.startScreenShare()
+        .then((stream) => {
+          attachScreenStream(stream);
+          renderScreenSharePanel();
+        })
+        .catch((error) => {
+          showError(error.message || "屏幕共享启动失败。");
+          sendRoomControl(stopScreenShareSignal(startScreenShareRequestId()));
+        });
+    }
+    return;
+  }
+  if (signal.type === "screen_share_stopped") {
+    if (signal.member_id === ownMemberId) {
+      mediaSession?.stopScreenShare().catch((error) => {
+        showError(error.message || "停止屏幕共享失败。");
+      });
+    }
+    attachScreenStream(null);
+    renderScreenSharePanel();
     return;
   }
 
@@ -855,6 +975,13 @@ async function startMedia() {
     onState: renderVoiceState,
     onLatency: rememberLatencySnapshot,
     onSpeaking: sendMemberSpeaking,
+    onScreenStream(stream) {
+      attachScreenStream(stream);
+      renderScreenSharePanel();
+    },
+    onScreenShareEnded() {
+      sendRoomControl(stopScreenShareSignal(startScreenShareRequestId()));
+    },
     onError(error) {
       showError(error.message || "媒体连接发生错误。");
     },
@@ -862,6 +989,7 @@ async function startMedia() {
   mediaSession.setMicrophoneGain(microphoneGainLevel);
   applyMemberVolumes();
   renderMicrophoneGainControl();
+  renderScreenSharePanel();
 
   try {
     await mediaSession.start();
@@ -871,10 +999,12 @@ async function startMedia() {
     mediaReady = true;
     renderVoiceState();
     renderMicrophoneGainControl();
+    renderScreenSharePanel();
   } catch (_error) {
     mediaReady = false;
     renderVoiceState({ media: "failed" });
     renderMicrophoneGainControl();
+    renderScreenSharePanel();
   }
 }
 
@@ -888,8 +1018,30 @@ microphoneGain.addEventListener("input", () => {
   setMicrophoneGain(microphoneGain.value);
 });
 
-panelToggle.addEventListener("click", () => {
-  setActiveSidePanel(activeSidePanel === "members" ? "chat" : "members");
+for (const tab of panelTabs) {
+  tab.addEventListener("click", () => {
+    setActiveSidePanel(tab.dataset.panel || "members");
+  });
+}
+
+startScreenShare.addEventListener("click", () => {
+  sendRoomControl(startScreenShareSignal(startScreenShareRequestId()));
+  setActiveSidePanel("screen");
+});
+
+stopScreenShare.addEventListener("click", () => {
+  sendRoomControl(stopScreenShareSignal(startScreenShareRequestId()));
+});
+
+openScreenPopout.addEventListener("click", openScreenSharePopout);
+closeScreenPopout.addEventListener("click", () => {
+  screenPopout.hidden = true;
+});
+fullscreenScreenShare.addEventListener("click", () => {
+  void requestScreenFullscreen(screenVideoFrame);
+});
+popoutFullscreenScreenShare.addEventListener("click", () => {
+  void requestScreenFullscreen(screenPopoutFrame);
 });
 
 chatForm.addEventListener("submit", async (event) => {

@@ -7,6 +7,8 @@ import {
   membersForRoom,
   nextRoomSnapshot,
   resumeRoomSignal,
+  startScreenShareSignal,
+  stopScreenShareSignal,
   websocketUrl,
 } from "../../static/room-state.mjs";
 
@@ -53,6 +55,17 @@ test("room resume signal carries tab session credentials", () => {
   );
 });
 
+test("screen share signals start and stop sharing", () => {
+  assert.deepEqual(startScreenShareSignal("screen-start"), {
+    type: "start_screen_share",
+    request_id: "screen-start",
+  });
+  assert.deepEqual(stopScreenShareSignal("screen-stop"), {
+    type: "stop_screen_share",
+    request_id: "screen-stop",
+  });
+});
+
 test("websocket url tracks the current page protocol", () => {
   assert.equal(
     websocketUrl({ href: "http://127.0.0.1:8080/rooms/ABC123", protocol: "http:" }),
@@ -97,6 +110,30 @@ test("room snapshots follow room messages and room closure", () => {
       member_id: "m_owner",
     }),
     joinedRoom,
+  );
+  assert.deepEqual(
+    nextRoomSnapshot(joinedRoom, {
+      type: "screen_share_started",
+      member_id: "m_member",
+      nickname: "队友",
+    }).screen_share,
+    {
+      member_id: "m_member",
+      nickname: "队友",
+    },
+  );
+  assert.equal(
+    nextRoomSnapshot(
+      {
+        ...joinedRoom,
+        screen_share: { member_id: "m_member", nickname: "队友" },
+      },
+      {
+        type: "screen_share_stopped",
+        member_id: "m_member",
+      },
+    ).screen_share,
+    null,
   );
   assert.equal(
     nextRoomSnapshot(joinedRoom, {

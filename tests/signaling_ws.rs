@@ -330,6 +330,147 @@ async fn websocket_joined_room_返回聊天历史() {
 }
 
 #[tokio::test]
+async fn websocket_开始屏幕共享会广播共享状态() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, room_id, _owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut member_ws, member_id) = connect_join(&ws_url, &room_id, "join-member", "队友").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+
+    member_ws
+        .send(Message::Text(
+            json!({
+                "type": "start_screen_share",
+                "request_id": "screen-start",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送 start_screen_share");
+
+    let owner_started = read_until_type(&mut owner_ws, "screen_share_started").await;
+    assert_eq!(owner_started["member_id"], member_id);
+    assert_eq!(owner_started["nickname"], "队友");
+
+    let member_started = read_until_type(&mut member_ws, "screen_share_started").await;
+    assert_eq!(member_started["member_id"], member_id);
+    assert_eq!(member_started["nickname"], "队友");
+}
+
+#[tokio::test]
+async fn websocket_第二个成员开始屏幕共享会失败() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, room_id, _owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut first_ws, _first_id) = connect_join(&ws_url, &room_id, "join-first", "共享者").await;
+    let (mut second_ws, _second_id) = connect_join(&ws_url, &room_id, "join-second", "观众").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+    let _ = read_until_type(&mut first_ws, "member_joined").await;
+
+    first_ws
+        .send(Message::Text(
+            json!({
+                "type": "start_screen_share",
+                "request_id": "screen-first",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("第一个成员开始共享");
+    let _ = read_until_type(&mut first_ws, "screen_share_started").await;
+
+    second_ws
+        .send(Message::Text(
+            json!({
+                "type": "start_screen_share",
+                "request_id": "screen-second",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("第二个成员开始共享");
+
+    let error = read_until_type(&mut second_ws, "error").await;
+    assert_eq!(error["request_id"], "screen-second");
+    assert_eq!(error["code"], "invalid_message");
+    assert_eq!(error["message"], "消息格式无效: 当前已有成员正在共享屏幕。");
+}
+
+#[tokio::test]
+async fn websocket_房主可以强制停止屏幕共享() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, room_id, _owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut member_ws, member_id) = connect_join(&ws_url, &room_id, "join-member", "队友").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+
+    member_ws
+        .send(Message::Text(
+            json!({
+                "type": "start_screen_share",
+                "request_id": "screen-start",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("成员开始共享");
+    let _ = read_until_type(&mut owner_ws, "screen_share_started").await;
+    let _ = read_until_type(&mut member_ws, "screen_share_started").await;
+
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "type": "stop_screen_share",
+                "request_id": "screen-stop",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("房主停止共享");
+
+    let owner_stopped = read_until_type(&mut owner_ws, "screen_share_stopped").await;
+    assert_eq!(owner_stopped["member_id"], member_id);
+    let member_stopped = read_until_type(&mut member_ws, "screen_share_stopped").await;
+    assert_eq!(member_stopped["member_id"], member_id);
+}
+
+#[tokio::test]
+async fn websocket_joined_room_返回屏幕共享状态() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let owner = state.rooms.create_room("房主").expect("创建房间");
+    let sharer = state.rooms.join_room(&owner.room.id, "共享者").expect("成员加入");
+    state
+        .rooms
+        .start_screen_share(&owner.room.id, &sharer.member.id)
+        .expect("成员开始共享");
+    let ws_url = spawn_app(state).await;
+
+    let (mut viewer_ws, _) = connect_async(&ws_url).await.expect("连接 ws");
+    viewer_ws
+        .send(Message::Text(
+            json!({
+                "type": "join_room",
+                "request_id": "join-viewer",
+                "room_id": owner.room.id,
+                "nickname": "观众",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送 join_room");
+    let joined = read_until_type(&mut viewer_ws, "joined_room").await;
+    assert_eq!(joined["room"]["screen_share"]["member_id"], sharer.member.id);
+    assert_eq!(joined["room"]["screen_share"]["nickname"], "共享者");
+}
+
+#[tokio::test]
 async fn websocket_joined_room_返回恢复凭据() {
     let state = AppState::new(8).expect("创建应用状态");
     let ws_url = spawn_app(state).await;

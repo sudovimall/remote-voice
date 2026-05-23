@@ -12,11 +12,24 @@ test("room side panel uses hidden as the exclusive members/chat switch", () => {
   assert.match(css, /\[hidden\]\s*\{[\s\S]*display:\s*none\s*!important;[\s\S]*\}/);
 });
 
-test("room chat toggle is a compact corner tab with an unread badge", () => {
-  assert.match(html, /id="panel-toggle"[\s\S]*class="panel-switch"/);
+test("room side panel exposes members chat and screen tabs", () => {
+  assert.match(html, /id="members-tab"[\s\S]*data-panel="members"/);
+  assert.match(html, /id="chat-tab"[\s\S]*data-panel="chat"/);
+  assert.match(html, /id="screen-tab"[\s\S]*data-panel="screen"/);
   assert.match(html, /id="chat-unread"[\s\S]*class="chat-unread"[\s\S]*hidden/);
-  assert.match(css, /\.panel-switch-tab/);
-  assert.match(css, /clip-path:\s*polygon\(100% 0,\s*100% 100%,\s*0 0\)/);
+  assert.match(css, /\.panel-tabs\b/);
+  assert.match(css, /\.panel-tab-active\b/);
+});
+
+test("room screen panel contains sharing controls and popout", () => {
+  assert.match(html, /id="screen-panel"[\s\S]*class="screen-panel"[\s\S]*hidden/);
+  assert.match(html, /id="start-screen-share"/);
+  assert.match(html, /id="stop-screen-share"/);
+  assert.match(html, /id="open-screen-popout"/);
+  assert.match(html, /id="fullscreen-screen-share"/);
+  assert.match(html, /id="screen-popout"[\s\S]*class="screen-popout"[\s\S]*hidden/);
+  assert.match(css, /\.screen-video-frame\b/);
+  assert.match(css, /\.screen-popout\b/);
 });
 
 test("room chat mentions use inline picker, highlight, and passive reminder", () => {

@@ -567,8 +567,8 @@ h2 {
 
 .chat-unread {
   position: absolute;
-  top: 7px;
-  right: 36px;
+  top: -7px;
+  right: -7px;
   z-index: 2;
   min-width: 20px;
   height: 20px;
@@ -582,6 +582,34 @@ h2 {
   font-size: 0.72rem;
   font-weight: 850;
   line-height: 1;
+}
+
+.panel-tabs {
+  position: relative;
+  display: inline-grid;
+  grid-template-columns: repeat(3, minmax(52px, 1fr));
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 4px;
+  background: var(--surface);
+}
+
+.panel-tab {
+  min-width: 0;
+  min-height: 34px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 10px;
+  color: var(--ink-soft);
+  background: transparent;
+  font-size: 0.84rem;
+  font-weight: 760;
+}
+
+.panel-tab-active {
+  color: var(--paper-bright);
+  background: var(--accent);
 }
 
 .chat-panel {
@@ -795,6 +823,103 @@ h2 {
 .chat-form button {
   min-width: 0;
   padding: 0 16px;
+}
+
+.screen-panel {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(220px, 1fr) auto;
+  gap: 14px;
+  padding-top: 24px;
+}
+
+.screen-panel-head,
+.screen-actions,
+.screen-popout-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.screen-panel-head > div {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.screen-panel-head span {
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+}
+
+.screen-video-frame {
+  position: relative;
+  min-height: 220px;
+  aspect-ratio: 16 / 9;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  color: rgb(252 253 248 / 66%);
+  background: #050806;
+}
+
+.screen-video-frame video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #050806;
+}
+
+.screen-video-frame video[srcObject],
+.screen-video-active {
+  display: block;
+}
+
+.screen-video-placeholder-hidden {
+  display: none;
+}
+
+.screen-actions {
+  flex-wrap: wrap;
+}
+
+.screen-actions .quiet-button {
+  flex: 1 1 120px;
+}
+
+.screen-popout {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(21 25 22 / 68%);
+}
+
+.screen-popout-surface {
+  width: min(1100px, 100%);
+  max-height: calc(100dvh - 48px);
+  display: grid;
+  gap: 12px;
+  border: 1px solid rgb(252 253 248 / 24%);
+  border-radius: var(--radius);
+  padding: 14px;
+  color: var(--paper-bright);
+  background: var(--ink);
+}
+
+.screen-popout-head > div {
+  display: flex;
+  gap: 8px;
+}
+
+.screen-popout-frame {
+  width: 100%;
+  max-height: calc(100dvh - 130px);
 }
 
 .member-row {

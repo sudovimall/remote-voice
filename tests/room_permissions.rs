@@ -100,6 +100,92 @@ fn 成员可以停止并恢复接收另一成员语音() {
 }
 
 #[test]
+fn 同房间只能一个成员共享屏幕() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间");
+    let first = store.join_room(&owner.room.id, "共享者").expect("加入房间");
+    let second = store.join_room(&owner.room.id, "观众").expect("加入房间");
+
+    let room = store
+        .start_screen_share(&owner.room.id, &first.member.id)
+        .expect("第一个成员可以共享屏幕");
+    assert_eq!(
+        room.screen_share.as_ref().map(|share| share.member_id.as_str()),
+        Some(first.member.id.as_str())
+    );
+    assert_eq!(
+        room.screen_share.as_ref().map(|share| share.nickname.as_str()),
+        Some("共享者")
+    );
+
+    let error = store
+        .start_screen_share(&owner.room.id, &second.member.id)
+        .expect_err("第二个成员不能同时共享屏幕");
+    assert!(matches!(error, Error::InvalidMessage(_)));
+}
+
+#[test]
+fn 房主可以强制停止成员屏幕共享() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间");
+    let member = store.join_room(&owner.room.id, "队友").expect("加入房间");
+
+    store
+        .start_screen_share(&owner.room.id, &member.member.id)
+        .expect("成员开始共享");
+    let room = store
+        .stop_screen_share(&owner.room.id, &owner.member.id)
+        .expect("房主可以强制停止");
+
+    assert!(room.screen_share.is_none());
+}
+
+#[test]
+fn 普通成员不能停止别人屏幕共享() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间");
+    let sharer = store.join_room(&owner.room.id, "共享者").expect("加入房间");
+    let viewer = store.join_room(&owner.room.id, "观众").expect("加入房间");
+
+    store
+        .start_screen_share(&owner.room.id, &sharer.member.id)
+        .expect("成员开始共享");
+    let error = store
+        .stop_screen_share(&owner.room.id, &viewer.member.id)
+        .expect_err("普通成员不能停止别人共享");
+
+    assert!(matches!(error, Error::NotRoomOwner));
+}
+
+#[test]
+fn 共享者离开或断线过期后释放共享占用() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间");
+    let leaver = store.join_room(&owner.room.id, "离开者").expect("加入房间");
+
+    store
+        .start_screen_share(&owner.room.id, &leaver.member.id)
+        .expect("成员开始共享");
+    let room = store
+        .leave_room(&owner.room.id, &leaver.member.id)
+        .expect("共享者离开");
+    assert!(room.screen_share.is_none());
+
+    let expiring = store.join_room(&owner.room.id, "断线者").expect("加入房间");
+    store
+        .start_screen_share(&owner.room.id, &expiring.member.id)
+        .expect("成员再次共享");
+    store
+        .mark_member_disconnected(&owner.room.id, &expiring.member.id)
+        .expect("共享者断线");
+    let room = store
+        .expire_disconnected_member(&owner.room.id, &expiring.member.id)
+        .expect("断线共享者超时清理")
+        .expect("断线共享者被移除");
+    assert!(room.screen_share.is_none());
+}
+
+#[test]
 fn 成员恢复原身份后保留不听名单() {
     let store = RoomStore::new(8);
     let owner = store.create_room("房主").expect("创建房间");
