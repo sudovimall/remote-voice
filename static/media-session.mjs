@@ -129,6 +129,7 @@ export class MediaSession {
     this.SessionDescriptionImpl =
       options.SessionDescriptionImpl ?? browserSessionDescription;
     this.IceCandidateImpl = options.IceCandidateImpl ?? browserIceCandidate;
+    this.MediaStreamImpl = options.MediaStreamImpl ?? globalThis.MediaStream;
     this.AudioContextImpl = options.AudioContextImpl ?? globalThis.AudioContext ?? globalThis.webkitAudioContext;
     this.createAudioElement = options.createAudioElement ?? browserAudioElement;
     this.audioHost = options.audioHost ?? null;
@@ -550,7 +551,10 @@ export class MediaSession {
         this.remoteTrackMembers.set(event.track.id, memberId);
       }
       if (event.track?.kind === "video" || (event.streams?.[0]?.getVideoTracks?.() ?? []).length > 0) {
-        this.onScreenStream?.(event.streams?.[0] ?? null, memberId);
+        const stream =
+          event.streams?.[0] ??
+          (event.track && this.MediaStreamImpl ? new this.MediaStreamImpl([event.track]) : null);
+        this.onScreenStream?.(stream, memberId);
         return;
       }
       this.playRemoteStream(event.streams?.[0], memberId);

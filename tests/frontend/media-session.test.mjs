@@ -136,6 +136,20 @@ function mediaHarness(options = {}) {
       this.removed = true;
     }
   }
+  class FakeMediaStream {
+    constructor(tracks = []) {
+      this.id = "generated-screen-stream";
+      this.tracks = tracks;
+    }
+
+    getVideoTracks() {
+      return this.tracks.filter((streamTrack) => streamTrack.kind === "video");
+    }
+
+    getAudioTracks() {
+      return this.tracks.filter((streamTrack) => streamTrack.kind === "audio");
+    }
+  }
   class FakePeerConnection {
     constructor() {
       this.addedTracks = [];
@@ -214,7 +228,10 @@ function mediaHarness(options = {}) {
     }
 
     emitTrack(remoteStream, remoteTrack = { id: "remote-track" }) {
-      this.on_track?.({ streams: [remoteStream], track: remoteTrack });
+      this.on_track?.({
+        streams: remoteStream === undefined ? [] : [remoteStream],
+        track: remoteTrack,
+      });
     }
 
     emitState(state) {
@@ -258,6 +275,7 @@ function mediaHarness(options = {}) {
     PeerConnectionImpl: FakePeerConnection,
     SessionDescriptionImpl: (description) => description,
     IceCandidateImpl: (candidate) => candidate,
+    MediaStreamImpl: FakeMediaStream,
     createAudioElement: () => new FakeAudio(),
     AudioContextImpl: options.AudioContextImpl === undefined ? FakeAudioContext : options.AudioContextImpl,
     setIntervalImpl: options.setIntervalImpl,
@@ -602,6 +620,19 @@ test("remote video track is reported without creating audio playback", async () 
   peerConnection.emitTrack(screenStream, { id: "m_member:screen-track", kind: "video" });
 
   assert.equal(harness.screenStreams[0].stream, screenStream);
+  assert.equal(harness.screenStreams[0].memberId, "m_member");
+  assert.equal(harness.audioNodes.length, 0);
+});
+
+test("remote video track without stream creates a stream for screen sharing", async () => {
+  const harness = mediaHarness();
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+  const remoteTrack = { id: "m_member:screen-track", kind: "video" };
+
+  peerConnection.emitTrack(undefined, remoteTrack);
+
+  assert.deepEqual(harness.screenStreams[0].stream.getVideoTracks(), [remoteTrack]);
   assert.equal(harness.screenStreams[0].memberId, "m_member");
   assert.equal(harness.audioNodes.length, 0);
 });
