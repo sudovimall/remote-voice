@@ -262,7 +262,13 @@ async fn websocket_聊天消息会确认给发送者并广播给其他成员() {
             json!({
                 "type": "send_chat_message",
                 "request_id": "chat-1",
-                "content": " 晚上打哪张图？ "
+                "content": " @队友 晚上打哪张图？ ",
+                "mentions": [
+                    {
+                        "member_id": member_id,
+                        "nickname": "伪造昵称"
+                    }
+                ]
             })
             .to_string()
             .into(),
@@ -275,7 +281,9 @@ async fn websocket_聊天消息会确认给发送者并广播给其他成员() {
     assert_eq!(sent["message"]["room_id"], room_id);
     assert_eq!(sent["message"]["member_id"], owner_id);
     assert_eq!(sent["message"]["nickname"], "房主");
-    assert_eq!(sent["message"]["content"], "晚上打哪张图？");
+    assert_eq!(sent["message"]["content"], "@队友 晚上打哪张图？");
+    assert_eq!(sent["message"]["mentions"][0]["member_id"], member_id);
+    assert_eq!(sent["message"]["mentions"][0]["nickname"], "队友");
 
     let received = read_until_type(&mut member_ws, "chat_message").await;
     assert_eq!(received["message"], sent["message"]);

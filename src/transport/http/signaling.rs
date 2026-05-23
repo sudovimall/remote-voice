@@ -1,6 +1,6 @@
 use crate::{
     Error, Result,
-    domain::room::{ChatMessage, Room},
+    domain::room::{ChatMention, ChatMessage, Room},
     media::{IceCandidate, MediaEvent},
     state::AppState,
 };
@@ -55,9 +55,19 @@ pub enum ClientSignal {
         member_id: String,
         listening: bool,
     },
+    SetMemberSpeaking {
+        request_id: Option<String>,
+        speaking: bool,
+    },
+    SetMemberLatency {
+        request_id: Option<String>,
+        server_ms: f64,
+    },
     SendChatMessage {
         request_id: Option<String>,
         content: String,
+        #[serde(default)]
+        mentions: Vec<ChatMention>,
     },
     // 浏览器发给后端 PeerConnection 的 offer；不再携带目标成员，也不会被转发给其他成员。
     WebrtcOffer {
@@ -105,6 +115,14 @@ pub enum ServerSignal {
     MemberListeningUpdated {
         request_id: Option<String>,
         not_listening_member_ids: Vec<String>,
+    },
+    MemberSpeakingUpdated {
+        member_id: String,
+        speaking: bool,
+    },
+    MemberLatencyUpdated {
+        member_id: String,
+        server_ms: f64,
     },
     ChatMessageSent {
         request_id: Option<String>,
@@ -426,6 +444,16 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                                     },
                                     None,
                                 );
+                                if self_muted {
+                                    let _ = state.signals.broadcast(
+                                        room_id,
+                                        ServerSignal::MemberSpeakingUpdated {
+                                            member_id: member_id.to_string(),
+                                            speaking: false,
+                                        },
+                                        None,
+                                    );
+                                }
                             }
                             Err(error) => {
                                 let _ = send_error(&mut sender, request_id, error).await;
@@ -447,9 +475,22 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                                     .await;
                                 let _ = state.signals.broadcast(
                                     room_id,
-                                    ServerSignal::MemberUpdated { room, member_id },
+                                    ServerSignal::MemberUpdated {
+                                        room,
+                                        member_id: member_id.clone(),
+                                    },
                                     None,
                                 );
+                                if !can_speak {
+                                    let _ = state.signals.broadcast(
+                                        room_id,
+                                        ServerSignal::MemberSpeakingUpdated {
+                                            member_id,
+                                            speaking: false,
+                                        },
+                                        None,
+                                    );
+                                }
                             }
                             Err(error) => {
                                 let _ = send_error(&mut sender, request_id, error).await;
@@ -493,13 +534,58 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             }
                         }
                     }
-                    ClientSignal::SendChatMessage { request_id, content } => {
+                    ClientSignal::SetMemberSpeaking { request_id, speaking } => {
                         let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
                             let _ = send_not_joined(&mut sender, request_id).await;
                             continue;
                         };
 
-                        match state.rooms.send_chat_message(room_id, member_id, &content) {
+                        let speaking = state
+                            .rooms
+                            .get_room(room_id)
+                            .ok()
+                            .and_then(|room| room.members.get(member_id).cloned())
+                            .is_some_and(|member| speaking && member.can_speak && !member.self_muted);
+                        let _ = state.signals.broadcast(
+                            room_id,
+                            ServerSignal::MemberSpeakingUpdated {
+                                member_id: member_id.to_string(),
+                                speaking,
+                            },
+                            None,
+                        );
+                    }
+                    ClientSignal::SetMemberLatency { request_id, server_ms } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                            let _ = send_not_joined(&mut sender, request_id).await;
+                            continue;
+                        };
+                        if !server_ms.is_finite() || server_ms < 0.0 {
+                            let _ = send_error(
+                                &mut sender,
+                                request_id,
+                                Error::InvalidMessage("成员延迟必须是非负毫秒数".to_string()),
+                            )
+                            .await;
+                            continue;
+                        }
+
+                        let _ = state.signals.broadcast(
+                            room_id,
+                            ServerSignal::MemberLatencyUpdated {
+                                member_id: member_id.to_string(),
+                                server_ms,
+                            },
+                            None,
+                        );
+                    }
+                    ClientSignal::SendChatMessage { request_id, content, mentions } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                            let _ = send_not_joined(&mut sender, request_id).await;
+                            continue;
+                        };
+
+                        match state.rooms.send_chat_message(room_id, member_id, &content, mentions) {
                             Ok(message) => {
                                 let _ = send_json(
                                     &mut sender,
@@ -843,6 +929,59 @@ mod tests {
     }
 
     #[test]
+    fn 客户端_set_member_speaking_按布尔状态解析() {
+        let signal: ClientSignal = serde_json::from_str(
+            r#"{"type":"set_member_speaking","request_id":"speak-1","speaking":true}"#,
+        )
+        .expect("解析发言状态信令");
+
+        assert!(matches!(
+            signal,
+            ClientSignal::SetMemberSpeaking {
+                request_id,
+                speaking
+            } if request_id.as_deref() == Some("speak-1") && speaking
+        ));
+    }
+
+    #[test]
+    fn 客户端_set_member_latency_按毫秒数解析() {
+        let signal: ClientSignal = serde_json::from_str(
+            r#"{"type":"set_member_latency","request_id":"latency-1","server_ms":28.4}"#,
+        )
+        .expect("解析成员延迟信令");
+
+        assert!(matches!(
+            signal,
+            ClientSignal::SetMemberLatency {
+                request_id,
+                server_ms
+            } if request_id.as_deref() == Some("latency-1") && server_ms == 28.4
+        ));
+    }
+
+    #[test]
+    fn 客户端_send_chat_message_解析_mentions() {
+        let signal: ClientSignal = serde_json::from_str(
+            r#"{"type":"send_chat_message","request_id":"chat-1","content":"@阿木 晚上打哪张图？","mentions":[{"member_id":"m_member","nickname":"阿木"}]}"#,
+        )
+        .expect("解析聊天 mention 信令");
+
+        assert!(matches!(
+            signal,
+            ClientSignal::SendChatMessage {
+                request_id,
+                content,
+                mentions
+            } if request_id.as_deref() == Some("chat-1")
+                && content == "@阿木 晚上打哪张图？"
+                && mentions.len() == 1
+                && mentions[0].member_id == "m_member"
+                && mentions[0].nickname == "阿木"
+        ));
+    }
+
+    #[test]
     fn 服务端_ice_candidate_按浏览器结构序列化() {
         let json = serde_json::to_value(ServerSignal::IceCandidate {
             candidate: IceCandidate {
@@ -870,6 +1009,32 @@ mod tests {
 
         assert_eq!(json["type"], "renegotiation_needed");
         assert_eq!(json["member_id"], "publisher-1");
+    }
+
+    #[test]
+    fn 服务端_member_speaking_updated_包含成员状态() {
+        let json = serde_json::to_value(ServerSignal::MemberSpeakingUpdated {
+            member_id: "publisher-1".to_string(),
+            speaking: true,
+        })
+        .expect("序列化发言状态信令");
+
+        assert_eq!(json["type"], "member_speaking_updated");
+        assert_eq!(json["member_id"], "publisher-1");
+        assert_eq!(json["speaking"], true);
+    }
+
+    #[test]
+    fn 服务端_member_latency_updated_包含成员延迟() {
+        let json = serde_json::to_value(ServerSignal::MemberLatencyUpdated {
+            member_id: "member-1".to_string(),
+            server_ms: 28.4,
+        })
+        .expect("序列化成员延迟信令");
+
+        assert_eq!(json["type"], "member_latency_updated");
+        assert_eq!(json["member_id"], "member-1");
+        assert_eq!(json["server_ms"], 28.4);
     }
 
     #[test]

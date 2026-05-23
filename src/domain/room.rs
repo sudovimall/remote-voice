@@ -78,6 +78,14 @@ pub struct ChatMessage {
     pub nickname: String,
     pub content: String,
     pub sent_at_epoch_millis: u64,
+    #[serde(default)]
+    pub mentions: Vec<ChatMention>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMention {
+    pub member_id: String,
+    pub nickname: String,
 }
 
 #[derive(Debug)]
@@ -301,6 +309,7 @@ impl RoomStore {
         room_id: &str,
         member_id: &str,
         content: &str,
+        mentions: Vec<ChatMention>,
     ) -> Result<ChatMessage> {
         let content = content.trim();
         if content.is_empty() {
@@ -315,6 +324,21 @@ impl RoomStore {
         let mut rooms = self.write_rooms()?;
         let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
         let member = room.members.get(member_id).ok_or(Error::MemberNotFound)?;
+        let mut seen_mentions = HashSet::new();
+        let mut checked_mentions = Vec::new();
+        for mention in mentions {
+            if mention.member_id == member_id || !seen_mentions.insert(mention.member_id.clone()) {
+                continue;
+            }
+            let mentioned_member = room
+                .members
+                .get(&mention.member_id)
+                .ok_or(Error::MemberNotFound)?;
+            checked_mentions.push(ChatMention {
+                member_id: mentioned_member.id.clone(),
+                nickname: mentioned_member.nickname.clone(),
+            });
+        }
         let message = ChatMessage {
             id: new_chat_message_id(),
             room_id: room_id.to_string(),
@@ -322,6 +346,7 @@ impl RoomStore {
             nickname: member.nickname.clone(),
             content: content.to_string(),
             sent_at_epoch_millis: now_epoch_millis(),
+            mentions: checked_mentions,
         };
 
         room.chat_messages.push(message.clone());
@@ -534,4 +559,106 @@ fn to_base36_fixed(mut value: u64, width: usize) -> String {
 
 fn base36_space(width: usize) -> u64 {
     36_u64.pow(width as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn joined_member_id(join: &RoomJoin) -> String {
+        join.member.id.clone()
+    }
+
+    #[test]
+    fn 聊天消息保存服务端校验后的_mentions() {
+        let store = RoomStore::new(8);
+        let owner = store.create_room("房主").expect("创建房间");
+        let room_id = owner.room.id.clone();
+        let owner_id = joined_member_id(&owner);
+        let member = store.join_room(&room_id, "阿木").expect("加入房间");
+        let member_id = joined_member_id(&member);
+
+        let message = store
+            .send_chat_message(
+                &room_id,
+                &owner_id,
+                "@阿木 晚上打哪张图？",
+                vec![ChatMention {
+                    member_id: member_id.clone(),
+                    nickname: "伪造昵称".to_string(),
+                }],
+            )
+            .expect("发送聊天消息");
+
+        assert_eq!(
+            message.mentions,
+            vec![ChatMention {
+                member_id,
+                nickname: "阿木".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn 聊天消息_mentions_兼容空列表并过滤自己和重复成员() {
+        let store = RoomStore::new(8);
+        let owner = store.create_room("房主").expect("创建房间");
+        let room_id = owner.room.id.clone();
+        let owner_id = joined_member_id(&owner);
+        let member = store.join_room(&room_id, "队友").expect("加入房间");
+        let member_id = joined_member_id(&member);
+
+        let message = store
+            .send_chat_message(
+                &room_id,
+                &owner_id,
+                " @队友 @房主 ",
+                vec![
+                    ChatMention {
+                        member_id: owner_id.clone(),
+                        nickname: "房主".to_string(),
+                    },
+                    ChatMention {
+                        member_id: member_id.clone(),
+                        nickname: "队友".to_string(),
+                    },
+                    ChatMention {
+                        member_id: member_id.clone(),
+                        nickname: "队友".to_string(),
+                    },
+                ],
+            )
+            .expect("发送聊天消息");
+
+        assert_eq!(message.content, "@队友 @房主");
+        assert_eq!(
+            message.mentions,
+            vec![ChatMention {
+                member_id,
+                nickname: "队友".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn 聊天消息_mentions_拒绝未知成员() {
+        let store = RoomStore::new(8);
+        let owner = store.create_room("房主").expect("创建房间");
+        let room_id = owner.room.id.clone();
+        let owner_id = joined_member_id(&owner);
+
+        let error = store
+            .send_chat_message(
+                &room_id,
+                &owner_id,
+                "@不存在 晚上打哪张图？",
+                vec![ChatMention {
+                    member_id: "m_missing".to_string(),
+                    nickname: "不存在".to_string(),
+                }],
+            )
+            .expect_err("未知成员不能被 mention");
+
+        assert!(matches!(error, Error::MemberNotFound));
+    }
 }

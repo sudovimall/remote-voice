@@ -45,9 +45,14 @@
           </div>
 
           <div id="member-list" class="member-list" aria-label="成员列表"></div>
+          <div id="mention-reminder" class="mention-reminder" role="status" aria-live="polite" hidden>
+            <strong id="mention-reminder-title"></strong>
+            <span id="mention-reminder-text"></span>
+          </div>
           <section id="chat-panel" class="chat-panel" aria-label="文字聊天" hidden>
             <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
             <form id="chat-form" class="chat-form">
+              <div id="mention-picker" class="mention-picker" role="listbox" aria-label="@ 成员候选" hidden></div>
               <textarea
                 id="chat-input"
                 maxlength="500"
@@ -65,6 +70,19 @@
             <h2 id="voice-title">本地语音</h2>
             <span class="meta-copy">单房间会话</span>
           </div>
+          <label class="volume-control microphone-gain-control">
+            <span>输入音量</span>
+            <input
+                    id="microphone-gain"
+                    type="range"
+                    min="0"
+                    max="2"
+                    step="0.05"
+                    value="1"
+            />
+            <strong id="microphone-gain-value">100%</strong>
+          </label>
+
 
           <button id="mic-state" class="mic-button" type="button" disabled>
             <span aria-hidden="true"></span>

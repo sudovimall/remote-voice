@@ -152,13 +152,13 @@ fn 房间聊天会保存最近消息并裁剪历史() {
     let member = store.join_room(&owner.room.id, "队友").expect("加入房间");
 
     let first = store
-        .send_chat_message(&owner.room.id, &owner.member.id, "第一条")
+        .send_chat_message(&owner.room.id, &owner.member.id, "第一条", Vec::new())
         .expect("发送第一条");
     let second = store
-        .send_chat_message(&owner.room.id, &member.member.id, " 第二条 ")
+        .send_chat_message(&owner.room.id, &member.member.id, " 第二条 ", Vec::new())
         .expect("发送第二条");
     let third = store
-        .send_chat_message(&owner.room.id, &owner.member.id, "第三条")
+        .send_chat_message(&owner.room.id, &owner.member.id, "第三条", Vec::new())
         .expect("发送第三条");
 
     assert!(first.id.starts_with("c_"));
@@ -178,13 +178,13 @@ fn 房间聊天拒绝空消息和超长消息() {
     let owner = store.create_room("房主").expect("创建房间");
 
     let empty = store
-        .send_chat_message(&owner.room.id, &owner.member.id, "   ")
+        .send_chat_message(&owner.room.id, &owner.member.id, "   ", Vec::new())
         .expect_err("空消息应拒绝");
     assert!(matches!(empty, Error::InvalidMessage(_)));
 
     let too_long = "a".repeat(501);
     let error = store
-        .send_chat_message(&owner.room.id, &owner.member.id, &too_long)
+        .send_chat_message(&owner.room.id, &owner.member.id, &too_long, Vec::new())
         .expect_err("超长消息应拒绝");
     assert!(matches!(error, Error::InvalidMessage(_)));
 }

@@ -18,17 +18,34 @@ import {
   canManageMember,
   canToggleMemberListening,
   memberCanSpeakSignal,
+  memberLatencySignal,
+  memberLatencyView,
   memberListeningLabel,
   memberListeningSignal,
   memberPermissionLabel,
+  memberSpeakingSignal,
   selfMutedSignal,
 } from "/assets/room-controls.mjs";
 import {
+  chatMessageContentParts,
   chatMessageView,
   chatUnreadBadgeText,
+  insertMentionText,
+  mentionCandidates,
+  mentionsForSend,
+  messageMentionsCurrentMember,
   nextChatUnreadCount,
   sendChatMessageSignal,
 } from "/assets/chat-controls.mjs";
+import {
+  clampMicrophoneGain,
+  clampPlaybackVolume,
+  loadMemberVolume,
+  loadMicrophoneGain,
+  saveMemberVolume,
+  saveMicrophoneGain,
+  volumePercent,
+} from "/assets/audio-volume.mjs";
 import { MediaSession } from "/assets/media-session.mjs";
 import { RoomConnection } from "/assets/room-connection.mjs";
 
@@ -44,13 +61,19 @@ const panelToggleIcon = document.querySelector("#panel-toggle-icon");
 const chatUnread = document.querySelector("#chat-unread");
 const chatPanel = document.querySelector("#chat-panel");
 const chatMessagesNode = document.querySelector("#chat-messages");
+const mentionReminder = document.querySelector("#mention-reminder");
+const mentionReminderTitle = document.querySelector("#mention-reminder-title");
+const mentionReminderText = document.querySelector("#mention-reminder-text");
 const chatForm = document.querySelector("#chat-form");
+const mentionPicker = document.querySelector("#mention-picker");
 const chatInput = document.querySelector("#chat-input");
 const micState = document.querySelector("#mic-state");
 const deviceState = document.querySelector("#device-state");
 const mediaState = document.querySelector("#media-state");
 const downlinkState = document.querySelector("#downlink-state");
 const permissionNote = document.querySelector("#permission-note");
+const microphoneGain = document.querySelector("#microphone-gain");
+const microphoneGainValue = document.querySelector("#microphone-gain-value");
 const muteSelf = document.querySelector("#mute-self");
 const leaveRoom = document.querySelector("#leave-room");
 const remoteAudio = document.querySelector("#remote-audio");
@@ -69,6 +92,17 @@ let notListeningMemberIds = new Set();
 let activeSidePanel = "members";
 let chatMessages = [];
 let unreadChatCount = 0;
+let selectedMentions = [];
+let mentionPickerMembers = [];
+let mentionPickerIndex = 0;
+let mentionReminderTimer = null;
+let latencySnapshot = { serverMs: null, members: {} };
+let memberVolumes = new Map();
+let microphoneGainLevel = loadMicrophoneGain(window.localStorage);
+let speakingMemberIds = new Set();
+let speakingTimers = new Map();
+const SPEAKING_TTL_MS = 1800;
+const MENTION_REMINDER_MS = 10000;
 const voiceState = {
   device: "idle",
   media: "waiting",
@@ -109,6 +143,7 @@ function setActiveSidePanel(panel) {
   if (chatActive) {
     unreadChatCount = 0;
     renderUnreadBadge();
+    clearMentionReminder();
     requestAnimationFrame(() => {
       chatMessagesNode.scrollTop = chatMessagesNode.scrollHeight;
       chatInput.focus({ preventScroll: true });
@@ -122,12 +157,247 @@ function renderUnreadBadge() {
   chatUnread.textContent = label;
 }
 
+function clearMentionReminder() {
+  if (mentionReminderTimer) {
+    window.clearTimeout(mentionReminderTimer);
+    mentionReminderTimer = null;
+  }
+  mentionReminder.hidden = true;
+  mentionReminderTitle.textContent = "";
+  mentionReminderText.textContent = "";
+}
+
+function showMentionReminder(message) {
+  if (
+    activeSidePanel === "chat" ||
+    message?.member_id === ownMemberId ||
+    !messageMentionsCurrentMember(message, ownMemberId)
+  ) {
+    return;
+  }
+
+  mentionReminderTitle.textContent = `${message.nickname || "成员"} @ 了你`;
+  mentionReminderText.textContent = message.content || "";
+  mentionReminder.hidden = false;
+  if (mentionReminderTimer) {
+    window.clearTimeout(mentionReminderTimer);
+  }
+  mentionReminderTimer = window.setTimeout(clearMentionReminder, MENTION_REMINDER_MS);
+}
+
+function activeMentionQuery() {
+  const cursor = chatInput.selectionStart ?? chatInput.value.length;
+  const prefix = chatInput.value.slice(0, cursor);
+  const atIndex = prefix.lastIndexOf("@");
+  if (atIndex < 0) {
+    return null;
+  }
+  const query = prefix.slice(atIndex + 1);
+  if (/\s/.test(query)) {
+    return null;
+  }
+
+  return query;
+}
+
+function hideMentionPicker() {
+  mentionPicker.hidden = true;
+  mentionPicker.replaceChildren();
+  mentionPickerMembers = [];
+  mentionPickerIndex = 0;
+}
+
+function renderMentionPicker() {
+  const query = activeMentionQuery();
+  if (query === null || !currentRoom) {
+    hideMentionPicker();
+    return;
+  }
+
+  mentionPickerMembers = mentionCandidates(currentRoom, ownMemberId).filter((member) =>
+    (member.nickname ?? "").toLowerCase().includes(query.toLowerCase()),
+  );
+  mentionPickerIndex = Math.min(mentionPickerIndex, Math.max(mentionPickerMembers.length - 1, 0));
+  if (!mentionPickerMembers.length) {
+    hideMentionPicker();
+    return;
+  }
+
+  mentionPicker.replaceChildren(
+    ...mentionPickerMembers.map((member, index) => {
+      const option = textNode("button", "mention-option", "");
+      option.type = "button";
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", String(index === mentionPickerIndex));
+      if (index === mentionPickerIndex) {
+        option.classList.add("mention-option-active");
+      }
+      option.append(
+        textNode("span", "mention-option-avatar", avatarText(member)),
+        textNode("span", "mention-option-name", member.nickname),
+      );
+      option.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+      });
+      option.addEventListener("click", () => {
+        selectMention(member);
+      });
+      return option;
+    }),
+  );
+  mentionPicker.hidden = false;
+}
+
+function selectMention(member) {
+  const inserted = insertMentionText(
+    chatInput.value,
+    chatInput.selectionStart ?? chatInput.value.length,
+    chatInput.selectionEnd ?? chatInput.value.length,
+    member,
+  );
+  chatInput.value = inserted.value;
+  selectedMentions = [...selectedMentions, inserted.mention];
+  hideMentionPicker();
+  chatInput.focus();
+  chatInput.setSelectionRange(inserted.cursor, inserted.cursor);
+}
+
 function ownMember() {
   return currentRoom?.members?.[ownMemberId] ?? null;
 }
 
+function memberVolume(memberId) {
+  if (!memberId || !currentRoom?.id) {
+    return 1;
+  }
+  if (!memberVolumes.has(memberId)) {
+    memberVolumes.set(memberId, loadMemberVolume(window.localStorage, currentRoom.id, memberId));
+  }
+
+  return memberVolumes.get(memberId);
+}
+
+function setMemberVolume(memberId, value) {
+  if (!memberId || !currentRoom?.id) {
+    return;
+  }
+
+  const volume = clampPlaybackVolume(value);
+  memberVolumes.set(memberId, volume);
+  saveMemberVolume(window.localStorage, currentRoom.id, memberId, volume);
+  mediaSession?.setMemberVolume(memberId, volume);
+}
+
+function applyMemberVolumes() {
+  for (const member of membersForRoom(currentRoom)) {
+    if (member.id !== ownMemberId) {
+      mediaSession?.setMemberVolume(member.id, memberVolume(member.id));
+    }
+  }
+}
+
+function renderMicrophoneGainControl() {
+  microphoneGain.value = String(microphoneGainLevel);
+  microphoneGainValue.textContent = volumePercent(microphoneGainLevel);
+  const supported = mediaSession?.microphoneGainSupported ?? true;
+  microphoneGain.disabled = !supported;
+  microphoneGain.title = supported ? "调整别人听到的麦克风音量" : "当前浏览器不支持输入音量调节";
+}
+
+function setMicrophoneGain(value) {
+  microphoneGainLevel = clampMicrophoneGain(value);
+  saveMicrophoneGain(window.localStorage, microphoneGainLevel);
+  mediaSession?.setMicrophoneGain(microphoneGainLevel);
+  renderMicrophoneGainControl();
+}
+
 function rememberListeningState(memberIds = []) {
   notListeningMemberIds = new Set(memberIds);
+}
+
+function rememberLatencySnapshot(snapshot) {
+  const nextMembers = { ...latencySnapshot.members };
+  for (const [memberId, memberLatency] of Object.entries(snapshot?.members ?? {})) {
+    nextMembers[memberId] = {
+      ...nextMembers[memberId],
+      ...memberLatency,
+    };
+  }
+  latencySnapshot = {
+    serverMs: Number.isFinite(snapshot?.serverMs) ? snapshot.serverMs : latencySnapshot.serverMs,
+    members: nextMembers,
+  };
+  if (Number.isFinite(snapshot?.serverMs)) {
+    sendRoomControl(memberLatencySignal(snapshot.serverMs));
+  }
+  if (currentRoom) {
+    renderRoom(currentRoom);
+  }
+}
+
+function rememberMemberLatency(memberId, serverMs) {
+  if (!memberId || !Number.isFinite(serverMs)) {
+    return;
+  }
+  if (memberId === ownMemberId) {
+    latencySnapshot = {
+      ...latencySnapshot,
+      serverMs,
+    };
+  } else {
+    latencySnapshot = {
+      ...latencySnapshot,
+      members: {
+        ...latencySnapshot.members,
+        [memberId]: {
+          ...latencySnapshot.members?.[memberId],
+          serverMs,
+        },
+      },
+    };
+  }
+  if (currentRoom) {
+    renderRoom(currentRoom);
+  }
+}
+
+function clearSpeakingTimers() {
+  for (const timer of speakingTimers.values()) {
+    window.clearTimeout(timer);
+  }
+  speakingTimers = new Map();
+}
+
+function rememberMemberSpeaking(memberId, speaking) {
+  if (!memberId) {
+    return;
+  }
+
+  const existingTimer = speakingTimers.get(memberId);
+  if (existingTimer) {
+    window.clearTimeout(existingTimer);
+    speakingTimers.delete(memberId);
+  }
+
+  if (speaking) {
+    speakingMemberIds.add(memberId);
+    speakingTimers.set(
+      memberId,
+      window.setTimeout(() => {
+        speakingTimers.delete(memberId);
+        speakingMemberIds.delete(memberId);
+        if (currentRoom) {
+          renderRoom(currentRoom);
+        }
+      }, SPEAKING_TTL_MS),
+    );
+  } else {
+    speakingMemberIds.delete(memberId);
+  }
+
+  if (currentRoom) {
+    renderRoom(currentRoom);
+  }
 }
 
 function sendRoomControl(signal) {
@@ -136,6 +406,13 @@ function sendRoomControl(signal) {
   } catch (error) {
     showError(error.message || "房间控制发送失败。");
   }
+}
+
+function sendMemberSpeaking(speaking) {
+  if (!ownMember()?.can_speak || ownMember()?.self_muted) {
+    speaking = false;
+  }
+  sendRoomControl(memberSpeakingSignal(speaking));
 }
 
 function voiceLabel(group, state) {
@@ -232,7 +509,19 @@ function renderChatMessage(message) {
     textNode("strong", "", view.nickname),
     textNode("time", "", view.timeLabel),
   );
-  bubble.append(meta, textNode("p", "", view.content));
+  const content = document.createElement("p");
+  for (const part of chatMessageContentParts(message)) {
+    if (part.type === "mention") {
+      const mention = textNode("span", "chat-mention", part.text);
+      if (part.memberId === ownMemberId) {
+        mention.classList.add("chat-mention-self");
+      }
+      content.append(mention);
+    } else {
+      content.append(document.createTextNode(part.text));
+    }
+  }
+  bubble.append(meta, content);
   row.append(avatar, bubble);
   return row;
 }
@@ -250,6 +539,8 @@ function renderChatMessages() {
 
 function rememberChatMessages(messages = []) {
   chatMessages = messages;
+  selectedMentions = [];
+  hideMentionPicker();
   renderChatMessages();
 }
 
@@ -264,6 +555,7 @@ function handleChatMessage(message) {
     message,
     ownMemberId,
   );
+  showMentionReminder(message);
   renderUnreadBadge();
   renderChatMessages();
 }
@@ -282,9 +574,17 @@ function renderMember(member, room) {
   }
 
   const name = document.createElement("div");
+  const nameLine = textNode("div", "member-name-line", "");
+  const speakingIndicator = textNode("span", "member-speaking-indicator", "");
+  speakingIndicator.title = "发言中";
+  speakingIndicator.setAttribute("aria-label", "发言中");
+  if (speakingMemberIds.has(member.id) && member.can_speak && !member.self_muted) {
+    speakingIndicator.classList.add("member-speaking-indicator-active");
+  }
+  nameLine.append(textNode("strong", "", member.nickname), speakingIndicator);
   name.append(
-    textNode("strong", "", member.nickname),
-    textNode("span", "", memberStateLabel(member)),
+    nameLine,
+    textNode("span", "member-state", memberStateLabel(member)),
   );
   identity.append(avatar, name);
 
@@ -329,6 +629,31 @@ function renderMember(member, room) {
     signals.append(listening);
   }
 
+  if (member.id !== ownMemberId) {
+    const volume = memberVolume(member.id);
+    const volumeControl = textNode("label", "volume-control member-volume-control", "");
+    const volumeInput = document.createElement("input");
+    volumeInput.type = "range";
+    volumeInput.min = "0";
+    volumeInput.max = "1";
+    volumeInput.step = "0.05";
+    volumeInput.value = String(volume);
+    volumeInput.setAttribute("aria-label", `${member.nickname} 播放音量`);
+    const volumeValue = textNode("strong", "volume-value", volumePercent(volume));
+    volumeInput.addEventListener("input", () => {
+      setMemberVolume(member.id, volumeInput.value);
+      volumeValue.textContent = volumePercent(volumeInput.value);
+    });
+    volumeControl.append(textNode("span", "", "音量"), volumeInput, volumeValue);
+    signals.append(volumeControl);
+  }
+
+  const latencyView = memberLatencyView(member.id, ownMemberId, latencySnapshot);
+  const latency = textNode("span", latencyView.className, latencyView.label);
+  latency.title = latencyView.title;
+  latency.setAttribute("aria-label", latencyView.title);
+  signals.append(latency);
+
   row.append(identity, signals);
   return row;
 }
@@ -350,6 +675,12 @@ function renderEmptyMembers(message) {
 
 function renderRoom(room) {
   const members = membersForRoom(room);
+  for (const member of members) {
+    if (member.id !== ownMemberId) {
+      memberVolume(member.id);
+      mediaSession?.setMemberVolume(member.id, memberVolume(member.id));
+    }
+  }
   membersMeta.textContent = `${members.length} 位成员`;
   memberList.replaceChildren(...members.map((member) => renderMember(member, room)));
   renderVoiceState();
@@ -375,10 +706,13 @@ function handleRoomSignal(signal) {
     clearRoomSession(window.sessionStorage);
     roomSession = null;
     rememberListeningState();
+    speakingMemberIds = new Set();
+    clearSpeakingTimers();
     setConnection("房间已关闭");
     membersMeta.textContent = "房间已关闭";
     renderEmptyMembers("房主已离开。");
     rememberChatMessages();
+    clearMentionReminder();
     showError("房主已离开，房间已关闭。");
     return;
   }
@@ -387,6 +721,14 @@ function handleRoomSignal(signal) {
     if (currentRoom) {
       renderRoom(currentRoom);
     }
+    return;
+  }
+  if (signal.type === "member_speaking_updated") {
+    rememberMemberSpeaking(signal.member_id, signal.speaking);
+    return;
+  }
+  if (signal.type === "member_latency_updated") {
+    rememberMemberLatency(signal.member_id, signal.server_ms);
     return;
   }
 
@@ -469,6 +811,7 @@ async function connectRoom(intent) {
     const joined = await nextClient.enter(entrySignal(intent));
     rememberJoinedRoom(joined, intent);
     rememberListeningState(joined.not_listening_member_ids);
+    memberVolumes = new Map();
     currentRoom = joined.room;
     ownMemberId = joined.member_id;
     rememberChatMessages(joined.chat_messages);
@@ -494,6 +837,8 @@ async function connectRoom(intent) {
       clearRoomSession(window.sessionStorage);
       roomSession = null;
       rememberListeningState();
+      speakingMemberIds = new Set();
+      clearSpeakingTimers();
       rememberChatMessages();
     }
     setConnection("未加入");
@@ -508,19 +853,28 @@ async function startMedia() {
   mediaSession = new MediaSession(client, {
     audioHost: remoteAudio,
     onState: renderVoiceState,
+    onLatency: rememberLatencySnapshot,
+    onSpeaking: sendMemberSpeaking,
     onError(error) {
       showError(error.message || "媒体连接发生错误。");
     },
   });
+  mediaSession.setMicrophoneGain(microphoneGainLevel);
+  applyMemberVolumes();
+  renderMicrophoneGainControl();
 
   try {
     await mediaSession.start();
     mediaSession.setMuted(Boolean(ownMember()?.self_muted));
+    mediaSession.setMicrophoneGain(microphoneGainLevel);
+    applyMemberVolumes();
     mediaReady = true;
     renderVoiceState();
+    renderMicrophoneGainControl();
   } catch (_error) {
     mediaReady = false;
-    renderVoiceState({ device: "denied", media: "failed" });
+    renderVoiceState({ media: "failed" });
+    renderMicrophoneGainControl();
   }
 }
 
@@ -530,6 +884,10 @@ muteSelf.addEventListener("click", () => {
   sendRoomControl(selfMutedSignal(nextMuted));
 });
 
+microphoneGain.addEventListener("input", () => {
+  setMicrophoneGain(microphoneGain.value);
+});
+
 panelToggle.addEventListener("click", () => {
   setActiveSidePanel(activeSidePanel === "members" ? "chat" : "members");
 });
@@ -537,33 +895,66 @@ panelToggle.addEventListener("click", () => {
 chatForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   let signal;
+  const mentions = mentionsForSend(chatInput.value, selectedMentions);
   try {
-    signal = sendChatMessageSignal(chatInput.value);
+    signal = sendChatMessageSignal(chatInput.value, undefined, mentions);
   } catch (error) {
     showError(error.message || "聊天消息无效。");
     return;
   }
 
   chatInput.value = "";
+  selectedMentions = [];
+  hideMentionPicker();
   chatInput.focus();
   try {
     if (!client) {
       throw new Error("房间信令尚未连接。");
     }
-    await client.sendChatMessage(signal.content, signal.request_id);
+    await client.sendChatMessage(signal.content, signal.request_id, signal.mentions ?? []);
   } catch (error) {
     chatInput.value = signal.content;
+    selectedMentions = signal.mentions ?? [];
     showError(error.message || "聊天消息发送失败。");
   }
 });
 
 chatInput.addEventListener("keydown", (event) => {
+  if (!mentionPicker.hidden && ["ArrowDown", "ArrowUp", "Enter", "Escape"].includes(event.key)) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      hideMentionPicker();
+      return;
+    }
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const delta = event.key === "ArrowDown" ? 1 : -1;
+      mentionPickerIndex =
+        (mentionPickerIndex + delta + mentionPickerMembers.length) % mentionPickerMembers.length;
+      renderMentionPicker();
+      return;
+    }
+    if (event.key === "Enter" && mentionPickerMembers[mentionPickerIndex]) {
+      event.preventDefault();
+      selectMention(mentionPickerMembers[mentionPickerIndex]);
+      return;
+    }
+  }
+
   if (event.key !== "Enter" || event.shiftKey || event.isComposing) {
     return;
   }
 
   event.preventDefault();
   chatForm.requestSubmit();
+});
+
+chatInput.addEventListener("input", () => {
+  renderMentionPicker();
+});
+
+chatInput.addEventListener("blur", () => {
+  window.setTimeout(hideMentionPicker, 120);
 });
 
 leaveRoom.addEventListener("click", () => {
@@ -579,6 +970,8 @@ leaveRoom.addEventListener("click", () => {
   clearRoomSession(window.sessionStorage);
   roomSession = null;
   rememberListeningState();
+  speakingMemberIds = new Set();
+  clearSpeakingTimers();
   rememberChatMessages();
   mediaSession?.close();
   client?.close();
@@ -621,6 +1014,4 @@ window.addEventListener("pagehide", () => {
   if (reconnectTimer) {
     window.clearTimeout(reconnectTimer);
   }
-  mediaSession?.close();
-  client?.close();
 });

@@ -13,6 +13,8 @@ function deferred() {
 
 function mediaHarness(options = {}) {
   const sent = [];
+  const latencies = [];
+  const speakingStates = [];
   const track = {
     enabled: true,
     stopped: false,
@@ -29,10 +31,72 @@ function mediaHarness(options = {}) {
     },
   };
   const audioNodes = [];
+  const gainNodes = [];
+  const destinationTrack = {
+    enabled: true,
+    stopped: false,
+    stop() {
+      this.stopped = true;
+    },
+  };
+  const destinationStream = {
+    getAudioTracks() {
+      return [destinationTrack];
+    },
+    getTracks() {
+      return [destinationTrack];
+    },
+  };
+  class FakeAudioContext {
+    constructor() {
+      this.closed = false;
+      FakeAudioContext.instances.push(this);
+    }
+
+    createMediaStreamSource(sourceStream) {
+      return {
+        stream: sourceStream,
+        connectedTo: null,
+        connect(target) {
+          this.connectedTo = target;
+          return target;
+        },
+        disconnect() {
+          this.connectedTo = null;
+        },
+      };
+    }
+
+    createGain() {
+      const node = {
+        gain: { value: 1 },
+        connectedTo: null,
+        connect(target) {
+          this.connectedTo = target;
+          return target;
+        },
+        disconnect() {
+          this.connectedTo = null;
+        },
+      };
+      gainNodes.push(node);
+      return node;
+    }
+
+    createMediaStreamDestination() {
+      return { stream: destinationStream };
+    }
+
+    async close() {
+      this.closed = true;
+    }
+  }
+  FakeAudioContext.instances = [];
   class FakeAudio {
     constructor() {
       this.autoplay = false;
       this.srcObject = null;
+      this.volume = 1;
       this.removed = false;
       audioNodes.push(this);
     }
@@ -95,8 +159,12 @@ function mediaHarness(options = {}) {
       this.on_icecandidate?.({ candidate });
     }
 
-    emitTrack(remoteStream) {
-      this.on_track?.({ streams: [remoteStream] });
+    async getStats() {
+      return options.stats ?? new Map();
+    }
+
+    emitTrack(remoteStream, remoteTrack = { id: "remote-track" }) {
+      this.on_track?.({ streams: [remoteStream], track: remoteTrack });
     }
 
     emitState(state) {
@@ -109,6 +177,9 @@ function mediaHarness(options = {}) {
   const client = {
     async request(signal) {
       sent.push(signal);
+      if (options.requestError) {
+        throw options.requestError;
+      }
       if (signal.type === "webrtc_offer") {
         return {
           type: "webrtc_answer",
@@ -132,8 +203,17 @@ function mediaHarness(options = {}) {
     SessionDescriptionImpl: (description) => description,
     IceCandidateImpl: (candidate) => candidate,
     createAudioElement: () => new FakeAudio(),
+    AudioContextImpl: options.AudioContextImpl === undefined ? FakeAudioContext : options.AudioContextImpl,
+    setIntervalImpl: options.setIntervalImpl,
+    clearIntervalImpl: options.clearIntervalImpl,
     onState(state) {
       states.push(state);
+    },
+    onLatency(latency) {
+      latencies.push(latency);
+    },
+    onSpeaking(speaking) {
+      speakingStates.push(speaking);
     },
     onError(error) {
       errors.push(error);
@@ -142,11 +222,16 @@ function mediaHarness(options = {}) {
 
   return {
     audioNodes,
+    destinationTrack,
     client,
     errors,
+    gainNodes,
+    audioContexts: FakeAudioContext.instances,
+    latencies,
     peerConnections: FakePeerConnection.instances,
     sent,
     session,
+    speakingStates,
     states,
     track,
   };
@@ -170,6 +255,18 @@ test("media session starts microphone and applies an answer", async () => {
     },
   ]);
   assert.equal(harness.states.some((state) => state.device === "authorized"), true);
+});
+
+test("media session does not report microphone denied when negotiation fails after permission", async () => {
+  const harness = mediaHarness({
+    requestError: new Error("offer failed"),
+  });
+
+  await assert.rejects(() => harness.session.start(), /offer failed/);
+
+  assert.equal(harness.states.some((state) => state.device === "authorized"), true);
+  assert.equal(harness.states.some((state) => state.device === "denied"), false);
+  assert.deepEqual(harness.states.at(-1), { media: "failed" });
 });
 
 test("media session reserves remote audio slots for multi-member rooms", async () => {
@@ -220,7 +317,7 @@ test("media session serializes renegotiation and toggles local mute", async () =
 
   harness.session.setMuted(true);
   assert.equal(peerConnection.offerCount, 3);
-  assert.equal(harness.track.enabled, false);
+  assert.equal(peerConnection.addedTracks[0][0].enabled, false);
 });
 
 test("renegotiation restores connected state when the peer connection stays connected", async () => {
@@ -248,4 +345,157 @@ test("media session plays tracks and releases resources on close", async () => {
   assert.equal(harness.track.stopped, true);
   assert.equal(peerConnection.closed, true);
   assert.equal(harness.audioNodes[0].removed, true);
+});
+
+test("media session applies and updates per-member playback volume", async () => {
+  const harness = mediaHarness();
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+
+  harness.session.setMemberVolume("m_member", 0.35);
+  peerConnection.emitTrack({ id: "remote-1" }, { id: "m_member:audio-track" });
+  assert.equal(harness.audioNodes[0].volume, 0.35);
+
+  harness.session.setMemberVolume("m_member", 1.5);
+  assert.equal(harness.audioNodes[0].volume, 1);
+});
+
+test("media session sends microphone through Web Audio gain and updates gain", async () => {
+  const harness = mediaHarness();
+  harness.session.setMicrophoneGain(1.4);
+
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+
+  assert.equal(peerConnection.addedTracks[0][0], harness.destinationTrack);
+  assert.equal(harness.gainNodes[0].gain.value, 1.4);
+
+  harness.session.setMicrophoneGain(0.25);
+  assert.equal(harness.gainNodes[0].gain.value, 0.25);
+
+  harness.session.setMuted(true);
+  assert.equal(harness.destinationTrack.enabled, false);
+});
+
+test("media session falls back to original microphone when Web Audio is unavailable", async () => {
+  const harness = mediaHarness({ AudioContextImpl: null });
+
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+
+  assert.equal(peerConnection.addedTracks[0][0], harness.track);
+  assert.equal(harness.session.microphoneGainSupported, false);
+});
+
+test("media session samples server latency and remote member total latency", async () => {
+  const harness = mediaHarness({
+    stats: new Map([
+      [
+        "transport-1",
+        {
+          type: "transport",
+          selectedCandidatePairId: "candidate-pair-1",
+        },
+      ],
+      [
+        "candidate-pair-1",
+        {
+          type: "candidate-pair",
+          state: "succeeded",
+          currentRoundTripTime: 0.0184,
+        },
+      ],
+      [
+        "inbound-rtp-1",
+        {
+          type: "inbound-rtp",
+          kind: "audio",
+          trackIdentifier: "m_member:audio-track",
+          jitterBufferDelay: 0.078,
+          jitterBufferEmittedCount: 3,
+        },
+      ],
+    ]),
+  });
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+  peerConnection.emitTrack({ id: "remote-stream" }, { id: "m_member:audio-track" });
+
+  await harness.session.sampleLatencyStats();
+
+  assert.deepEqual(harness.latencies, [
+    {
+      serverMs: 18.4,
+      members: {
+        m_member: {
+          receiveMs: 26,
+        },
+      },
+    },
+  ]);
+});
+
+test("media session falls back to usable candidate pair round trip stats", async () => {
+  const harness = mediaHarness({
+    stats: new Map([
+      [
+        "candidate-pair-1",
+        {
+          type: "candidate-pair",
+          state: "succeeded",
+          totalRoundTripTime: 0.12,
+          responsesReceived: 4,
+        },
+      ],
+    ]),
+  });
+  await harness.session.start();
+
+  await harness.session.sampleLatencyStats();
+
+  assert.equal(harness.latencies.at(-1).serverMs, 30);
+});
+
+test("media session reports speaking only from microphone audio level and clears on mute", async () => {
+  const harness = mediaHarness({
+    stats: new Map([
+      [
+        "media-source-1",
+        {
+          type: "media-source",
+          kind: "audio",
+          audioLevel: 0.08,
+        },
+      ],
+    ]),
+  });
+  await harness.session.start();
+
+  await harness.session.sampleSpeakingStats();
+  harness.session.setMuted(true);
+
+  assert.deepEqual(harness.speakingStates, [true, false]);
+});
+
+test("media session calls timer functions with the global context", async () => {
+  const timers = [];
+  const harness = mediaHarness({
+    setIntervalImpl(callback, intervalMs) {
+      assert.equal(this, globalThis);
+      timers.push({ callback, intervalMs });
+      return timers.length;
+    },
+    clearIntervalImpl(timer) {
+      assert.equal(this, globalThis);
+      timers.push({ cleared: timer });
+    },
+  });
+
+  await harness.session.start();
+  await harness.session.close();
+
+  assert.equal(timers.some((timer) => timer.intervalMs === 1500), true);
+  assert.equal(timers.some((timer) => timer.intervalMs === 250), true);
+  assert.equal(timers.some((timer) => timer.cleared === 1), true);
+  assert.equal(timers.some((timer) => timer.cleared === 2), true);
 });

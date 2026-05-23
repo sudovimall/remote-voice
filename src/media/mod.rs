@@ -1970,14 +1970,16 @@ mod tests {
                     .await
                     .expect("发布测试上行 RTP");
 
-                if let Ok(Ok(event)) = timeout(Duration::from_millis(20), media_events.recv()).await
+                while let Ok(Ok(event)) =
+                    timeout(Duration::from_millis(20), media_events.recv()).await
                 {
-                    assert!(matches!(
+                    if matches!(
                         event,
                         super::MediaEvent::InboundAudioTrack { member_id, .. }
                             if member_id == publisher_member_id
-                    ));
-                    return;
+                    ) {
+                        return;
+                    }
                 }
 
                 sleep(Duration::from_millis(5)).await;

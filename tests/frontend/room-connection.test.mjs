@@ -100,12 +100,15 @@ test("room connection sends chat messages and emits the confirmed message", asyn
   const seen = [];
   connection.onChatMessage((message) => seen.push(message));
 
-  const message = await connection.sendChatMessage("晚上打哪张图？", "chat-1");
+  const message = await connection.sendChatMessage("晚上打哪张图？", "chat-1", [
+    { member_id: "m_member", nickname: "队友" },
+  ]);
 
   assert.deepEqual(client.sentRequests[0], {
     type: "send_chat_message",
     request_id: "chat-1",
     content: "晚上打哪张图？",
+    mentions: [{ member_id: "m_member", nickname: "队友" }],
   });
   assert.deepEqual(message, { id: "c_1", content: "晚上打哪张图？" });
   assert.deepEqual(seen, [message]);

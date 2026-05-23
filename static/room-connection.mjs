@@ -67,12 +67,17 @@ export class RoomConnection {
     return joined;
   }
 
-  async sendChatMessage(content, requestId) {
-    const response = await this.client.request({
+  async sendChatMessage(content, requestId, mentions = []) {
+    const signal = {
       type: "send_chat_message",
       request_id: requestId,
       content,
-    });
+    };
+    if (mentions.length) {
+      signal.mentions = mentions;
+    }
+
+    const response = await this.client.request(signal);
     if (response?.message) {
       this.rememberChatMessage(response.message);
       notify(this.chatMessageListeners, response.message);
