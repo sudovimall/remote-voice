@@ -54,6 +54,9 @@ import { RoomConnection } from "/assets/room-connection.mjs";
 const roomIdNode = document.querySelector("#room-id");
 const roomError = document.querySelector("#room-error");
 const connection = document.querySelector("#room-connection");
+const roomShell = document.querySelector(".room-shell");
+const voicePane = document.querySelector("#voice-pane");
+const toggleVoicePane = document.querySelector("#toggle-voice-pane");
 const sidePanel = document.querySelector("#side-panel");
 const membersTitle = document.querySelector("#members-title");
 const membersMeta = document.querySelector("#members-meta");
@@ -69,6 +72,7 @@ const chatForm = document.querySelector("#chat-form");
 const mentionPicker = document.querySelector("#mention-picker");
 const chatInput = document.querySelector("#chat-input");
 const screenPanel = document.querySelector("#screen-panel");
+const screenToolbar = document.querySelector("#screen-toolbar");
 const screenShareTitle = document.querySelector("#screen-share-title");
 const screenShareMeta = document.querySelector("#screen-share-meta");
 const startScreenShare = document.querySelector("#start-screen-share");
@@ -122,11 +126,33 @@ let speakingMemberIds = new Set();
 let speakingTimers = new Map();
 const SPEAKING_TTL_MS = 1800;
 const MENTION_REMINDER_MS = 10000;
+const VOICE_PANE_COLLAPSED_KEY = "remote-voice.voice-pane-collapsed";
+const SCREEN_ASPECT_16_9 = 16 / 9;
+const SCREEN_ASPECT_16_10 = 16 / 10;
 const voiceState = {
   device: "idle",
   media: "waiting",
   downlink: "waiting",
 };
+
+function setVoicePaneCollapsed(collapsed, persist = true) {
+  roomShell?.classList.toggle("voice-pane-collapsed", collapsed);
+  if (voicePane) {
+    voicePane.hidden = collapsed;
+  }
+  if (toggleVoicePane) {
+    toggleVoicePane.textContent = collapsed ? "显示语音" : "隐藏语音";
+    toggleVoicePane.setAttribute("aria-expanded", String(!collapsed));
+  }
+  if (persist) {
+    window.localStorage.setItem(VOICE_PANE_COLLAPSED_KEY, collapsed ? "1" : "0");
+  }
+  requestAnimationFrame(() => {
+    resizeScreenVideoFrame();
+    requestAnimationFrame(resizeScreenVideoFrame);
+  });
+  window.setTimeout(resizeScreenVideoFrame, 120);
+}
 
 function decodeRoomId(rawRoomId) {
   try {
@@ -156,6 +182,7 @@ function setActiveSidePanel(panel) {
   memberList.hidden = chatActive || screenActive;
   chatPanel.hidden = !chatActive;
   screenPanel.hidden = !screenActive;
+  screenToolbar.hidden = !screenActive;
   sidePanel.dataset.activePanel = panel;
   membersTitle.textContent = screenActive ? "共享" : chatActive ? "聊天" : "成员";
   for (const tab of panelTabs) {
@@ -174,6 +201,7 @@ function setActiveSidePanel(panel) {
   }
   if (screenActive) {
     renderScreenSharePanel();
+    requestAnimationFrame(resizeScreenVideoFrame);
   }
 }
 
@@ -213,6 +241,49 @@ function renderScreenVideoState() {
 
   screenVideo.classList.toggle("screen-video-active", Boolean(stream));
   screenVideoPlaceholder.classList.toggle("screen-video-placeholder-hidden", Boolean(stream));
+  resizeScreenVideoFrame();
+}
+
+function preferredScreenAspectRatio() {
+  const width = screenVideo.videoWidth;
+  const height = screenVideo.videoHeight;
+  if (width > 0 && height > 0) {
+    const ratio = width / height;
+    return Math.abs(ratio - SCREEN_ASPECT_16_10) < Math.abs(ratio - SCREEN_ASPECT_16_9)
+      ? SCREEN_ASPECT_16_10
+      : SCREEN_ASPECT_16_9;
+  }
+
+  return SCREEN_ASPECT_16_9;
+}
+
+function resizeScreenVideoFrame() {
+  if (!screenPanel || screenPanel.hidden || !screenVideoFrame) {
+    return;
+  }
+
+  const ratio = preferredScreenAspectRatio();
+  const panelRect = screenPanel.getBoundingClientRect();
+  const headRect = screenPanel.querySelector(".screen-panel-head")?.getBoundingClientRect();
+  const styles = window.getComputedStyle(screenPanel);
+  const gap = Number.parseFloat(styles.rowGap || styles.gap || "0") || 0;
+  const availableWidth = Math.max(0, screenPanel.clientWidth);
+  const availableHeight = Math.max(0, panelRect.height - (headRect?.height ?? 0) - gap);
+
+  if (!availableWidth || !availableHeight) {
+    return;
+  }
+
+  let frameWidth = Math.min(availableWidth, availableHeight * ratio);
+  let frameHeight = frameWidth / ratio;
+  if (frameHeight > availableHeight) {
+    frameHeight = availableHeight;
+    frameWidth = frameHeight * ratio;
+  }
+
+  screenVideoFrame.style.setProperty("--screen-frame-ratio", ratio === SCREEN_ASPECT_16_10 ? "16 / 10" : "16 / 9");
+  screenVideoFrame.style.setProperty("--screen-frame-width", `${Math.floor(frameWidth)}px`);
+  screenVideoFrame.style.setProperty("--screen-frame-height", `${Math.floor(frameHeight)}px`);
 }
 
 function attachLocalScreenStream(stream) {
@@ -251,6 +322,7 @@ function renderScreenSharePanel() {
     ? `${share.nickname || "成员"} 的屏幕共享`
     : "屏幕共享";
   renderScreenVideoState();
+  resizeScreenVideoFrame();
   if (!sharing) {
     screenPopout.hidden = true;
   }
@@ -1048,6 +1120,17 @@ microphoneGain.addEventListener("input", () => {
   setMicrophoneGain(microphoneGain.value);
 });
 
+toggleVoicePane?.addEventListener("click", () => {
+  setVoicePaneCollapsed(!roomShell?.classList.contains("voice-pane-collapsed"));
+});
+
+window.addEventListener("resize", () => {
+  resizeScreenVideoFrame();
+});
+
+screenVideo.addEventListener("loadedmetadata", resizeScreenVideoFrame);
+screenVideo.addEventListener("resize", resizeScreenVideoFrame);
+
 for (const tab of panelTabs) {
   tab.addEventListener("click", () => {
     setActiveSidePanel(tab.dataset.panel || "members");
@@ -1161,12 +1244,14 @@ leaveRoom.addEventListener("click", () => {
 });
 
 if (!routeRoomId) {
+  setVoicePaneCollapsed(window.localStorage.getItem(VOICE_PANE_COLLAPSED_KEY) === "1", false);
   setConnection("地址无效");
   membersMeta.textContent = "缺少房间号";
   renderEmptyMembers("返回大厅重新进入。");
   rememberChatMessages();
   showError("房间地址缺少房间号。");
 } else {
+  setVoicePaneCollapsed(window.localStorage.getItem(VOICE_PANE_COLLAPSED_KEY) === "1", false);
   roomIdNode.textContent = routeRoomId === "NEW" ? "创建中" : routeRoomId;
   const intent = loadRoomEntryIntent(window.sessionStorage, routeRoomId);
   const session = intent ? null : loadRoomSession(window.sessionStorage, routeRoomId);
