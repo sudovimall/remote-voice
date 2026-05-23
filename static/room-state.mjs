@@ -25,6 +25,20 @@ export function resumeRoomSignal(session, requestId) {
   };
 }
 
+export function startScreenShareSignal(requestId) {
+  return {
+    type: "start_screen_share",
+    request_id: requestId,
+  };
+}
+
+export function stopScreenShareSignal(requestId) {
+  return {
+    type: "stop_screen_share",
+    request_id: requestId,
+  };
+}
+
 export function websocketUrl(location) {
   const url = new URL("/ws", location.href);
   url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -47,6 +61,21 @@ export function membersForRoom(room) {
 export function nextRoomSnapshot(currentRoom, signal) {
   if (signal.type === "room_closed") {
     return null;
+  }
+  if (signal.type === "screen_share_started") {
+    return {
+      ...currentRoom,
+      screen_share: {
+        member_id: signal.member_id,
+        nickname: signal.nickname,
+      },
+    };
+  }
+  if (signal.type === "screen_share_stopped") {
+    return {
+      ...currentRoom,
+      screen_share: null,
+    };
   }
   if (signal.room) {
     return signal.room;

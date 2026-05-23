@@ -69,6 +69,12 @@ pub enum ClientSignal {
         #[serde(default)]
         mentions: Vec<ChatMention>,
     },
+    StartScreenShare {
+        request_id: Option<String>,
+    },
+    StopScreenShare {
+        request_id: Option<String>,
+    },
     // 浏览器发给后端 PeerConnection 的 offer；不再携带目标成员，也不会被转发给其他成员。
     WebrtcOffer {
         request_id: Option<String>,
@@ -130,6 +136,13 @@ pub enum ServerSignal {
     },
     ChatMessage {
         message: ChatMessage,
+    },
+    ScreenShareStarted {
+        member_id: String,
+        nickname: String,
+    },
+    ScreenShareStopped {
+        member_id: String,
     },
     WebrtcAnswer {
         request_id: Option<String>,
@@ -606,6 +619,67 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             }
                         }
                     }
+                    ClientSignal::StartScreenShare { request_id } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                            let _ = send_not_joined(&mut sender, request_id).await;
+                            continue;
+                        };
+
+                        match state.rooms.start_screen_share(room_id, member_id) {
+                            Ok(room) => {
+                                if let Some(screen_share) = room.screen_share {
+                                    if let Err(error) = state
+                                        .media
+                                        .set_screen_share_owner(room_id, Some(&screen_share.member_id))
+                                        .await
+                                    {
+                                        let _ = send_error(&mut sender, request_id, error).await;
+                                        continue;
+                                    }
+                                    let _ = state.signals.broadcast(
+                                        room_id,
+                                        ServerSignal::ScreenShareStarted {
+                                            member_id: screen_share.member_id,
+                                            nickname: screen_share.nickname,
+                                        },
+                                        None,
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                let _ = send_error(&mut sender, request_id, error).await;
+                            }
+                        }
+                    }
+                    ClientSignal::StopScreenShare { request_id } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                            let _ = send_not_joined(&mut sender, request_id).await;
+                            continue;
+                        };
+
+                        let stopped_member_id = state
+                            .rooms
+                            .get_room(room_id)
+                            .ok()
+                            .and_then(|room| room.screen_share.map(|screen_share| screen_share.member_id));
+                        match state.rooms.stop_screen_share(room_id, member_id) {
+                            Ok(_room) => {
+                                if let Some(stopped_member_id) = stopped_member_id {
+                                    let _ = state.media.set_screen_share_owner(room_id, None).await;
+                                    let _ = state.signals.broadcast(
+                                        room_id,
+                                        ServerSignal::ScreenShareStopped {
+                                            member_id: stopped_member_id,
+                                        },
+                                        None,
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                let _ = send_error(&mut sender, request_id, error).await;
+                            }
+                        }
+                    }
                     ClientSignal::WebrtcOffer { request_id, sdp } => {
                         let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
                             let _ = send_not_joined(&mut sender, request_id).await;
@@ -798,6 +872,15 @@ fn renegotiation_signal_for_event(
 ) -> Option<ServerSignal> {
     match event {
         MediaEvent::InboundAudioTrack { room_id, member_id }
+            if joined_room_id == Some(room_id.as_str())
+                && joined_member_id.is_some()
+                && joined_member_id != Some(member_id.as_str()) =>
+        {
+            Some(ServerSignal::RenegotiationNeeded {
+                member_id: member_id.clone(),
+            })
+        }
+        MediaEvent::InboundVideoTrack { room_id, member_id }
             if joined_room_id == Some(room_id.as_str())
                 && joined_member_id.is_some()
                 && joined_member_id != Some(member_id.as_str()) =>

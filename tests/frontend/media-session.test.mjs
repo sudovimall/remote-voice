@@ -47,6 +47,35 @@ function mediaHarness(options = {}) {
       return [destinationTrack];
     },
   };
+  const displayTrack = {
+    kind: "video",
+    stopped: false,
+    listeners: {},
+    getSettings() {
+      return options.displaySettings ?? { width: 1920, height: 1080, frameRate: 30 };
+    },
+    addEventListener(type, listener) {
+      this.listeners[type] = listener;
+    },
+    stop() {
+      this.stopped = true;
+    },
+    emitEnded() {
+      this.listeners.ended?.();
+    },
+  };
+  const displayStream = {
+    id: "display-stream",
+    getAudioTracks() {
+      return [];
+    },
+    getVideoTracks() {
+      return [displayTrack];
+    },
+    getTracks() {
+      return [displayTrack];
+    },
+  };
   class FakeAudioContext {
     constructor() {
       this.closed = false;
@@ -107,6 +136,20 @@ function mediaHarness(options = {}) {
       this.removed = true;
     }
   }
+  class FakeMediaStream {
+    constructor(tracks = []) {
+      this.id = "generated-screen-stream";
+      this.tracks = tracks;
+    }
+
+    getVideoTracks() {
+      return this.tracks.filter((streamTrack) => streamTrack.kind === "video");
+    }
+
+    getAudioTracks() {
+      return this.tracks.filter((streamTrack) => streamTrack.kind === "audio");
+    }
+  }
   class FakePeerConnection {
     constructor() {
       this.addedTracks = [];
@@ -117,6 +160,8 @@ function mediaHarness(options = {}) {
       this.offerCount = 0;
       this.closed = false;
       this.connectionState = "new";
+      this.senders = [];
+      this.removedSender = null;
       FakePeerConnection.instances.push(this);
     }
 
@@ -126,6 +171,25 @@ function mediaHarness(options = {}) {
 
     addTrack(addedTrack, addedStream) {
       this.addedTracks.push([addedTrack, addedStream]);
+      const sender = {
+        track: addedTrack,
+        parameters: {},
+        async setParameters(parameters) {
+          this.parameters = parameters;
+        },
+        getParameters() {
+          return this.parameters;
+        },
+        async replaceTrack(nextTrack) {
+          this.track = nextTrack;
+        },
+      };
+      this.senders.push(sender);
+      return sender;
+    }
+
+    removeTrack(sender) {
+      this.removedSender = sender;
     }
 
     addTransceiver(kind, options) {
@@ -164,7 +228,10 @@ function mediaHarness(options = {}) {
     }
 
     emitTrack(remoteStream, remoteTrack = { id: "remote-track" }) {
-      this.on_track?.({ streams: [remoteStream], track: remoteTrack });
+      this.on_track?.({
+        streams: remoteStream === undefined ? [] : [remoteStream],
+        track: remoteTrack,
+      });
     }
 
     emitState(state) {
@@ -192,16 +259,23 @@ function mediaHarness(options = {}) {
   };
   const states = [];
   const errors = [];
+  const screenStreams = [];
+  const screenStops = [];
   const session = new MediaSession(client, {
     mediaDevices: {
       async getUserMedia(constraints) {
         assert.deepEqual(constraints, { audio: true });
         return stream;
       },
+      async getDisplayMedia(constraints) {
+        assert.deepEqual(constraints, { video: true, audio: false });
+        return displayStream;
+      },
     },
     PeerConnectionImpl: FakePeerConnection,
     SessionDescriptionImpl: (description) => description,
     IceCandidateImpl: (candidate) => candidate,
+    MediaStreamImpl: FakeMediaStream,
     createAudioElement: () => new FakeAudio(),
     AudioContextImpl: options.AudioContextImpl === undefined ? FakeAudioContext : options.AudioContextImpl,
     setIntervalImpl: options.setIntervalImpl,
@@ -218,11 +292,19 @@ function mediaHarness(options = {}) {
     onError(error) {
       errors.push(error);
     },
+    onScreenStream(stream, memberId) {
+      screenStreams.push({ stream, memberId });
+    },
+    onScreenShareEnded() {
+      screenStops.push("ended");
+    },
   });
 
   return {
     audioNodes,
     destinationTrack,
+    displayStream,
+    displayTrack,
     client,
     errors,
     gainNodes,
@@ -231,6 +313,8 @@ function mediaHarness(options = {}) {
     peerConnections: FakePeerConnection.instances,
     sent,
     session,
+    screenStreams,
+    screenStops,
     speakingStates,
     states,
     track,
@@ -281,6 +365,7 @@ test("media session reserves remote audio slots for multi-member rooms", async (
     ["audio", { direction: "recvonly" }],
     ["audio", { direction: "recvonly" }],
     ["audio", { direction: "recvonly" }],
+    ["video", { direction: "recvonly" }],
   ]);
 });
 
@@ -475,6 +560,84 @@ test("media session reports speaking only from microphone audio level and clears
   harness.session.setMuted(true);
 
   assert.deepEqual(harness.speakingStates, [true, false]);
+});
+
+test("media session starts screen share without system audio and sets bitrate", async () => {
+  const harness = mediaHarness({
+    displaySettings: { width: 1920, height: 1080, frameRate: 30 },
+  });
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+
+  await harness.session.startScreenShare();
+
+  assert.equal(peerConnection.addedTracks.at(-1)[0], harness.displayTrack);
+  assert.equal(peerConnection.addedTracks.at(-1)[1], harness.displayStream);
+  assert.equal(peerConnection.offerCount, 2);
+  assert.deepEqual(peerConnection.senders.at(-1).parameters, {
+    encodings: [{ maxBitrate: 5_000_000 }],
+  });
+});
+
+test("media session stops display tracks and renegotiates", async () => {
+  const harness = mediaHarness();
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+
+  await harness.session.startScreenShare();
+  const sender = peerConnection.senders.at(-1);
+  await harness.session.stopScreenShare();
+
+  assert.equal(harness.displayTrack.stopped, true);
+  assert.equal(peerConnection.removedSender, sender);
+  assert.equal(peerConnection.offerCount, 3);
+});
+
+test("display track ended reports screen share stopped", async () => {
+  const harness = mediaHarness();
+  await harness.session.start();
+  await harness.session.startScreenShare();
+
+  harness.displayTrack.emitEnded();
+
+  assert.deepEqual(harness.screenStops, ["ended"]);
+});
+
+test("remote video track is reported without creating audio playback", async () => {
+  const harness = mediaHarness();
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+  const videoTrack = { id: "m_member:screen-track", kind: "video" };
+  const audioTrack = { id: "m_member:audio-track", kind: "audio" };
+  const screenStream = {
+    id: "screen-stream",
+    getVideoTracks() {
+      return [videoTrack];
+    },
+    getAudioTracks() {
+      return [audioTrack];
+    },
+  };
+
+  peerConnection.emitTrack(screenStream, videoTrack);
+
+  assert.deepEqual(harness.screenStreams[0].stream.getVideoTracks(), [videoTrack]);
+  assert.deepEqual(harness.screenStreams[0].stream.getAudioTracks(), []);
+  assert.equal(harness.screenStreams[0].memberId, "m_member");
+  assert.equal(harness.audioNodes.length, 0);
+});
+
+test("remote video track without stream creates a stream for screen sharing", async () => {
+  const harness = mediaHarness();
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+  const remoteTrack = { id: "m_member:screen-track", kind: "video" };
+
+  peerConnection.emitTrack(undefined, remoteTrack);
+
+  assert.deepEqual(harness.screenStreams[0].stream.getVideoTracks(), [remoteTrack]);
+  assert.equal(harness.screenStreams[0].memberId, "m_member");
+  assert.equal(harness.audioNodes.length, 0);
 });
 
 test("media session calls timer functions with the global context", async () => {

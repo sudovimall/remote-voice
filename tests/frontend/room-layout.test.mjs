@@ -12,11 +12,64 @@ test("room side panel uses hidden as the exclusive members/chat switch", () => {
   assert.match(css, /\[hidden\]\s*\{[\s\S]*display:\s*none\s*!important;[\s\S]*\}/);
 });
 
-test("room chat toggle is a compact corner tab with an unread badge", () => {
-  assert.match(html, /id="panel-toggle"[\s\S]*class="panel-switch"/);
+test("room side panel exposes members chat and screen tabs", () => {
+  assert.match(html, /id="members-tab"[\s\S]*data-panel="members"/);
+  assert.match(html, /id="chat-tab"[\s\S]*data-panel="chat"/);
+  assert.match(html, /id="screen-tab"[\s\S]*data-panel="screen"/);
   assert.match(html, /id="chat-unread"[\s\S]*class="chat-unread"[\s\S]*hidden/);
-  assert.match(css, /\.panel-switch-tab/);
-  assert.match(css, /clip-path:\s*polygon\(100% 0,\s*100% 100%,\s*0 0\)/);
+  assert.match(css, /\.panel-tabs\b/);
+  assert.match(css, /\.panel-tab-active\b/);
+});
+
+test("room screen panel contains sharing controls and popout", () => {
+  assert.match(html, /id="screen-panel"[\s\S]*class="screen-panel"[\s\S]*hidden/);
+  assert.match(html, /id="start-screen-share"/);
+  assert.match(html, /id="stop-screen-share"/);
+  assert.match(html, /id="open-screen-popout"/);
+  assert.match(html, /id="fullscreen-screen-share"/);
+  assert.match(html, /class="pane-head"[\s\S]*id="screen-toolbar"[\s\S]*id="start-screen-share"/);
+  assert.doesNotMatch(html, /id="screen-panel"[\s\S]*class="screen-actions"/);
+  assert.match(html, /id="screen-popout"[\s\S]*class="screen-popout"[\s\S]*hidden/);
+  assert.match(css, /\.screen-video-frame\b/);
+  assert.match(css, /\.screen-popout\b/);
+});
+
+test("room can collapse local voice pane to give side panels more space", () => {
+  assert.match(html, /id="toggle-voice-pane"/);
+  assert.match(html, /id="voice-pane"[\s\S]*class="voice-pane"/);
+  assert.match(roomJs, /const toggleVoicePane = document\.querySelector\("#toggle-voice-pane"\)/);
+  assert.match(roomJs, /function setVoicePaneCollapsed\(/);
+  assert.match(css, /\.room-shell\.voice-pane-collapsed\s+\.room-grid\s*\{[\s\S]*grid-template-columns:\s*1fr;[\s\S]*\}/);
+});
+
+test("room screen layout keeps video actions visible in the fixed desktop viewport", () => {
+  assert.match(css, /\.screen-panel\s*\{[\s\S]*grid-template-rows:\s*auto minmax\(0,\s*1fr\);[\s\S]*\}/);
+  assert.match(css, /\.pane-head\s*>\s*\.pane-controls\s*\{[\s\S]*display:\s*flex;[\s\S]*\}/);
+  assert.match(css, /\.screen-toolbar\s*\{[\s\S]*display:\s*flex;[\s\S]*\}/);
+  assert.match(css, /\.screen-video-frame\s*\{[\s\S]*width:\s*var\(--screen-frame-width,\s*100%\);[\s\S]*height:\s*var\(--screen-frame-height,\s*100%\);[\s\S]*aspect-ratio:\s*var\(--screen-frame-ratio,\s*16 \/ 9\);[\s\S]*\}/);
+  assert.doesNotMatch(css, /\.screen-panel\s*\{[\s\S]*minmax\(220px,\s*1fr\)/);
+});
+
+test("room screen frame resizes for 16:9 and 16:10 content", () => {
+  assert.match(roomJs, /const SCREEN_ASPECT_16_9\s*=\s*16 \/ 9/);
+  assert.match(roomJs, /const SCREEN_ASPECT_16_10\s*=\s*16 \/ 10/);
+  assert.match(roomJs, /function preferredScreenAspectRatio\(/);
+  assert.match(roomJs, /function resizeScreenVideoFrame\(/);
+  assert.match(roomJs, /screenVideoFrame\.style\.setProperty\("--screen-frame-ratio"/);
+  assert.match(roomJs, /window\.addEventListener\("resize",\s*\(\)\s*=>\s*\{/);
+});
+
+test("room screen panel tolerates optional meta copy", () => {
+  assert.match(roomJs, /if\s*\(\s*screenShareMeta\s*\)\s*\{[\s\S]*screenShareMeta\.textContent/);
+});
+
+test("room keeps negotiated remote screen stream across inactive sharing state", () => {
+  assert.match(roomJs, /let remoteScreenStream = null;/);
+  assert.match(roomJs, /function activeScreenStream\(\)/);
+  assert.doesNotMatch(
+    roomJs,
+    /if\s*\(\s*!sharing\s*\)\s*\{[\s\S]*attachScreenStream\(null\)/,
+  );
 });
 
 test("room chat mentions use inline picker, highlight, and passive reminder", () => {
@@ -57,7 +110,8 @@ test("room local voice controls stay compact", () => {
 test("desktop room layout keeps page fixed and scrolls inside panels", () => {
   assert.match(css, /body\[data-page="voice-room"\]\s*\{[\s\S]*overflow:\s*hidden;[\s\S]*\}/);
   assert.match(css, /\.room-shell\s*\{[\s\S]*height:\s*100dvh;[\s\S]*grid-template-rows:\s*auto auto minmax\(0,\s*1fr\);[\s\S]*overflow:\s*hidden;[\s\S]*\}/);
-  assert.match(css, /\.room-grid\s*\{[\s\S]*min-height:\s*0;[\s\S]*\}/);
+  assert.match(css, /\.room-grid\s*\{[\s\S]*height:\s*calc\(100dvh - 104px\);[\s\S]*min-height:\s*0;[\s\S]*align-items:\s*stretch;[\s\S]*\}/);
+  assert.match(css, /\.members-pane\s*\{[\s\S]*height:\s*100%;[\s\S]*\}/);
   assert.match(css, /\.member-list\s*\{[\s\S]*overflow:\s*auto;[\s\S]*\}/);
   assert.match(css, /\.chat-messages\s*\{[\s\S]*min-height:\s*0;[\s\S]*overflow:\s*auto;[\s\S]*\}/);
   assert.match(css, /@media \(max-width:\s*900px\)\s*\{[\s\S]*body\[data-page="voice-room"\]\s*\{[\s\S]*overflow:\s*auto;[\s\S]*\}/);

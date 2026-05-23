@@ -17,6 +17,9 @@
         </div>
         <div class="room-meta">
           <span id="room-connection" class="status-pill">未连接</span>
+          <button id="toggle-voice-pane" type="button" class="quiet-button" aria-expanded="true">
+            隐藏语音
+          </button>
           <a class="quiet-button" href="/">离开</a>
         </div>
       </header>
@@ -30,18 +33,26 @@
               <h2 id="members-title">成员</h2>
               <span id="members-meta" class="meta-copy">等待房间状态</span>
             </div>
-            <button
-              id="panel-toggle"
-              class="panel-switch"
-              type="button"
-              aria-label="切换到聊天"
-              title="切换到聊天"
-            >
-              <span class="panel-switch-tab">
-                <span id="panel-toggle-icon" class="panel-switch-icon" aria-hidden="true">聊</span>
-              </span>
-              <span id="chat-unread" class="chat-unread" hidden></span>
-            </button>
+            <div class="pane-controls">
+              <div id="screen-toolbar" class="screen-toolbar" hidden>
+                <button id="start-screen-share" type="button" class="quiet-button">开始共享屏幕</button>
+                <button id="open-screen-popout" type="button" class="quiet-button" disabled>弹窗</button>
+                <button id="fullscreen-screen-share" type="button" class="quiet-button" disabled>全屏</button>
+                <button id="stop-screen-share" type="button" class="quiet-button" hidden>停止共享</button>
+              </div>
+              <div class="panel-tabs" role="tablist" aria-label="侧栏视图">
+                <button id="members-tab" class="panel-tab panel-tab-active" type="button" data-panel="members">
+                  成员
+                </button>
+                <button id="chat-tab" class="panel-tab" type="button" data-panel="chat">
+                  聊天
+                </button>
+                <button id="screen-tab" class="panel-tab" type="button" data-panel="screen">
+                  共享
+                </button>
+                <span id="chat-unread" class="chat-unread" hidden></span>
+              </div>
+            </div>
           </div>
 
           <div id="member-list" class="member-list" aria-label="成员列表"></div>
@@ -63,9 +74,20 @@
               <button id="chat-send" type="submit">发送</button>
             </form>
           </section>
+          <section id="screen-panel" class="screen-panel" aria-label="屏幕共享" hidden>
+            <div class="screen-panel-head" hidden>
+              <div>
+                <strong id="screen-share-title">当前没有屏幕共享</strong>
+              </div>
+            </div>
+            <div id="screen-video-frame" class="screen-video-frame">
+              <video id="screen-video" playsinline autoplay></video>
+              <span id="screen-video-placeholder">等待共享画面</span>
+            </div>
+          </section>
         </section>
 
-        <aside class="voice-pane" aria-labelledby="voice-title">
+        <aside id="voice-pane" class="voice-pane" aria-labelledby="voice-title">
           <div class="pane-head">
             <h2 id="voice-title">本地语音</h2>
             <span class="meta-copy">单房间会话</span>
@@ -116,6 +138,20 @@
           </div>
         </aside>
       </section>
+      <div id="screen-popout" class="screen-popout" hidden>
+        <div class="screen-popout-surface">
+          <div class="screen-popout-head">
+            <strong id="screen-popout-title">屏幕共享</strong>
+            <div>
+              <button id="popout-fullscreen-screen-share" type="button" class="quiet-button">全屏</button>
+              <button id="close-screen-popout" type="button" class="quiet-button">关闭</button>
+            </div>
+          </div>
+          <div id="screen-popout-frame" class="screen-video-frame screen-popout-frame">
+            <video id="screen-popout-video" playsinline autoplay></video>
+          </div>
+        </div>
+      </div>
       <div id="remote-audio" hidden aria-hidden="true"></div>
     </main>
   </body>

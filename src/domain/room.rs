@@ -40,6 +40,12 @@ pub struct MemberListeningState {
     pub not_listening_member_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenShareState {
+    pub member_id: String,
+    pub nickname: String,
+}
+
 impl Member {
     pub fn not_listening_member_ids(&self) -> Vec<String> {
         sorted_member_ids(&self.not_listening_member_ids)
@@ -53,6 +59,7 @@ pub struct Room {
     pub members: HashMap<String, Member>,
     pub created_at_epoch_seconds: u64,
     pub last_active_epoch_seconds: u64,
+    pub screen_share: Option<ScreenShareState>,
     #[serde(skip, default)]
     chat_messages: Vec<ChatMessage>,
 }
@@ -129,6 +136,7 @@ impl RoomStore {
             members: HashMap::from([(member.id.clone(), member.clone())]),
             created_at_epoch_seconds: now,
             last_active_epoch_seconds: now,
+            screen_share: None,
             chat_messages: Vec::new(),
         };
 
@@ -365,6 +373,61 @@ impl RoomStore {
         Ok(room.chat_messages.clone())
     }
 
+    pub fn start_screen_share(&self, room_id: &str, member_id: &str) -> Result<Room> {
+        let mut rooms = self.write_rooms()?;
+        let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
+        let member = room.members.get(member_id).ok_or(Error::MemberNotFound)?;
+
+        if !member.connected {
+            return Err(Error::InvalidMessage(
+                "离线成员不能共享屏幕".to_string(),
+            ));
+        }
+
+        if let Some(screen_share) = &room.screen_share {
+            if screen_share.member_id != member_id {
+                return Err(Error::InvalidMessage(
+                    "当前已有成员正在共享屏幕。".to_string(),
+                ));
+            }
+            room.last_active_epoch_seconds = now_epoch_seconds();
+            return Ok(room.clone());
+        }
+
+        room.screen_share = Some(ScreenShareState {
+            member_id: member.id.clone(),
+            nickname: member.nickname.clone(),
+        });
+        room.last_active_epoch_seconds = now_epoch_seconds();
+
+        Ok(room.clone())
+    }
+
+    pub fn stop_screen_share(&self, room_id: &str, requester_member_id: &str) -> Result<Room> {
+        let mut rooms = self.write_rooms()?;
+        let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
+
+        if !room.members.contains_key(requester_member_id) {
+            return Err(Error::MemberNotFound);
+        }
+
+        let can_stop = match &room.screen_share {
+            Some(screen_share) => {
+                screen_share.member_id == requester_member_id
+                    || room.owner_member_id == requester_member_id
+            }
+            None => true,
+        };
+        if !can_stop {
+            return Err(Error::NotRoomOwner);
+        }
+
+        room.screen_share = None;
+        room.last_active_epoch_seconds = now_epoch_seconds();
+
+        Ok(room.clone())
+    }
+
     pub fn mark_member_disconnected(&self, room_id: &str, member_id: &str) -> Result<Room> {
         let mut rooms = self.write_rooms()?;
         let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
@@ -374,6 +437,7 @@ impl RoomStore {
             .ok_or(Error::MemberNotFound)?;
 
         member.connected = false;
+        clear_screen_share_for_member(room, member_id);
         room.last_active_epoch_seconds = now_epoch_seconds();
 
         Ok(room.clone())
@@ -400,6 +464,7 @@ impl RoomStore {
 
         room.members.remove(member_id);
         remove_listening_references(room, member_id);
+        clear_screen_share_for_member(room, member_id);
         room.last_active_epoch_seconds = now_epoch_seconds();
 
         Ok(Some(room.clone()))
@@ -421,6 +486,7 @@ impl RoomStore {
 
         room.members.remove(member_id);
         remove_listening_references(room, member_id);
+        clear_screen_share_for_member(room, member_id);
         room.last_active_epoch_seconds = now_epoch_seconds();
 
         Ok(room.clone())
@@ -468,6 +534,16 @@ impl RoomStore {
 fn remove_listening_references(room: &mut Room, member_id: &str) {
     for member in room.members.values_mut() {
         member.not_listening_member_ids.remove(member_id);
+    }
+}
+
+fn clear_screen_share_for_member(room: &mut Room, member_id: &str) {
+    if room
+        .screen_share
+        .as_ref()
+        .is_some_and(|screen_share| screen_share.member_id == member_id)
+    {
+        room.screen_share = None;
     }
 }
 

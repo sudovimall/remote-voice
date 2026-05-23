@@ -31,6 +31,11 @@ const DEFAULT_LATENCY_INTERVAL_MS = 1500;
 const DEFAULT_SPEAKING_INTERVAL_MS = 250;
 const SPEAKING_AUDIO_LEVEL = 0.035;
 const DEFAULT_VOLUME = 1;
+const SCREEN_SHARE_BITRATES = [
+  [921600, 2_500_000],
+  [2073600, 5_000_000],
+  [Number.POSITIVE_INFINITY, 8_000_000],
+];
 
 function clamp(value, max) {
   const numeric = Number(value);
@@ -64,6 +69,28 @@ function memberIdFromTrackId(trackId = "") {
   }
 
   return trackId.slice(0, separator);
+}
+
+function screenShareBitrate(settings = {}) {
+  const width = Number(settings.width);
+  const height = Number(settings.height);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return 2_500_000;
+  }
+
+  const pixels = width * height;
+  return SCREEN_SHARE_BITRATES.find(([maxPixels]) => pixels <= maxPixels)?.[1] ?? 8_000_000;
+}
+
+function videoOnlyStream(event, MediaStreamImpl) {
+  const videoTracks = event.track?.kind === "video"
+    ? [event.track]
+    : (event.streams?.[0]?.getVideoTracks?.() ?? []);
+  if (MediaStreamImpl && videoTracks.length > 0) {
+    return new MediaStreamImpl(videoTracks);
+  }
+
+  return event.streams?.[0] ?? null;
 }
 
 function selectedCandidatePair(stats) {
@@ -113,12 +140,15 @@ export class MediaSession {
     this.SessionDescriptionImpl =
       options.SessionDescriptionImpl ?? browserSessionDescription;
     this.IceCandidateImpl = options.IceCandidateImpl ?? browserIceCandidate;
+    this.MediaStreamImpl = options.MediaStreamImpl ?? globalThis.MediaStream;
     this.AudioContextImpl = options.AudioContextImpl ?? globalThis.AudioContext ?? globalThis.webkitAudioContext;
     this.createAudioElement = options.createAudioElement ?? browserAudioElement;
     this.audioHost = options.audioHost ?? null;
     this.onState = options.onState;
     this.onLatency = options.onLatency;
     this.onSpeaking = options.onSpeaking;
+    this.onScreenStream = options.onScreenStream;
+    this.onScreenShareEnded = options.onScreenShareEnded;
     this.onError = options.onError;
     this.latencyIntervalMs = options.latencyIntervalMs ?? DEFAULT_LATENCY_INTERVAL_MS;
     this.speakingIntervalMs = options.speakingIntervalMs ?? DEFAULT_SPEAKING_INTERVAL_MS;
@@ -138,6 +168,9 @@ export class MediaSession {
     this.microphoneDestination = null;
     this.microphoneGain = DEFAULT_VOLUME;
     this.microphoneGainSupported = Boolean(this.AudioContextImpl);
+    this.displayStream = null;
+    this.displaySender = null;
+    this.stoppingScreenShare = false;
     this.latencyTimer = null;
     this.speakingTimer = null;
     this.lastSpeaking = false;
@@ -167,6 +200,7 @@ export class MediaSession {
     for (let index = 0; index < EXTRA_REMOTE_AUDIO_SLOTS; index += 1) {
       this.peerConnection.addTransceiver("audio", { direction: "recvonly" });
     }
+    this.peerConnection.addTransceiver("video", { direction: "recvonly" });
 
     try {
       await this.negotiate();
@@ -263,6 +297,88 @@ export class MediaSession {
     }
   }
 
+  canShareScreen() {
+    return Boolean(this.mediaDevices?.getDisplayMedia);
+  }
+
+  async startScreenShare() {
+    if (!this.peerConnection) {
+      throw new Error("媒体会话尚未连接。");
+    }
+    if (!this.canShareScreen()) {
+      throw new Error("当前浏览器不支持屏幕共享。");
+    }
+
+    await this.stopScreenShare({ renegotiate: false, notify: false });
+    const displayStream = await this.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: false,
+    });
+    const [displayTrack] = displayStream.getVideoTracks?.() ?? [];
+    if (!displayTrack) {
+      for (const track of displayStream.getTracks?.() ?? []) {
+        track.stop();
+      }
+      throw new Error("没有可共享的屏幕视频轨道。");
+    }
+
+    displayTrack.addEventListener?.("ended", () => {
+      if (this.stoppingScreenShare || this.displayStream !== displayStream) {
+        return;
+      }
+      this.onScreenShareEnded?.();
+    });
+
+    this.displayStream = displayStream;
+    this.displaySender = this.peerConnection.addTrack(displayTrack, displayStream);
+    await this.applyScreenShareBitrate(this.displaySender, displayTrack);
+    await this.renegotiate();
+    return displayStream;
+  }
+
+  async stopScreenShare(options = {}) {
+    const { renegotiate = true, notify = true } = options;
+    const displayStream = this.displayStream;
+    const displaySender = this.displaySender;
+    if (!displayStream && !displaySender) {
+      return;
+    }
+
+    this.stoppingScreenShare = true;
+    for (const track of displayStream?.getTracks?.() ?? []) {
+      track.stop();
+    }
+    if (displaySender && this.peerConnection?.removeTrack) {
+      this.peerConnection.removeTrack(displaySender);
+    } else if (displaySender?.replaceTrack) {
+      await displaySender.replaceTrack(null);
+    }
+    this.displayStream = null;
+    this.displaySender = null;
+    this.stoppingScreenShare = false;
+    if (notify) {
+      this.onScreenStream?.(null, "");
+    }
+    if (renegotiate && this.peerConnection) {
+      await this.renegotiate();
+    }
+  }
+
+  async applyScreenShareBitrate(sender, displayTrack) {
+    if (!sender?.setParameters) {
+      return;
+    }
+
+    try {
+      const maxBitrate = screenShareBitrate(displayTrack?.getSettings?.());
+      const parameters = sender.getParameters?.() ?? {};
+      parameters.encodings = [{ ...(parameters.encodings?.[0] ?? {}), maxBitrate }];
+      await sender.setParameters(parameters);
+    } catch (error) {
+      this.onError?.(error);
+    }
+  }
+
   async addRemoteIceCandidate(candidate) {
     if (!this.peerConnection || !candidate) {
       return;
@@ -283,6 +399,7 @@ export class MediaSession {
     for (const track of this.localStream?.getTracks() ?? []) {
       track.stop();
     }
+    await this.stopScreenShare({ renegotiate: false, notify: false });
     await this.releaseAudioGraph();
     for (const entry of this.audioNodes.values()) {
       entry.audio.remove();
@@ -443,6 +560,10 @@ export class MediaSession {
       const memberId = memberIdFromTrackId(event.track?.id);
       if (memberId) {
         this.remoteTrackMembers.set(event.track.id, memberId);
+      }
+      if (event.track?.kind === "video" || (event.streams?.[0]?.getVideoTracks?.() ?? []).length > 0) {
+        this.onScreenStream?.(videoOnlyStream(event, this.MediaStreamImpl), memberId);
+        return;
       }
       this.playRemoteStream(event.streams?.[0], memberId);
     });
