@@ -607,19 +607,22 @@ test("remote video track is reported without creating audio playback", async () 
   const harness = mediaHarness();
   await harness.session.start();
   const peerConnection = harness.peerConnections[0];
+  const videoTrack = { id: "m_member:screen-track", kind: "video" };
+  const audioTrack = { id: "m_member:audio-track", kind: "audio" };
   const screenStream = {
     id: "screen-stream",
     getVideoTracks() {
-      return [{ kind: "video" }];
+      return [videoTrack];
     },
     getAudioTracks() {
-      return [];
+      return [audioTrack];
     },
   };
 
-  peerConnection.emitTrack(screenStream, { id: "m_member:screen-track", kind: "video" });
+  peerConnection.emitTrack(screenStream, videoTrack);
 
-  assert.equal(harness.screenStreams[0].stream, screenStream);
+  assert.deepEqual(harness.screenStreams[0].stream.getVideoTracks(), [videoTrack]);
+  assert.deepEqual(harness.screenStreams[0].stream.getAudioTracks(), []);
   assert.equal(harness.screenStreams[0].memberId, "m_member");
   assert.equal(harness.audioNodes.length, 0);
 });

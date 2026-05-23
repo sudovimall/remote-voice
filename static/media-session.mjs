@@ -82,6 +82,17 @@ function screenShareBitrate(settings = {}) {
   return SCREEN_SHARE_BITRATES.find(([maxPixels]) => pixels <= maxPixels)?.[1] ?? 8_000_000;
 }
 
+function videoOnlyStream(event, MediaStreamImpl) {
+  const videoTracks = event.track?.kind === "video"
+    ? [event.track]
+    : (event.streams?.[0]?.getVideoTracks?.() ?? []);
+  if (MediaStreamImpl && videoTracks.length > 0) {
+    return new MediaStreamImpl(videoTracks);
+  }
+
+  return event.streams?.[0] ?? null;
+}
+
 function selectedCandidatePair(stats) {
   for (const report of stats.values()) {
     if (report.type !== "transport" || !report.selectedCandidatePairId) {
@@ -551,10 +562,7 @@ export class MediaSession {
         this.remoteTrackMembers.set(event.track.id, memberId);
       }
       if (event.track?.kind === "video" || (event.streams?.[0]?.getVideoTracks?.() ?? []).length > 0) {
-        const stream =
-          event.streams?.[0] ??
-          (event.track && this.MediaStreamImpl ? new this.MediaStreamImpl([event.track]) : null);
-        this.onScreenStream?.(stream, memberId);
+        this.onScreenStream?.(videoOnlyStream(event, this.MediaStreamImpl), memberId);
         return;
       }
       this.playRemoteStream(event.streams?.[0], memberId);
