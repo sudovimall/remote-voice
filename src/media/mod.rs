@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     sync::Arc,
+    time::Duration,
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
 use webrtc::{
@@ -23,6 +24,7 @@ use webrtc::{
         RTCPeerConnection, configuration::RTCConfiguration,
         sdp::session_description::RTCSessionDescription,
     },
+    rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication,
     rtp_transceiver::{
         rtp_codec::{RTCRtpCodecCapability, RTPCodecType},
         rtp_sender::RTCRtpSender,
@@ -38,6 +40,7 @@ type SessionMap = HashMap<SessionKey, MediaSession>;
 const LOCAL_ICE_QUEUE_CAPACITY: usize = 64;
 const MEDIA_EVENT_QUEUE_CAPACITY: usize = 256;
 const DEFAULT_DOWNLINK_SLOT_COUNT: usize = 7;
+const VIDEO_KEYFRAME_REQUEST_DELAYS_MS: [u64; 3] = [0, 500, 1500];
 
 pub struct MediaController {
     api: API,
@@ -1265,7 +1268,67 @@ async fn attach_video_to_subscriber(
     downlink_sender
         .replace_track(Some(fanout_track as Arc<dyn TrackLocal + Send + Sync>))
         .await
-        .map_err(|err| Error::Internal(format!("替换下行屏幕共享槽位失败: {err}")))
+        .map_err(|err| Error::Internal(format!("替换下行屏幕共享槽位失败: {err}")))?;
+    schedule_publisher_video_keyframes(
+        Arc::clone(&sessions),
+        subscriber_key.0,
+        publisher_member_id.to_string(),
+    );
+    Ok(())
+}
+
+fn schedule_publisher_video_keyframes(
+    sessions: Arc<Mutex<SessionMap>>,
+    room_id: String,
+    publisher_member_id: String,
+) {
+    tokio::spawn(async move {
+        for delay_ms in VIDEO_KEYFRAME_REQUEST_DELAYS_MS {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            let _ = request_publisher_video_keyframe(
+                Arc::clone(&sessions),
+                &room_id,
+                &publisher_member_id,
+            )
+            .await;
+        }
+    });
+}
+
+async fn request_publisher_video_keyframe(
+    sessions: Arc<Mutex<SessionMap>>,
+    room_id: &str,
+    publisher_member_id: &str,
+) -> Result<()> {
+    let request = {
+        let sessions = sessions.lock().await;
+        let publisher_key = (room_id.to_string(), publisher_member_id.to_string());
+        let Some(publisher) = sessions.get(&publisher_key) else {
+            return Ok(());
+        };
+        let Some(media_ssrc) = publisher
+            .inbound_tracks
+            .values()
+            .find(|track| track.kind == MediaTrackKind::Video)
+            .map(|track| track.ssrc)
+        else {
+            return Ok(());
+        };
+
+        (Arc::clone(&publisher.peer_connection), media_ssrc)
+    };
+
+    request
+        .0
+        .write_rtcp(&[Box::new(PictureLossIndication {
+            sender_ssrc: 0,
+            media_ssrc: request.1,
+        })])
+        .await
+        .map_err(|err| Error::Internal(format!("请求屏幕共享关键帧失败: {err}")))?;
+    Ok(())
 }
 
 async fn detach_publisher_video_from_subscribers(
@@ -1573,7 +1636,11 @@ mod tests {
             peer_connection_state::RTCPeerConnectionState,
             sdp::session_description::RTCSessionDescription,
         },
-        rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType},
+        rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication,
+        rtp_transceiver::{
+            rtp_codec::{RTCRtpCodecCapability, RTPCodecType},
+            rtp_sender::RTCRtpSender,
+        },
         track::track_local::{
             TrackLocal, TrackLocalWriter, track_local_static_rtp::TrackLocalStaticRTP,
         },
@@ -2139,7 +2206,7 @@ mod tests {
 
         let publisher = new_test_peer_connection(Arc::clone(&test_network.publisher)).await;
         let publisher_track = new_publisher_video_track();
-        publisher
+        let publisher_sender = publisher
             .add_track(Arc::clone(&publisher_track) as Arc<dyn TrackLocal + Send + Sync>)
             .await
             .expect("共享者添加视频 track");
@@ -2155,6 +2222,19 @@ mod tests {
                 .expect("听众媒体会话存在")
                 .outbound_video_track_count,
             1
+        );
+        let publisher_video_ssrc = media
+            .session_snapshot(room_id, "publisher-1")
+            .await
+            .expect("共享者媒体会话存在")
+            .tracks
+            .into_iter()
+            .find(|track| track.kind == "video")
+            .expect("共享者视频 track 存在")
+            .ssrc;
+        assert!(
+            publisher_receives_pli_count(&publisher_sender, publisher_video_ssrc, 2).await >= 2,
+            "听众接入屏幕共享后服务端应在协商窗口内重复请求关键帧"
         );
 
         let received_payload =
@@ -2723,6 +2803,36 @@ mod tests {
         })
         .await
         .expect("等待听众视频 RTP 未超时")
+    }
+
+    async fn publisher_receives_pli_count(
+        publisher_sender: &RTCRtpSender,
+        media_ssrc: u32,
+        expected_count: usize,
+    ) -> usize {
+        timeout(Duration::from_secs(2), async {
+            let mut pli_count = 0;
+            loop {
+                let Ok((packets, _)) = publisher_sender.read_rtcp().await else {
+                    return pli_count;
+                };
+
+                for packet in packets {
+                    if packet
+                        .as_any()
+                        .downcast_ref::<PictureLossIndication>()
+                        .is_some_and(|pli| pli.media_ssrc == media_ssrc)
+                    {
+                        pli_count += 1;
+                        if pli_count >= expected_count {
+                            return pli_count;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or(0)
     }
 
     fn test_rtp_packet(sequence_number: u16) -> webrtc::rtp::packet::Packet {
