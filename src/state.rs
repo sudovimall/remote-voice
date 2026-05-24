@@ -1,5 +1,8 @@
 use crate::{
-    Result, config::settings::Settings, domain::room::RoomStore, media::MediaController,
+    Result,
+    config::settings::{ScreenShareSettings, Settings},
+    domain::room::RoomStore,
+    media::MediaController,
     transport::http::signaling::SignalHub,
 };
 use std::{sync::Arc, time::Duration};
@@ -9,6 +12,7 @@ pub struct AppState {
     pub rooms: Arc<RoomStore>,
     pub signals: Arc<SignalHub>,
     pub media: Arc<MediaController>,
+    pub screen_share: ScreenShareSettings,
     pub disconnect_grace_period: Duration,
 }
 
@@ -25,6 +29,7 @@ impl AppState {
             rooms: Arc::new(RoomStore::new(max_members)),
             signals: Arc::new(SignalHub::new()),
             media: Arc::new(MediaController::new()?),
+            screen_share: ScreenShareSettings::default(),
             disconnect_grace_period,
         })
     }
@@ -41,6 +46,7 @@ impl AppState {
                 settings.media.udp_port_max,
                 settings.media.public_ip.clone(),
             )?),
+            screen_share: settings.screen_share.clone(),
             disconnect_grace_period: Duration::from_secs(settings.room.disconnect_grace_seconds),
         })
     }

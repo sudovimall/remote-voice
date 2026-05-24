@@ -359,6 +359,66 @@ async fn websocket_开始屏幕共享会广播共享状态() {
 }
 
 #[tokio::test]
+async fn websocket_屏幕观看状态会广播观看人数() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, room_id, _owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut sharer_ws, sharer_id) = connect_join(&ws_url, &room_id, "join-sharer", "共享者").await;
+    let (mut viewer_ws, _viewer_id) = connect_join(&ws_url, &room_id, "join-viewer", "观众").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+    let _ = read_until_type(&mut sharer_ws, "member_joined").await;
+
+    sharer_ws
+        .send(Message::Text(
+            json!({
+                "type": "start_screen_share",
+                "request_id": "screen-start",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("共享者开始共享");
+    let _ = read_until_type(&mut viewer_ws, "screen_share_started").await;
+    let _ = read_until_type(&mut sharer_ws, "screen_share_started").await;
+
+    viewer_ws
+        .send(Message::Text(
+            json!({
+                "type": "set_screen_viewing",
+                "request_id": "view-start",
+                "viewing": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("观众开始观看");
+
+    let count = read_until_type(&mut sharer_ws, "screen_share_viewer_count_updated").await;
+    assert_eq!(count["member_id"], sharer_id);
+    assert_eq!(count["viewer_count"], 1);
+
+    viewer_ws
+        .send(Message::Text(
+            json!({
+                "type": "set_screen_viewing",
+                "request_id": "view-stop",
+                "viewing": false,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("观众停止观看");
+
+    let count = read_until_type(&mut sharer_ws, "screen_share_viewer_count_updated").await;
+    assert_eq!(count["member_id"], sharer_id);
+    assert_eq!(count["viewer_count"], 0);
+}
+
+#[tokio::test]
 async fn websocket_第二个成员开始屏幕共享会失败() {
     let state = AppState::new(8).expect("创建应用状态");
     let ws_url = spawn_app(state).await;

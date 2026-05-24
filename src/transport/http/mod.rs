@@ -1,11 +1,12 @@
 use crate::state::AppState;
 use axum::{
-    Router,
-    extract::Path,
+    Json, Router,
+    extract::{Path, State},
     http::{StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::get,
 };
+use serde::Serialize;
 
 mod health;
 mod rooms;
@@ -16,10 +17,22 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(lobby_page))
         .route("/rooms/{room_id}", get(room_page))
         .route("/assets/{asset}", get(asset))
+        .route("/api/client-config", get(client_config))
         .merge(health::router())
         .merge(rooms::router())
         .route("/ws", get(signaling::websocket))
         .with_state(state)
+}
+
+#[derive(Debug, Serialize)]
+struct ClientConfig {
+    screen_share: crate::config::settings::ScreenShareSettings,
+}
+
+async fn client_config(State(state): State<AppState>) -> Json<ClientConfig> {
+    Json(ClientConfig {
+        screen_share: state.screen_share,
+    })
 }
 
 async fn lobby_page() -> Html<&'static str> {
@@ -63,7 +76,7 @@ fn javascript(source: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::router;
-    use crate::state::AppState;
+    use crate::{config::settings::Settings, state::AppState};
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
@@ -141,5 +154,48 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::OK, "asset {asset}");
         }
+    }
+
+    #[tokio::test]
+    async fn 客户端配置返回屏幕共享策略() {
+        let settings: Settings = serde_yaml::from_str(
+            r#"
+            port: 9000
+            screen_share:
+              max_width: 1024
+              max_height: 576
+              max_frame_rate: 10
+              bitrate_rules:
+                - max_viewers: 1
+                  max_bitrate_bps: 1500000
+                - max_viewers: 4
+                  max_bitrate_bps: 600000
+            "#,
+        )
+        .expect("解析配置");
+        let app = router(AppState::from_settings(&settings).expect("创建应用状态"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/client-config")
+                    .body(Body::empty())
+                    .expect("构造客户端配置请求"),
+            )
+            .await
+            .expect("读取客户端配置响应");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("读取客户端配置响应体");
+        let config: serde_json::Value = serde_json::from_slice(&body).expect("客户端配置是 JSON");
+        assert_eq!(config["screen_share"]["max_width"], 1024);
+        assert_eq!(config["screen_share"]["max_height"], 576);
+        assert_eq!(config["screen_share"]["max_frame_rate"], 10);
+        assert_eq!(
+            config["screen_share"]["bitrate_rules"][1]["max_bitrate_bps"],
+            600000
+        );
     }
 }

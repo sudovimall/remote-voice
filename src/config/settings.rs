@@ -11,6 +11,8 @@ pub struct Settings {
     pub room: RoomSettings,
     #[serde(default)]
     pub media: MediaSettings,
+    #[serde(default)]
+    pub screen_share: ScreenShareSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +35,24 @@ pub struct MediaSettings {
     pub public_ip: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenShareSettings {
+    #[serde(default = "default_screen_share_max_width")]
+    pub max_width: u32,
+    #[serde(default = "default_screen_share_max_height")]
+    pub max_height: u32,
+    #[serde(default = "default_screen_share_max_frame_rate")]
+    pub max_frame_rate: u32,
+    #[serde(default = "default_screen_share_bitrate_rules")]
+    pub bitrate_rules: Vec<ScreenShareBitrateRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenShareBitrateRule {
+    pub max_viewers: u32,
+    pub max_bitrate_bps: u32,
+}
+
 impl Default for RoomSettings {
     fn default() -> Self {
         Self {
@@ -49,6 +69,17 @@ impl Default for MediaSettings {
             udp_port_min: default_udp_port_min(),
             udp_port_max: default_udp_port_max(),
             public_ip: None,
+        }
+    }
+}
+
+impl Default for ScreenShareSettings {
+    fn default() -> Self {
+        Self {
+            max_width: default_screen_share_max_width(),
+            max_height: default_screen_share_max_height(),
+            max_frame_rate: default_screen_share_max_frame_rate(),
+            bitrate_rules: default_screen_share_bitrate_rules(),
         }
     }
 }
@@ -73,18 +104,50 @@ fn default_udp_port_max() -> u16 {
     40100
 }
 
+fn default_screen_share_max_width() -> u32 {
+    1280
+}
+
+fn default_screen_share_max_height() -> u32 {
+    720
+}
+
+fn default_screen_share_max_frame_rate() -> u32 {
+    12
+}
+
+fn default_screen_share_bitrate_rules() -> Vec<ScreenShareBitrateRule> {
+    vec![
+        ScreenShareBitrateRule {
+            max_viewers: 1,
+            max_bitrate_bps: 2_000_000,
+        },
+        ScreenShareBitrateRule {
+            max_viewers: 2,
+            max_bitrate_bps: 1_200_000,
+        },
+        ScreenShareBitrateRule {
+            max_viewers: 8,
+            max_bitrate_bps: 800_000,
+        },
+    ]
+}
+
 impl Display for Settings {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "[监听端口 = {}, 房间人数上限 = {}, 断线保留秒数 = {}, 聊天历史条数 = {}, 媒体 UDP 端口范围 = {}-{}, 对外媒体 IP = {}]",
+            "[监听端口 = {}, 房间人数上限 = {}, 断线保留秒数 = {}, 聊天历史条数 = {}, 媒体 UDP 端口范围 = {}-{}, 对外媒体 IP = {}, 屏幕共享 = {}x{}@{}fps]",
             self.port,
             self.room.max_members,
             self.room.disconnect_grace_seconds,
             self.room.chat_history_limit,
             self.media.udp_port_min,
             self.media.udp_port_max,
-            self.media.public_ip.as_deref().unwrap_or("未配置")
+            self.media.public_ip.as_deref().unwrap_or("未配置"),
+            self.screen_share.max_width,
+            self.screen_share.max_height,
+            self.screen_share.max_frame_rate
         )?;
         Ok(())
     }
@@ -100,6 +163,10 @@ pub fn init_config() -> Result<Settings> {
             media:
               udp_port_min: 40000
               udp_port_max: 40100
+            screen_share:
+              max_width: 1280
+              max_height: 720
+              max_frame_rate: 12
            "#
         .to_string()
     });
@@ -123,6 +190,10 @@ mod tests {
         assert_eq!(settings.media.udp_port_min, 40000);
         assert_eq!(settings.media.udp_port_max, 40100);
         assert_eq!(settings.media.public_ip, None);
+        assert_eq!(settings.screen_share.max_width, 1280);
+        assert_eq!(settings.screen_share.max_height, 720);
+        assert_eq!(settings.screen_share.max_frame_rate, 12);
+        assert_eq!(settings.screen_share.bitrate_rules.len(), 3);
     }
 
     #[test]
@@ -147,6 +218,36 @@ mod tests {
                 .contains("媒体 UDP 端口范围 = 41000-41015")
         );
         assert!(settings.to_string().contains("对外媒体 IP = 111.228.39.21"));
+    }
+
+    #[test]
+    fn 屏幕共享码率策略可以配置并显示() {
+        let settings: Settings = serde_yaml::from_str(
+            r#"
+            port: 9000
+            screen_share:
+              max_width: 1024
+              max_height: 576
+              max_frame_rate: 10
+              bitrate_rules:
+                - max_viewers: 1
+                  max_bitrate_bps: 1500000
+                - max_viewers: 4
+                  max_bitrate_bps: 600000
+            "#,
+        )
+        .expect("解析屏幕共享配置");
+
+        assert_eq!(settings.screen_share.max_width, 1024);
+        assert_eq!(settings.screen_share.max_height, 576);
+        assert_eq!(settings.screen_share.max_frame_rate, 10);
+        assert_eq!(settings.screen_share.bitrate_rules.len(), 2);
+        assert_eq!(settings.screen_share.bitrate_rules[1].max_viewers, 4);
+        assert_eq!(
+            settings.screen_share.bitrate_rules[1].max_bitrate_bps,
+            600000
+        );
+        assert!(settings.to_string().contains("屏幕共享 = 1024x576@10fps"));
     }
 
     #[test]

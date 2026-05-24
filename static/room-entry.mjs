@@ -1,6 +1,8 @@
 export const NICKNAME_KEY = "remote-voice.nickname";
 export const ENTRY_INTENT_KEY = "remote-voice.room-entry-intent";
 export const ROOM_SESSION_KEY = "remote-voice.room-session";
+const ROOM_PANEL_KEY_PREFIX = "remote-voice.room-panel.";
+const ROOM_PANELS = new Set(["members", "chat", "screen"]);
 
 function trimmed(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -59,6 +61,15 @@ function normalizeRoomSession(session) {
     resumeToken,
     nickname,
   };
+}
+
+function normalizedPanel(panel) {
+  return ROOM_PANELS.has(panel) ? panel : "members";
+}
+
+function roomPanelKey(roomId) {
+  const normalized = normalizedRoomId(roomId);
+  return normalized ? `${ROOM_PANEL_KEY_PREFIX}${normalized}` : "";
 }
 
 export function loadNickname(storage) {
@@ -166,5 +177,33 @@ export function clearRoomSession(storage) {
     storage.removeItem(ROOM_SESSION_KEY);
   } catch (_error) {
     // Losing cleanup should not block the browser from leaving the page.
+  }
+}
+
+export function saveRoomPanel(storage, roomId, panel) {
+  const key = roomPanelKey(roomId);
+  const value = normalizedPanel(panel);
+  if (!key) {
+    return value;
+  }
+
+  try {
+    storage.setItem(key, value);
+  } catch (_error) {
+    // Panel persistence is only a convenience for refresh/resume.
+  }
+  return value;
+}
+
+export function loadRoomPanel(storage, roomId) {
+  const key = roomPanelKey(roomId);
+  if (!key) {
+    return "members";
+  }
+
+  try {
+    return normalizedPanel(storage.getItem(key));
+  } catch (_error) {
+    return "members";
   }
 }

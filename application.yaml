@@ -5,3 +5,16 @@ room:
 media:
   udp_port_min: 40000
   udp_port_max: 40100
+screen_share:
+  max_width: 1280
+  max_height: 720
+  max_frame_rate: 24
+  bitrate_rules:
+    - max_viewers: 1
+      max_bitrate_bps: 3500000
+    - max_viewers: 2
+      max_bitrate_bps: 1200000
+    - max_viewers: 3
+      max_bitrate_bps: 1200000
+    - max_viewers: 8
+      max_bitrate_bps: 800000

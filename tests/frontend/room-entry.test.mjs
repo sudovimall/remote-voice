@@ -5,6 +5,7 @@ import {
   ENTRY_INTENT_KEY,
   NICKNAME_KEY,
   ROOM_SESSION_KEY,
+  loadRoomPanel,
   clearRoomEntryIntent,
   clearRoomSession,
   directRoomEntry,
@@ -12,6 +13,7 @@ import {
   lobbyRoomId,
   loadRoomEntryIntent,
   loadRoomSession,
+  saveRoomPanel,
   saveNickname,
   saveRoomEntryIntent,
   saveRoomSession,
@@ -145,4 +147,16 @@ test("room session ignores invalid resume credentials and can be cleared", () =>
   });
   clearRoomSession(storage);
   assert.equal(storage.value(ROOM_SESSION_KEY), undefined);
+});
+
+test("room panel storage restores a screen view only for the matching room", () => {
+  const storage = memoryStorage();
+
+  assert.equal(loadRoomPanel(storage, "ABC123"), "members");
+  assert.equal(saveRoomPanel(storage, " abc123 ", "screen"), "screen");
+  assert.equal(loadRoomPanel(storage, "ABC123"), "screen");
+  assert.equal(loadRoomPanel(storage, "OTHER"), "members");
+
+  assert.equal(saveRoomPanel(storage, "ABC123", "invalid"), "members");
+  assert.equal(loadRoomPanel(storage, "ABC123"), "members");
 });

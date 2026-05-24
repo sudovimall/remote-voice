@@ -63,6 +63,10 @@ pub enum ClientSignal {
         request_id: Option<String>,
         server_ms: f64,
     },
+    SetScreenViewing {
+        request_id: Option<String>,
+        viewing: bool,
+    },
     SendChatMessage {
         request_id: Option<String>,
         content: String,
@@ -143,6 +147,10 @@ pub enum ServerSignal {
     },
     ScreenShareStopped {
         member_id: String,
+    },
+    ScreenShareViewerCountUpdated {
+        member_id: String,
+        viewer_count: usize,
     },
     WebrtcAnswer {
         request_id: Option<String>,
@@ -592,6 +600,26 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             None,
                         );
                     }
+                    ClientSignal::SetScreenViewing { request_id, viewing } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                            let _ = send_not_joined(&mut sender, request_id).await;
+                            continue;
+                        };
+
+                        match state.media.set_screen_viewing(room_id, member_id, viewing).await {
+                            Ok(viewer_count) => {
+                                broadcast_screen_viewer_count(
+                                    &state,
+                                    room_id,
+                                    viewer_count,
+                                )
+                                .await;
+                            }
+                            Err(error) => {
+                                let _ = send_error(&mut sender, request_id, error).await;
+                            }
+                        }
+                    }
                     ClientSignal::SendChatMessage { request_id, content, mentions } => {
                         let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
                             let _ = send_not_joined(&mut sender, request_id).await;
@@ -644,6 +672,10 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                                         },
                                         None,
                                     );
+                                    let viewer_count = state.media.screen_viewer_count(room_id).await;
+                                    if viewer_count > 0 {
+                                        broadcast_screen_viewer_count(&state, room_id, viewer_count).await;
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -673,6 +705,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                                         },
                                         None,
                                     );
+                                    broadcast_screen_viewer_count(&state, room_id, 0).await;
                                 }
                             }
                             Err(error) => {
@@ -781,6 +814,8 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 
     if let (Some(room_id), Some(member_id)) = (joined_room_id, joined_member_id) {
         let _ = state.media.close_member(&room_id, &member_id).await;
+        let viewer_count = state.media.screen_viewer_count(&room_id).await;
+        broadcast_screen_viewer_count(&state, &room_id, viewer_count).await;
         let _ = state.signals.unregister(&room_id, &member_id);
 
         if explicit_leave {
@@ -850,6 +885,26 @@ fn schedule_disconnected_cleanup(state: AppState, room_id: String, member_id: St
             );
         }
     });
+}
+
+async fn broadcast_screen_viewer_count(state: &AppState, room_id: &str, viewer_count: usize) {
+    let Some(member_id) = state
+        .rooms
+        .get_room(room_id)
+        .ok()
+        .and_then(|room| room.screen_share.map(|screen_share| screen_share.member_id))
+    else {
+        return;
+    };
+
+    let _ = state.signals.broadcast(
+        room_id,
+        ServerSignal::ScreenShareViewerCountUpdated {
+            member_id,
+            viewer_count,
+        },
+        None,
+    );
 }
 
 fn request_id_from_text(text: &str) -> Option<String> {

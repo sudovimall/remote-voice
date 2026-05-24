@@ -7,6 +7,7 @@ import {
   membersForRoom,
   nextRoomSnapshot,
   resumeRoomSignal,
+  setScreenViewingSignal,
   startScreenShareSignal,
   stopScreenShareSignal,
   websocketUrl,
@@ -63,6 +64,10 @@ test("screen share signals start and stop sharing", () => {
   assert.deepEqual(stopScreenShareSignal("screen-stop"), {
     type: "stop_screen_share",
     request_id: "screen-stop",
+  });
+  assert.deepEqual(setScreenViewingSignal(true), {
+    type: "set_screen_viewing",
+    viewing: true,
   });
 });
 

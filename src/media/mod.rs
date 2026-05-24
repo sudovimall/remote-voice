@@ -24,7 +24,13 @@ use webrtc::{
         RTCPeerConnection, configuration::RTCConfiguration,
         sdp::session_description::RTCSessionDescription,
     },
-    rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication,
+    rtcp::{
+        packet::Packet as RtcpPacket,
+        payload_feedbacks::{
+            full_intra_request::FullIntraRequest, picture_loss_indication::PictureLossIndication,
+        },
+        transport_feedbacks::transport_layer_nack::TransportLayerNack,
+    },
     rtp_transceiver::{
         rtp_codec::{RTCRtpCodecCapability, RTPCodecType},
         rtp_sender::RTCRtpSender,
@@ -52,6 +58,7 @@ pub struct MediaController {
     // 每个听众私有的“不接收哪些发布者”策略，信令层只回传给当前听众。
     member_not_listening: Arc<Mutex<HashMap<SessionKey, HashSet<String>>>>,
     screen_share_owners: Arc<Mutex<HashMap<String, String>>>,
+    screen_share_viewers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     event_sender: broadcast::Sender<MediaEvent>,
 }
 
@@ -223,6 +230,7 @@ impl MediaController {
             member_can_speak: Arc::new(Mutex::new(HashMap::new())),
             member_not_listening: Arc::new(Mutex::new(HashMap::new())),
             screen_share_owners: Arc::new(Mutex::new(HashMap::new())),
+            screen_share_viewers: Arc::new(Mutex::new(HashMap::new())),
             event_sender: broadcast::channel(MEDIA_EVENT_QUEUE_CAPACITY).0,
         })
     }
@@ -282,6 +290,7 @@ impl MediaController {
                 attach_existing_video_to_subscriber(
                     Arc::clone(&self.sessions),
                     Arc::clone(&self.screen_share_owners),
+                    Arc::clone(&self.screen_share_viewers),
                     room_id,
                     member_id,
                 )
@@ -316,6 +325,7 @@ impl MediaController {
         let sessions = Arc::clone(&self.sessions);
         let member_not_listening = Arc::clone(&self.member_not_listening);
         let screen_share_owners = Arc::clone(&self.screen_share_owners);
+        let screen_share_viewers = Arc::clone(&self.screen_share_viewers);
         let session_key = (room_id.to_string(), member_id.to_string());
         let event_sender = self.event_sender.clone();
         let track_peer_connection = Arc::clone(&peer_connection);
@@ -327,6 +337,7 @@ impl MediaController {
             let track_peer_connection = Arc::clone(&track_peer_connection);
             let member_not_listening = Arc::clone(&member_not_listening);
             let screen_share_owners = Arc::clone(&screen_share_owners);
+            let screen_share_viewers = Arc::clone(&screen_share_viewers);
 
             Box::pin(async move {
                 let kind = match track.kind() {
@@ -395,6 +406,7 @@ impl MediaController {
                         MediaTrackKind::Video => {
                             if attach_video_to_subscribers(
                                 Arc::clone(&sessions),
+                                Arc::clone(&screen_share_viewers),
                                 &session_key.0,
                                 &session_key.1,
                                 outbound_track_id,
@@ -499,6 +511,7 @@ impl MediaController {
             attach_existing_video_to_subscriber(
                 Arc::clone(&self.sessions),
                 Arc::clone(&self.screen_share_owners),
+                Arc::clone(&self.screen_share_viewers),
                 room_id,
                 member_id,
             )
@@ -551,6 +564,15 @@ impl MediaController {
                 blocked.remove(member_id);
             }
         }
+        {
+            let mut viewers = self.screen_share_viewers.lock().await;
+            if let Some(room_viewers) = viewers.get_mut(room_id) {
+                room_viewers.remove(member_id);
+                if room_viewers.is_empty() {
+                    viewers.remove(room_id);
+                }
+            }
+        }
         self.clear_screen_share_owner_if_matches(room_id, member_id)
             .await?;
         let session = {
@@ -582,6 +604,7 @@ impl MediaController {
                     .insert(room_id.to_string(), member_id.to_string());
                 attach_existing_video_to_subscribers_for_publisher(
                     Arc::clone(&self.sessions),
+                    Arc::clone(&self.screen_share_viewers),
                     room_id,
                     member_id,
                 )
@@ -623,6 +646,56 @@ impl MediaController {
             self.set_screen_share_owner(room_id, None).await?;
         }
         Ok(())
+    }
+
+    pub async fn set_screen_viewing(
+        &self,
+        room_id: &str,
+        member_id: &str,
+        viewing: bool,
+    ) -> Result<usize> {
+        {
+            let mut viewers = self.screen_share_viewers.lock().await;
+            let room_viewers = viewers.entry(room_id.to_string()).or_default();
+            if viewing {
+                room_viewers.insert(member_id.to_string());
+            } else {
+                room_viewers.remove(member_id);
+                if room_viewers.is_empty() {
+                    viewers.remove(room_id);
+                }
+            }
+        }
+
+        if viewing {
+            attach_existing_video_to_subscriber(
+                Arc::clone(&self.sessions),
+                Arc::clone(&self.screen_share_owners),
+                Arc::clone(&self.screen_share_viewers),
+                room_id,
+                member_id,
+            )
+            .await?;
+        } else {
+            detach_current_video_from_subscriber(Arc::clone(&self.sessions), room_id, member_id)
+                .await?;
+        }
+
+        Ok(self.screen_viewer_count(room_id).await)
+    }
+
+    pub async fn screen_viewer_count(&self, room_id: &str) -> usize {
+        let owner = self.screen_share_owners.lock().await.get(room_id).cloned();
+        let viewers = self.screen_share_viewers.lock().await;
+        viewers
+            .get(room_id)
+            .map(|room_viewers| {
+                room_viewers
+                    .iter()
+                    .filter(|member_id| Some(member_id.as_str()) != owner.as_deref())
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     /// 同步当前听众对某个发布者的下行接收偏好。
@@ -897,14 +970,8 @@ impl MediaSession {
 
         MediaSessionSnapshot {
             inbound_track_count: tracks.len(),
-            audio_track_count: tracks
-                .iter()
-                .filter(|track| track.kind == "audio")
-                .count(),
-            video_track_count: tracks
-                .iter()
-                .filter(|track| track.kind == "video")
-                .count(),
+            audio_track_count: tracks.iter().filter(|track| track.kind == "audio").count(),
+            video_track_count: tracks.iter().filter(|track| track.kind == "video").count(),
             inbound_packet_count: tracks.iter().map(|track| track.packet_count).sum(),
             outbound_track_count: outbound_tracks.len(),
             outbound_video_track_count: outbound_tracks
@@ -1200,6 +1267,7 @@ async fn detach_publisher_audio_from_subscriber(
 
 async fn attach_video_to_subscribers(
     sessions: Arc<Mutex<SessionMap>>,
+    screen_share_viewers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     room_id: &str,
     publisher_member_id: &str,
     track_id: String,
@@ -1207,12 +1275,16 @@ async fn attach_video_to_subscribers(
 ) -> Result<()> {
     let subscriber_keys = {
         let sessions = sessions.lock().await;
+        let viewers = screen_share_viewers.lock().await;
         sessions
             .iter()
             .filter_map(|((session_room_id, member_id), session)| {
                 if session_room_id == room_id
                     && member_id != publisher_member_id
                     && session.video_downlink_sender.is_some()
+                    && viewers
+                        .get(room_id)
+                        .is_some_and(|room_viewers| room_viewers.contains(member_id))
                 {
                     Some((session_room_id.clone(), member_id.clone()))
                 } else {
@@ -1271,10 +1343,85 @@ async fn attach_video_to_subscriber(
         .map_err(|err| Error::Internal(format!("替换下行屏幕共享槽位失败: {err}")))?;
     schedule_publisher_video_keyframes(
         Arc::clone(&sessions),
-        subscriber_key.0,
+        subscriber_key.0.clone(),
         publisher_member_id.to_string(),
     );
+    forward_subscriber_video_rtcp_feedback(
+        Arc::clone(&sessions),
+        subscriber_key.0,
+        publisher_member_id.to_string(),
+        downlink_sender,
+    );
     Ok(())
+}
+
+fn forward_subscriber_video_rtcp_feedback(
+    sessions: Arc<Mutex<SessionMap>>,
+    room_id: String,
+    publisher_member_id: String,
+    downlink_sender: Arc<RTCRtpSender>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let Ok((packets, _)) = downlink_sender.read_rtcp().await else {
+                break;
+            };
+
+            let publisher = {
+                let sessions = sessions.lock().await;
+                let publisher_key = (room_id.clone(), publisher_member_id.clone());
+                let Some(publisher) = sessions.get(&publisher_key) else {
+                    break;
+                };
+                let Some(media_ssrc) = publisher
+                    .inbound_tracks
+                    .values()
+                    .find(|track| track.kind == MediaTrackKind::Video)
+                    .map(|track| track.ssrc)
+                else {
+                    break;
+                };
+
+                (Arc::clone(&publisher.peer_connection), media_ssrc)
+            };
+
+            let forwarded = packets
+                .iter()
+                .filter_map(|packet| {
+                    rewrite_video_feedback_for_publisher(packet.as_ref(), publisher.1)
+                })
+                .collect::<Vec<_>>();
+            if !forwarded.is_empty() {
+                let _ = publisher.0.write_rtcp(&forwarded).await;
+            }
+        }
+    });
+}
+
+fn rewrite_video_feedback_for_publisher(
+    packet: &(dyn RtcpPacket + Send + Sync),
+    publisher_media_ssrc: u32,
+) -> Option<Box<dyn RtcpPacket + Send + Sync>> {
+    if let Some(pli) = packet.as_any().downcast_ref::<PictureLossIndication>() {
+        let mut forwarded = pli.clone();
+        forwarded.media_ssrc = publisher_media_ssrc;
+        return Some(Box::new(forwarded));
+    }
+    if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>() {
+        let mut forwarded = nack.clone();
+        forwarded.media_ssrc = publisher_media_ssrc;
+        return Some(Box::new(forwarded));
+    }
+    if let Some(fir) = packet.as_any().downcast_ref::<FullIntraRequest>() {
+        let mut forwarded = fir.clone();
+        forwarded.media_ssrc = publisher_media_ssrc;
+        for entry in &mut forwarded.fir {
+            entry.ssrc = publisher_media_ssrc;
+        }
+        return Some(Box::new(forwarded));
+    }
+
+    None
 }
 
 fn schedule_publisher_video_keyframes(
@@ -1503,6 +1650,7 @@ async fn attach_existing_publisher_audio_to_subscriber(
 async fn attach_existing_video_to_subscriber(
     sessions: Arc<Mutex<SessionMap>>,
     screen_share_owners: Arc<Mutex<HashMap<String, String>>>,
+    screen_share_viewers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     room_id: &str,
     member_id: &str,
 ) -> Result<()> {
@@ -1514,6 +1662,15 @@ async fn attach_existing_video_to_subscriber(
         return Ok(());
     };
     if publisher_member_id == member_id {
+        return Ok(());
+    }
+    let is_viewing = {
+        let viewers = screen_share_viewers.lock().await;
+        viewers
+            .get(room_id)
+            .is_some_and(|room_viewers| room_viewers.contains(member_id))
+    };
+    if !is_viewing {
         return Ok(());
     }
 
@@ -1562,6 +1719,7 @@ async fn attach_existing_video_to_subscriber(
 
 async fn attach_existing_video_to_subscribers_for_publisher(
     sessions: Arc<Mutex<SessionMap>>,
+    screen_share_viewers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     room_id: &str,
     publisher_member_id: &str,
 ) -> Result<()> {
@@ -1588,6 +1746,7 @@ async fn attach_existing_video_to_subscribers_for_publisher(
     for (track_id, fanout_track) in existing_video {
         attach_video_to_subscribers(
             Arc::clone(&sessions),
+            Arc::clone(&screen_share_viewers),
             room_id,
             publisher_member_id,
             track_id,
@@ -1597,6 +1756,48 @@ async fn attach_existing_video_to_subscribers_for_publisher(
     }
 
     Ok(())
+}
+
+async fn detach_current_video_from_subscriber(
+    sessions: Arc<Mutex<SessionMap>>,
+    room_id: &str,
+    listener_member_id: &str,
+) -> Result<()> {
+    let downlink_sender = {
+        let mut sessions = sessions.lock().await;
+        let subscriber_key = (room_id.to_string(), listener_member_id.to_string());
+        let Some(subscriber) = sessions.get_mut(&subscriber_key) else {
+            return Ok(());
+        };
+
+        let track_ids = subscriber
+            .outbound_tracks
+            .iter()
+            .filter_map(|(track_id, outbound_track)| {
+                if outbound_track.kind == MediaTrackKind::Video {
+                    Some(track_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for track_id in track_ids {
+            subscriber.outbound_tracks.remove(&track_id);
+        }
+
+        subscriber.video_downlink_sender.clone()
+    };
+
+    let Some(downlink_sender) = downlink_sender else {
+        return Ok(());
+    };
+
+    let empty_slot = new_video_downlink_slot_track(room_id, listener_member_id);
+    downlink_sender
+        .replace_track(Some(empty_slot as Arc<dyn TrackLocal + Send + Sync>))
+        .await
+        .map_err(|err| Error::Internal(format!("停止接收屏幕共享失败: {err}")))
 }
 
 async fn remove_inbound_video_tracks(
@@ -1636,7 +1837,10 @@ mod tests {
             peer_connection_state::RTCPeerConnectionState,
             sdp::session_description::RTCSessionDescription,
         },
-        rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication,
+        rtcp::{
+            payload_feedbacks::picture_loss_indication::PictureLossIndication,
+            transport_feedbacks::transport_layer_nack::{NackPair, TransportLayerNack},
+        },
         rtp_transceiver::{
             rtp_codec::{RTCRtpCodecCapability, RTPCodecType},
             rtp_sender::RTCRtpSender,
@@ -2184,7 +2388,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 共享者视频_track_会转发给听众() {
+    async fn 共享者视频_track_只会转发给正在观看的听众() {
         let test_network = new_test_network().await;
         let media = MediaController::new_with_vnet_for_test(Arc::clone(&test_network.server))
             .expect("创建媒体控制器");
@@ -2203,6 +2407,11 @@ mod tests {
         let mut packet_receiver = receive_first_track_packet(&listener);
         negotiate_client(&media, room_id, "listener-1", &listener).await;
         wait_for_connected(&listener).await;
+        let viewer_count = media
+            .set_screen_viewing(room_id, "listener-1", true)
+            .await
+            .expect("听众开始观看屏幕");
+        assert_eq!(viewer_count, 1);
 
         let publisher = new_test_peer_connection(Arc::clone(&test_network.publisher)).await;
         let publisher_track = new_publisher_video_track();
@@ -2242,6 +2451,122 @@ mod tests {
                 .await
                 .expect("听众收到屏幕共享 RTP");
         assert_eq!(received_payload, vec![0xC7]);
+
+        listener.close().await.expect("关闭听众 PeerConnection");
+        publisher.close().await.expect("关闭发布者 PeerConnection");
+    }
+
+    #[tokio::test]
+    async fn 听众视频_rtcp_反馈会转发给共享者() {
+        let test_network = new_test_network().await;
+        let media = MediaController::new_with_vnet_for_test(Arc::clone(&test_network.server))
+            .expect("创建媒体控制器");
+        let room_id = "room-1";
+        let mut media_events = media.subscribe_events();
+        media
+            .set_screen_share_owner(room_id, Some("publisher-1"))
+            .await
+            .expect("设置屏幕共享者");
+
+        let listener = new_test_peer_connection(Arc::clone(&test_network.listener)).await;
+        listener
+            .add_transceiver_from_kind(RTPCodecType::Video, None)
+            .await
+            .expect("听众声明视频 transceiver");
+        let mut packet_receiver = receive_first_track_packet_info(&listener);
+        negotiate_client(&media, room_id, "listener-1", &listener).await;
+        wait_for_connected(&listener).await;
+        media
+            .set_screen_viewing(room_id, "listener-1", true)
+            .await
+            .expect("听众开始观看屏幕");
+
+        let publisher = new_test_peer_connection(Arc::clone(&test_network.publisher)).await;
+        let publisher_track = new_publisher_video_track();
+        let publisher_sender = publisher
+            .add_track(Arc::clone(&publisher_track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .expect("共享者添加视频 track");
+        negotiate_client(&media, room_id, "publisher-1", &publisher).await;
+        wait_for_connected(&publisher).await;
+
+        send_until_publisher_video_arrives(&publisher_track, &mut media_events, "publisher-1")
+            .await;
+        let publisher_video_ssrc = media
+            .session_snapshot(room_id, "publisher-1")
+            .await
+            .expect("共享者媒体会话存在")
+            .tracks
+            .into_iter()
+            .find(|track| track.kind == "video")
+            .expect("共享者视频 track 存在")
+            .ssrc;
+        publisher_track
+            .write_rtp_with_extensions(&test_video_rtp_packet(900), &[])
+            .await
+            .expect("发布待转发视频 RTP");
+        let received = timeout(Duration::from_secs(2), packet_receiver.recv())
+            .await
+            .expect("等待听众视频 RTP 未超时")
+            .expect("听众收到视频 RTP");
+
+        listener
+            .write_rtcp(&[Box::new(TransportLayerNack {
+                sender_ssrc: 1,
+                media_ssrc: received.ssrc,
+                nacks: vec![NackPair::new(received.sequence_number)],
+            })])
+            .await
+            .expect("听众发送 NACK");
+
+        assert!(
+            publisher_receives_nack_for_ssrc(&publisher_sender, publisher_video_ssrc).await,
+            "听众对下行视频的 NACK 应改写 SSRC 后转发给共享者"
+        );
+
+        listener.close().await.expect("关闭听众 PeerConnection");
+        publisher.close().await.expect("关闭发布者 PeerConnection");
+    }
+
+    #[tokio::test]
+    async fn 共享者视频_track_不会转发给未观看的听众() {
+        let test_network = new_test_network().await;
+        let media = MediaController::new_with_vnet_for_test(Arc::clone(&test_network.server))
+            .expect("创建媒体控制器");
+        let room_id = "room-1";
+        let mut media_events = media.subscribe_events();
+        media
+            .set_screen_share_owner(room_id, Some("publisher-1"))
+            .await
+            .expect("设置屏幕共享者");
+
+        let listener = new_test_peer_connection(Arc::clone(&test_network.listener)).await;
+        listener
+            .add_transceiver_from_kind(RTPCodecType::Video, None)
+            .await
+            .expect("听众声明视频 transceiver");
+        negotiate_client(&media, room_id, "listener-1", &listener).await;
+        wait_for_connected(&listener).await;
+
+        let publisher = new_test_peer_connection(Arc::clone(&test_network.publisher)).await;
+        let publisher_track = new_publisher_video_track();
+        publisher
+            .add_track(Arc::clone(&publisher_track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .expect("共享者添加视频 track");
+        negotiate_client(&media, room_id, "publisher-1", &publisher).await;
+        wait_for_connected(&publisher).await;
+
+        send_until_publisher_video_arrives(&publisher_track, &mut media_events, "publisher-1")
+            .await;
+        assert_eq!(
+            media
+                .session_snapshot(room_id, "listener-1")
+                .await
+                .expect("听众媒体会话存在")
+                .outbound_video_track_count,
+            0
+        );
 
         listener.close().await.expect("关闭听众 PeerConnection");
         publisher.close().await.expect("关闭发布者 PeerConnection");
@@ -2521,14 +2846,41 @@ mod tests {
         ))
     }
 
+    #[derive(Debug)]
+    struct ReceivedTrackPacket {
+        ssrc: u32,
+        sequence_number: u16,
+        payload: Vec<u8>,
+    }
+
     fn receive_first_track_packet(peer_connection: &RTCPeerConnection) -> mpsc::Receiver<Vec<u8>> {
+        let mut packet_info_receiver = receive_first_track_packet_info(peer_connection);
+        let (packet_sender, packet_receiver) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(packet) = packet_info_receiver.recv().await {
+                if packet_sender.send(packet.payload).await.is_err() {
+                    break;
+                }
+            }
+        });
+        packet_receiver
+    }
+
+    fn receive_first_track_packet_info(
+        peer_connection: &RTCPeerConnection,
+    ) -> mpsc::Receiver<ReceivedTrackPacket> {
         let (packet_sender, packet_receiver) = mpsc::channel(8);
         peer_connection.on_track(Box::new(move |track, _, _| {
             let packet_sender = packet_sender.clone();
             Box::pin(async move {
                 tokio::spawn(async move {
                     while let Ok((packet, _)) = track.read_rtp().await {
-                        if packet_sender.send(packet.payload.to_vec()).await.is_err() {
+                        let packet = ReceivedTrackPacket {
+                            ssrc: packet.header.ssrc,
+                            sequence_number: packet.header.sequence_number,
+                            payload: packet.payload.to_vec(),
+                        };
+                        if packet_sender.send(packet).await.is_err() {
                             break;
                         }
                     }
@@ -2833,6 +3185,31 @@ mod tests {
         })
         .await
         .unwrap_or(0)
+    }
+
+    async fn publisher_receives_nack_for_ssrc(
+        publisher_sender: &RTCRtpSender,
+        media_ssrc: u32,
+    ) -> bool {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let Ok((packets, _)) = publisher_sender.read_rtcp().await else {
+                    return false;
+                };
+
+                for packet in packets {
+                    if packet
+                        .as_any()
+                        .downcast_ref::<TransportLayerNack>()
+                        .is_some_and(|nack| nack.media_ssrc == media_ssrc)
+                    {
+                        return true;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
     }
 
     fn test_rtp_packet(sequence_number: u16) -> webrtc::rtp::packet::Packet {

@@ -39,6 +39,17 @@ export function stopScreenShareSignal(requestId) {
   };
 }
 
+export function setScreenViewingSignal(viewing, requestId) {
+  const signal = {
+    type: "set_screen_viewing",
+    viewing,
+  };
+  if (requestId !== undefined) {
+    signal.request_id = requestId;
+  }
+  return signal;
+}
+
 export function websocketUrl(location) {
   const url = new URL("/ws", location.href);
   url.protocol = location.protocol === "https:" ? "wss:" : "ws:";

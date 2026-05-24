@@ -31,11 +31,16 @@ const DEFAULT_LATENCY_INTERVAL_MS = 1500;
 const DEFAULT_SPEAKING_INTERVAL_MS = 250;
 const SPEAKING_AUDIO_LEVEL = 0.035;
 const DEFAULT_VOLUME = 1;
-const SCREEN_SHARE_BITRATES = [
-  [921600, 2_500_000],
-  [2073600, 5_000_000],
-  [Number.POSITIVE_INFINITY, 8_000_000],
-];
+const DEFAULT_SCREEN_SHARE_CONFIG = {
+  maxWidth: 1280,
+  maxHeight: 720,
+  maxFrameRate: 12,
+  bitrateRules: [
+    { maxViewers: 1, maxBitrateBps: 2_000_000 },
+    { maxViewers: 2, maxBitrateBps: 1_200_000 },
+    { maxViewers: Number.POSITIVE_INFINITY, maxBitrateBps: 800_000 },
+  ],
+};
 
 function clamp(value, max) {
   const numeric = Number(value);
@@ -71,15 +76,68 @@ function memberIdFromTrackId(trackId = "") {
   return trackId.slice(0, separator);
 }
 
-function screenShareBitrate(settings = {}) {
-  const width = Number(settings.width);
-  const height = Number(settings.height);
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
-    return 2_500_000;
+function positiveInteger(value, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return fallback;
   }
 
-  const pixels = width * height;
-  return SCREEN_SHARE_BITRATES.find(([maxPixels]) => pixels <= maxPixels)?.[1] ?? 8_000_000;
+  return Math.floor(numeric);
+}
+
+function configValue(source, snakeName, camelName, fallback) {
+  return positiveInteger(source?.[snakeName] ?? source?.[camelName], fallback);
+}
+
+function normalizeScreenShareConfig(config = {}) {
+  const rules = Array.isArray(config?.bitrate_rules)
+    ? config.bitrate_rules
+    : Array.isArray(config?.bitrateRules)
+      ? config.bitrateRules
+      : [];
+  const bitrateRules = rules
+    .map((rule) => ({
+      maxViewers: positiveInteger(rule?.max_viewers ?? rule?.maxViewers, 0),
+      maxBitrateBps: positiveInteger(rule?.max_bitrate_bps ?? rule?.maxBitrateBps, 0),
+    }))
+    .filter((rule) => rule.maxViewers > 0 && rule.maxBitrateBps > 0)
+    .sort((left, right) => left.maxViewers - right.maxViewers);
+
+  return {
+    maxWidth: configValue(config, "max_width", "maxWidth", DEFAULT_SCREEN_SHARE_CONFIG.maxWidth),
+    maxHeight: configValue(config, "max_height", "maxHeight", DEFAULT_SCREEN_SHARE_CONFIG.maxHeight),
+    maxFrameRate: configValue(
+      config,
+      "max_frame_rate",
+      "maxFrameRate",
+      DEFAULT_SCREEN_SHARE_CONFIG.maxFrameRate,
+    ),
+    bitrateRules: bitrateRules.length ? bitrateRules : DEFAULT_SCREEN_SHARE_CONFIG.bitrateRules,
+  };
+}
+
+function screenShareVideoConstraints(config) {
+  return {
+    width: { max: config.maxWidth },
+    height: { max: config.maxHeight },
+    frameRate: { max: config.maxFrameRate },
+  };
+}
+
+function normalizedScreenShareViewerCount(viewerCount) {
+  const numeric = Number(viewerCount);
+  if (!Number.isFinite(numeric)) {
+    return 1;
+  }
+
+  return Math.max(1, Math.floor(numeric));
+}
+
+function screenShareBitrate(viewerCount = 1, config = DEFAULT_SCREEN_SHARE_CONFIG) {
+  const viewers = normalizedScreenShareViewerCount(viewerCount);
+  return config.bitrateRules.find((rule) => viewers <= rule.maxViewers)?.maxBitrateBps
+    ?? config.bitrateRules.at(-1)?.maxBitrateBps
+    ?? DEFAULT_SCREEN_SHARE_CONFIG.bitrateRules.at(-1).maxBitrateBps;
 }
 
 function videoOnlyStream(event, MediaStreamImpl) {
@@ -150,6 +208,7 @@ export class MediaSession {
     this.onScreenStream = options.onScreenStream;
     this.onScreenShareEnded = options.onScreenShareEnded;
     this.onError = options.onError;
+    this.screenShareConfig = normalizeScreenShareConfig(options.screenShare);
     this.latencyIntervalMs = options.latencyIntervalMs ?? DEFAULT_LATENCY_INTERVAL_MS;
     this.speakingIntervalMs = options.speakingIntervalMs ?? DEFAULT_SPEAKING_INTERVAL_MS;
     this.setIntervalImpl =
@@ -170,6 +229,7 @@ export class MediaSession {
     this.microphoneGainSupported = Boolean(this.AudioContextImpl);
     this.displayStream = null;
     this.displaySender = null;
+    this.screenShareViewerCount = 1;
     this.stoppingScreenShare = false;
     this.latencyTimer = null;
     this.speakingTimer = null;
@@ -301,6 +361,18 @@ export class MediaSession {
     return Boolean(this.mediaDevices?.getDisplayMedia);
   }
 
+  async setScreenShareViewerCount(viewerCount) {
+    const nextViewerCount = normalizedScreenShareViewerCount(viewerCount);
+    if (nextViewerCount === this.screenShareViewerCount) {
+      return;
+    }
+
+    this.screenShareViewerCount = nextViewerCount;
+    if (this.displaySender) {
+      await this.applyScreenShareBitrate(this.displaySender);
+    }
+  }
+
   async startScreenShare() {
     if (!this.peerConnection) {
       throw new Error("媒体会话尚未连接。");
@@ -311,7 +383,7 @@ export class MediaSession {
 
     await this.stopScreenShare({ renegotiate: false, notify: false });
     const displayStream = await this.mediaDevices.getDisplayMedia({
-      video: true,
+      video: screenShareVideoConstraints(this.screenShareConfig),
       audio: false,
     });
     const [displayTrack] = displayStream.getVideoTracks?.() ?? [];
@@ -331,7 +403,7 @@ export class MediaSession {
 
     this.displayStream = displayStream;
     this.displaySender = this.peerConnection.addTrack(displayTrack, displayStream);
-    await this.applyScreenShareBitrate(this.displaySender, displayTrack);
+    await this.applyScreenShareBitrate(this.displaySender);
     await this.renegotiate();
     return displayStream;
   }
@@ -364,13 +436,13 @@ export class MediaSession {
     }
   }
 
-  async applyScreenShareBitrate(sender, displayTrack) {
+  async applyScreenShareBitrate(sender) {
     if (!sender?.setParameters) {
       return;
     }
 
     try {
-      const maxBitrate = screenShareBitrate(displayTrack?.getSettings?.());
+      const maxBitrate = screenShareBitrate(this.screenShareViewerCount, this.screenShareConfig);
       const parameters = sender.getParameters?.() ?? {};
       parameters.encodings = [{ ...(parameters.encodings?.[0] ?? {}), maxBitrate }];
       await sender.setParameters(parameters);
@@ -561,7 +633,15 @@ export class MediaSession {
       if (memberId) {
         this.remoteTrackMembers.set(event.track.id, memberId);
       }
-      if (event.track?.kind === "video" || (event.streams?.[0]?.getVideoTracks?.() ?? []).length > 0) {
+      if (event.track?.kind === "video") {
+        this.onScreenStream?.(videoOnlyStream(event, this.MediaStreamImpl), memberId);
+        return;
+      }
+      if (event.track?.kind === "audio") {
+        this.playRemoteStream(event.streams?.[0], memberId);
+        return;
+      }
+      if ((event.streams?.[0]?.getVideoTracks?.() ?? []).length > 0) {
         this.onScreenStream?.(videoOnlyStream(event, this.MediaStreamImpl), memberId);
         return;
       }

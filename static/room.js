@@ -2,8 +2,10 @@ import {
   clearRoomEntryIntent,
   clearRoomSession,
   directRoomEntry,
+  loadRoomPanel,
   loadRoomEntryIntent,
   loadRoomSession,
+  saveRoomPanel,
   saveRoomSession,
 } from "/assets/room-entry.mjs";
 import {
@@ -12,6 +14,7 @@ import {
   membersForRoom,
   nextRoomSnapshot,
   resumeRoomSignal,
+  setScreenViewingSignal,
   startScreenShareSignal,
   stopScreenShareSignal,
   websocketUrl,
@@ -122,6 +125,8 @@ let memberVolumes = new Map();
 let microphoneGainLevel = loadMicrophoneGain(window.localStorage);
 let localScreenStream = null;
 let remoteScreenStream = null;
+let clientConfigPromise = null;
+let lastScreenViewing = false;
 let speakingMemberIds = new Set();
 let speakingTimers = new Map();
 const SPEAKING_TTL_MS = 1800;
@@ -171,12 +176,31 @@ function showError(message) {
   roomError.textContent = message;
 }
 
+async function loadClientConfig() {
+  if (!clientConfigPromise) {
+    clientConfigPromise = fetch("/api/client-config", { cache: "no-store" })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`客户端配置加载失败：${response.status}`);
+        }
+        return response.json();
+      })
+      .catch((error) => {
+        console.warn(error);
+        return null;
+      });
+  }
+
+  return clientConfigPromise;
+}
+
 function setConnection(message) {
   connection.textContent = message;
 }
 
 function setActiveSidePanel(panel) {
   activeSidePanel = panel;
+  saveRoomPanel(window.sessionStorage, currentRoom?.id, panel);
   const chatActive = panel === "chat";
   const screenActive = panel === "screen";
   memberList.hidden = chatActive || screenActive;
@@ -203,6 +227,7 @@ function setActiveSidePanel(panel) {
     renderScreenSharePanel();
     requestAnimationFrame(resizeScreenVideoFrame);
   }
+  syncScreenViewingState();
 }
 
 function renderUnreadBadge() {
@@ -294,6 +319,31 @@ function attachLocalScreenStream(stream) {
 function attachRemoteScreenStream(stream) {
   remoteScreenStream = stream;
   renderScreenVideoState();
+}
+
+function shouldReceiveScreenShare() {
+  const share = currentScreenShare();
+  return activeSidePanel === "screen" && share?.member_id !== ownMemberId;
+}
+
+function syncScreenViewingState(force = false) {
+  const viewing = shouldReceiveScreenShare();
+  if (!force && viewing === lastScreenViewing) {
+    return;
+  }
+
+  lastScreenViewing = viewing;
+  sendRoomControl(setScreenViewingSignal(viewing));
+}
+
+function applyScreenShareViewerCount(memberId, viewerCount) {
+  if (memberId !== ownMemberId) {
+    return;
+  }
+
+  mediaSession?.setScreenShareViewerCount(viewerCount).catch((error) => {
+    showError(error.message || "屏幕共享码率调整失败。");
+  });
 }
 
 function renderScreenSharePanel() {
@@ -877,6 +927,7 @@ function renderRoom(room) {
   membersMeta.textContent = `${members.length} 位成员`;
   memberList.replaceChildren(...members.map((member) => renderMember(member, room)));
   renderVoiceState();
+  syncScreenViewingState();
   renderScreenSharePanel();
 }
 
@@ -925,8 +976,13 @@ function handleRoomSignal(signal) {
     rememberMemberLatency(signal.member_id, signal.server_ms);
     return;
   }
+  if (signal.type === "screen_share_viewer_count_updated") {
+    applyScreenShareViewerCount(signal.member_id, signal.viewer_count);
+    return;
+  }
   if (signal.type === "screen_share_started") {
     renderScreenSharePanel();
+    syncScreenViewingState(true);
     if (signal.member_id === ownMemberId) {
       mediaSession
         ?.startScreenShare()
@@ -949,6 +1005,7 @@ function handleRoomSignal(signal) {
       });
     }
     renderScreenSharePanel();
+    syncScreenViewingState(true);
     return;
   }
 
@@ -1037,6 +1094,7 @@ async function connectRoom(intent) {
     rememberChatMessages(joined.chat_messages);
     clearRoomEntryIntent(window.sessionStorage);
     roomIdNode.textContent = joined.room.id;
+    setActiveSidePanel(loadRoomPanel(window.sessionStorage, joined.room.id));
     renderRoom(joined.room);
     setConnection("已连接");
     void startMedia();
@@ -1072,7 +1130,10 @@ async function startMedia() {
   mediaReady = false;
   localScreenStream = null;
   remoteScreenStream = null;
+  lastScreenViewing = false;
+  const clientConfig = await loadClientConfig();
   mediaSession = new MediaSession(client, {
+    screenShare: clientConfig?.screen_share,
     audioHost: remoteAudio,
     onState: renderVoiceState,
     onLatency: rememberLatencySnapshot,
@@ -1102,6 +1163,7 @@ async function startMedia() {
     renderVoiceState();
     renderMicrophoneGainControl();
     renderScreenSharePanel();
+    syncScreenViewingState(true);
   } catch (_error) {
     mediaReady = false;
     renderVoiceState({ media: "failed" });

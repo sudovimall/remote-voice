@@ -261,14 +261,24 @@ function mediaHarness(options = {}) {
   const errors = [];
   const screenStreams = [];
   const screenStops = [];
+  let displayConstraints = null;
   const session = new MediaSession(client, {
+    screenShare: options.screenShare,
     mediaDevices: {
       async getUserMedia(constraints) {
         assert.deepEqual(constraints, { audio: true });
         return stream;
       },
       async getDisplayMedia(constraints) {
-        assert.deepEqual(constraints, { video: true, audio: false });
+        displayConstraints = constraints;
+        assert.deepEqual(constraints, options.expectedDisplayConstraints ?? {
+          video: {
+            width: { max: 1280 },
+            height: { max: 720 },
+            frameRate: { max: 12 },
+          },
+          audio: false,
+        });
         return displayStream;
       },
     },
@@ -305,6 +315,9 @@ function mediaHarness(options = {}) {
     destinationTrack,
     displayStream,
     displayTrack,
+    get displayConstraints() {
+      return displayConstraints;
+    },
     client,
     errors,
     gainNodes,
@@ -430,6 +443,27 @@ test("media session plays tracks and releases resources on close", async () => {
   assert.equal(harness.track.stopped, true);
   assert.equal(peerConnection.closed, true);
   assert.equal(harness.audioNodes[0].removed, true);
+});
+
+test("media session plays audio track even when its stream also has a video slot", async () => {
+  const harness = mediaHarness();
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+
+  peerConnection.emitTrack(
+    {
+      id: "remote-mixed-stream",
+      getVideoTracks() {
+        return [{ kind: "video" }];
+      },
+    },
+    { id: "m_member:audio-track", kind: "audio" },
+  );
+  await Promise.resolve();
+
+  assert.equal(harness.audioNodes.length, 1);
+  assert.equal(harness.screenStreams.length, 0);
+  assert.equal(harness.states.some((state) => state.downlink === "track"), true);
 });
 
 test("media session applies and updates per-member playback volume", async () => {
@@ -562,7 +596,7 @@ test("media session reports speaking only from microphone audio level and clears
   assert.deepEqual(harness.speakingStates, [true, false]);
 });
 
-test("media session starts screen share without system audio and sets bitrate", async () => {
+test("media session starts bandwidth-limited screen share without system audio", async () => {
   const harness = mediaHarness({
     displaySettings: { width: 1920, height: 1080, frameRate: 30 },
   });
@@ -575,7 +609,64 @@ test("media session starts screen share without system audio and sets bitrate", 
   assert.equal(peerConnection.addedTracks.at(-1)[1], harness.displayStream);
   assert.equal(peerConnection.offerCount, 2);
   assert.deepEqual(peerConnection.senders.at(-1).parameters, {
-    encodings: [{ maxBitrate: 5_000_000 }],
+    encodings: [{ maxBitrate: 2_000_000 }],
+  });
+});
+
+test("media session updates screen share bitrate from viewer count", async () => {
+  const harness = mediaHarness();
+  await harness.session.start();
+
+  await harness.session.setScreenShareViewerCount(2);
+  await harness.session.startScreenShare();
+  const sender = harness.peerConnections[0].senders.at(-1);
+
+  assert.deepEqual(sender.parameters, {
+    encodings: [{ maxBitrate: 1_200_000 }],
+  });
+
+  await harness.session.setScreenShareViewerCount(3);
+
+  assert.deepEqual(sender.parameters, {
+    encodings: [{ maxBitrate: 800_000 }],
+  });
+});
+
+test("media session uses backend screen share config", async () => {
+  const harness = mediaHarness({
+    screenShare: {
+      max_width: 1024,
+      max_height: 576,
+      max_frame_rate: 10,
+      bitrate_rules: [
+        { max_viewers: 1, max_bitrate_bps: 1_500_000 },
+        { max_viewers: 4, max_bitrate_bps: 600_000 },
+      ],
+    },
+    expectedDisplayConstraints: {
+      video: {
+        width: { max: 1024 },
+        height: { max: 576 },
+        frameRate: { max: 10 },
+      },
+      audio: false,
+    },
+  });
+  await harness.session.start();
+
+  await harness.session.setScreenShareViewerCount(3);
+  await harness.session.startScreenShare();
+
+  assert.deepEqual(harness.displayConstraints, {
+    video: {
+      width: { max: 1024 },
+      height: { max: 576 },
+      frameRate: { max: 10 },
+    },
+    audio: false,
+  });
+  assert.deepEqual(harness.peerConnections[0].senders.at(-1).parameters, {
+    encodings: [{ maxBitrate: 600_000 }],
   });
 });
 
