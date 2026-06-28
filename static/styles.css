@@ -247,6 +247,73 @@ h2 {
   color: var(--ink-soft);
 }
 
+.auth-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 18px;
+  padding: 10px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.88);
+}
+
+.auth-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.auth-actions a,
+.auth-actions button {
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+  border-radius: 6px;
+  padding: 8px 10px;
+  text-decoration: none;
+  font: inherit;
+  cursor: pointer;
+}
+
+body[data-page="auth"],
+body[data-page="admin"] {
+  min-height: 100vh;
+  background: #101419;
+  color: #f6f2e8;
+}
+
+.auth-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px 18px;
+}
+
+.auth-panel {
+  width: min(420px, 100%);
+  display: grid;
+  gap: 16px;
+  padding: 28px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+}
+
+.auth-panel h1 {
+  margin: 0;
+  font-size: 2rem;
+}
+
+.auth-panel button {
+  min-height: 44px;
+}
+
+.admin-shell {
+  place-items: start center;
+}
+
 .stage-dot {
   width: 13px;
   height: 13px;

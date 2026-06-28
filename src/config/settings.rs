@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use tracing::info;
@@ -13,6 +13,10 @@ pub struct Settings {
     pub media: MediaSettings,
     #[serde(default)]
     pub screen_share: ScreenShareSettings,
+    #[serde(default)]
+    pub auth: AuthSettings,
+    #[serde(default)]
+    pub storage: StorageSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +57,63 @@ pub struct ScreenShareBitrateRule {
     pub max_bitrate_bps: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub admin: Option<AuthAdminSettings>,
+    #[serde(default)]
+    pub session: AuthSessionSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthAdminSettings {
+    pub username: String,
+    pub password_hash: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthSessionSettings {
+    #[serde(default = "default_session_cookie_name")]
+    pub cookie_name: String,
+    #[serde(default = "default_session_ttl_hours")]
+    pub ttl_hours: u64,
+    #[serde(default)]
+    pub secure: SessionSecureSetting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSecureSetting {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageSettings {
+    #[serde(default)]
+    pub kind: StorageKind,
+    #[serde(default)]
+    pub sqlite: SqliteSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageKind {
+    #[default]
+    Sqlite,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqliteSettings {
+    #[serde(default = "default_sqlite_path")]
+    pub path: String,
+}
+
 impl Default for RoomSettings {
     fn default() -> Self {
         Self {
@@ -80,6 +141,43 @@ impl Default for ScreenShareSettings {
             max_height: default_screen_share_max_height(),
             max_frame_rate: default_screen_share_max_frame_rate(),
             bitrate_rules: default_screen_share_bitrate_rules(),
+        }
+    }
+}
+
+impl Default for AuthSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            admin: None,
+            session: AuthSessionSettings::default(),
+        }
+    }
+}
+
+impl Default for AuthSessionSettings {
+    fn default() -> Self {
+        Self {
+            cookie_name: default_session_cookie_name(),
+            ttl_hours: default_session_ttl_hours(),
+            secure: SessionSecureSetting::Auto,
+        }
+    }
+}
+
+impl Default for StorageSettings {
+    fn default() -> Self {
+        Self {
+            kind: StorageKind::Sqlite,
+            sqlite: SqliteSettings::default(),
+        }
+    }
+}
+
+impl Default for SqliteSettings {
+    fn default() -> Self {
+        Self {
+            path: default_sqlite_path(),
         }
     }
 }
@@ -133,11 +231,68 @@ fn default_screen_share_bitrate_rules() -> Vec<ScreenShareBitrateRule> {
     ]
 }
 
+fn default_session_cookie_name() -> String {
+    "remote_voice_session".to_string()
+}
+
+fn default_session_ttl_hours() -> u64 {
+    168
+}
+
+fn default_sqlite_path() -> String {
+    "remote-voice.db".to_string()
+}
+
+impl Settings {
+    pub fn validate(&self) -> Result<()> {
+        if self.auth.enabled {
+            let Some(admin) = &self.auth.admin else {
+                return Err(Error::ConfigValue(
+                    "auth.enabled=true 时必须配置 auth.admin".to_string(),
+                ));
+            };
+
+            if admin.username.trim().is_empty() {
+                return Err(Error::ConfigValue(
+                    "auth.admin.username 不能为空".to_string(),
+                ));
+            }
+            if admin.password_hash.trim().is_empty() {
+                return Err(Error::ConfigValue(
+                    "auth.admin.password_hash 不能为空".to_string(),
+                ));
+            }
+            if admin.display_name.trim().is_empty() {
+                return Err(Error::ConfigValue(
+                    "auth.admin.display_name 不能为空".to_string(),
+                ));
+            }
+            if self.auth.session.cookie_name.trim().is_empty() {
+                return Err(Error::ConfigValue(
+                    "auth.session.cookie_name 不能为空".to_string(),
+                ));
+            }
+            if self.auth.session.ttl_hours == 0 {
+                return Err(Error::ConfigValue(
+                    "auth.session.ttl_hours 必须大于 0".to_string(),
+                ));
+            }
+            if self.storage.sqlite.path.trim().is_empty() {
+                return Err(Error::ConfigValue(
+                    "storage.sqlite.path 不能为空".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl Display for Settings {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "[监听端口 = {}, 房间人数上限 = {}, 断线保留秒数 = {}, 聊天历史条数 = {}, 媒体 UDP 端口范围 = {}-{}, 对外媒体 IP = {}, 屏幕共享 = {}x{}@{}fps]",
+            "[监听端口 = {}, 房间人数上限 = {}, 断线保留秒数 = {}, 聊天历史条数 = {}, 媒体 UDP 端口范围 = {}-{}, 对外媒体 IP = {}, 屏幕共享 = {}x{}@{}fps, 认证 = {}]",
             self.port,
             self.room.max_members,
             self.room.disconnect_grace_seconds,
@@ -147,15 +302,22 @@ impl Display for Settings {
             self.media.public_ip.as_deref().unwrap_or("未配置"),
             self.screen_share.max_width,
             self.screen_share.max_height,
-            self.screen_share.max_frame_rate
+            self.screen_share.max_frame_rate,
+            if self.auth.enabled {
+                "开启"
+            } else {
+                "关闭"
+            }
         )?;
         Ok(())
     }
 }
 
 pub fn init_config() -> Result<Settings> {
-    let s = std::fs::read_to_string("application.yaml").unwrap_or_else(|_| {
-        r#"
+    let s = match std::env::var("REMOTE_VOICE_CONFIG") {
+        Ok(path) => std::fs::read_to_string(path)?,
+        Err(_) => std::fs::read_to_string("application.yaml").unwrap_or_else(|_| {
+            r#"
             port: 8080
             room:
               max_members: 8
@@ -163,14 +325,16 @@ pub fn init_config() -> Result<Settings> {
             media:
               udp_port_min: 40000
               udp_port_max: 40100
-            screen_share:
-              max_width: 1280
-              max_height: 720
-              max_frame_rate: 12
-           "#
-        .to_string()
-    });
+	            screen_share:
+	              max_width: 1280
+	              max_height: 720
+	              max_frame_rate: 12
+	           "#
+            .to_string()
+        }),
+    };
     let config = serde_yaml::from_str::<Settings>(s.as_str())?;
+    config.validate()?;
     info!("后端配置已加载：{config}");
     Ok(config)
 }
@@ -273,5 +437,60 @@ mod tests {
         assert!(display.contains("聊天历史条数 = 25"));
         assert!(display.contains("媒体 UDP 端口范围 = 41000-41015"));
         assert!(display.contains("对外媒体 IP = 未配置"));
+    }
+
+    #[test]
+    fn 认证配置默认关闭且使用_sqlite_存储() {
+        let settings: Settings = serde_yaml::from_str("port: 9000").expect("解析最小配置");
+
+        assert!(!settings.auth.enabled);
+        assert_eq!(settings.auth.session.cookie_name, "remote_voice_session");
+        assert_eq!(settings.auth.session.ttl_hours, 168);
+        assert_eq!(settings.storage.sqlite.path, "remote-voice.db");
+    }
+
+    #[test]
+    fn 认证开启时必须配置管理员() {
+        let settings: Settings = serde_yaml::from_str(
+            r#"
+            port: 9000
+            auth:
+              enabled: true
+            "#,
+        )
+        .expect("解析认证配置");
+
+        assert!(settings.auth.enabled);
+        assert!(settings.auth.admin.is_none());
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn 认证开启且配置管理员时校验通过() {
+        let settings: Settings = serde_yaml::from_str(
+            r#"
+            port: 9000
+            auth:
+              enabled: true
+              admin:
+                username: admin
+                password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$c29tZWhhc2g"
+                display_name: 管理员
+            storage:
+              sqlite:
+                path: /tmp/remote-voice-auth-test.db
+            "#,
+        )
+        .expect("解析认证配置");
+
+        assert!(settings.validate().is_ok());
+        assert_eq!(
+            settings.auth.admin.as_ref().expect("管理员配置").username,
+            "admin"
+        );
+        assert_eq!(
+            settings.storage.sqlite.path,
+            "/tmp/remote-voice-auth-test.db"
+        );
     }
 }

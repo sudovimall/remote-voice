@@ -110,11 +110,15 @@ fn 同房间只能一个成员共享屏幕() {
         .start_screen_share(&owner.room.id, &first.member.id)
         .expect("第一个成员可以共享屏幕");
     assert_eq!(
-        room.screen_share.as_ref().map(|share| share.member_id.as_str()),
+        room.screen_share
+            .as_ref()
+            .map(|share| share.member_id.as_str()),
         Some(first.member.id.as_str())
     );
     assert_eq!(
-        room.screen_share.as_ref().map(|share| share.nickname.as_str()),
+        room.screen_share
+            .as_ref()
+            .map(|share| share.nickname.as_str()),
         Some("共享者")
     );
 

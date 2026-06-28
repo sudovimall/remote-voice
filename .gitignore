@@ -1,4 +1,10 @@
 /target
 /.worktrees
+/node_modules
+/static/dist
+/test-results
+/playwright-report
+/remote-voice.db
+/remote-voice.db-*
 /deploy/certs/*
 !/deploy/certs/.gitkeep

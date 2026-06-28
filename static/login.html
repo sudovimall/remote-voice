@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>登录 - Remote Voice</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/assets/styles.css">
+    <script type="module" src="/assets/auth-page.js"></script>
+  </head>
+  <body data-page="auth">
+    <main class="auth-shell">
+      <form id="login-form" class="auth-panel">
+        <p class="eyebrow">Remote Voice</p>
+        <h1>登录</h1>
+        <label class="field">
+          <span>用户名</span>
+          <input name="username" autocomplete="username" required>
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <div id="auth-error" class="inline-message" role="status" hidden></div>
+        <button type="submit">登录</button>
+      </form>
+    </main>
+  </body>
+</html>
