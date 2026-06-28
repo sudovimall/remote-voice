@@ -3,11 +3,20 @@
 `remote-voice` 是一个浏览器语音房 MVP：
 
 - Rust 提供房间、WebSocket 信令和服务端 WebRTC 音频转发。
-- 前端由 Rust 服务直接提供静态页面。
+- 前端由 Vue/Vite 构建，Rust 服务提供构建后的静态页面。
 - 昵称保存在浏览器 `localStorage`。
 - 房间恢复凭据保存在当前标签页 `sessionStorage`，刷新房间页后可在断线宽限期内恢复房主或成员身份。
 
 ## 本地运行
+
+前端构建产物位于 `static/dist`，启动 Rust 服务前先构建一次：
+
+```bash
+npm install
+npm run build:frontend
+```
+
+随后启动后端：
 
 ```bash
 cargo run

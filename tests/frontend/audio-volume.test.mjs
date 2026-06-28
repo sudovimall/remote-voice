@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  clearMemberVolumesForRoom,
   clampMicrophoneGain,
   clampPlaybackVolume,
   loadMemberVolume,
@@ -23,6 +24,18 @@ class MemoryStorage {
 
   setItem(key, value) {
     this.values.set(key, String(value));
+  }
+
+  removeItem(key) {
+    this.values.delete(key);
+  }
+
+  key(index) {
+    return Array.from(this.values.keys())[index] ?? null;
+  }
+
+  get length() {
+    return this.values.size;
   }
 }
 
@@ -65,6 +78,22 @@ test("member volume storage saves clamped values", () => {
 
   assert.equal(storage.getItem(memberVolumeKey("ABC123", "m_member")), "0.5");
   assert.equal(storage.getItem(memberVolumeKey("ABC123", "m_loud")), "1");
+});
+
+test("member volume cleanup removes only values for one room", () => {
+  const storage = new MemoryStorage({
+    [memberVolumeKey("ABC123", "m_a")]: "0.2",
+    [memberVolumeKey("ABC123", "m_b")]: "0.3",
+    [memberVolumeKey("OTHER", "m_a")]: "0.4",
+    remote_voice_microphone_gain: "0.8",
+  });
+
+  clearMemberVolumesForRoom(storage, "ABC123");
+
+  assert.equal(storage.getItem(memberVolumeKey("ABC123", "m_a")), null);
+  assert.equal(storage.getItem(memberVolumeKey("ABC123", "m_b")), null);
+  assert.equal(storage.getItem(memberVolumeKey("OTHER", "m_a")), "0.4");
+  assert.equal(storage.getItem("remote_voice_microphone_gain"), "0.8");
 });
 
 test("microphone gain storage uses a global browser preference", () => {

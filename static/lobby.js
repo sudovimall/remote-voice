@@ -5,6 +5,7 @@ import {
   saveRoomEntryIntent,
 } from "/assets/room-entry.mjs";
 import { fetchRoomSummaries } from "/assets/lobby-rooms.mjs";
+import { fetchAuthState, renderAuthControls } from "/assets/auth-ui.mjs";
 
 const nickname = document.querySelector("#nickname");
 const roomId = document.querySelector("#room-id");
@@ -15,6 +16,7 @@ const joinRoomForm = document.querySelector("#join-room");
 const roomBrowserMeta = document.querySelector("#room-browser-meta");
 const roomBrowserList = document.querySelector("#room-browser-list");
 const refreshRooms = document.querySelector("#refresh-rooms");
+const authControls = document.querySelector("#auth-controls");
 
 nickname.value = loadNickname(window.localStorage);
 roomId.value = lobbyRoomId(window.location.search);
@@ -158,4 +160,24 @@ refreshRooms.addEventListener("click", () => {
   void loadRooms();
 });
 
+async function logout() {
+  await fetch("/api/auth/logout", { method: "POST" });
+  window.location.assign("/login?next=%2F");
+}
+
+async function loadAuthControls() {
+  try {
+    const authState = await fetchAuthState(window.fetch.bind(window));
+    renderAuthControls(authControls, authState, () => {
+      void logout();
+    });
+    if (authState.user && !nickname.value) {
+      nickname.value = authState.user.display_name || authState.user.username || "";
+    }
+  } catch (_authError) {
+    authControls.hidden = true;
+  }
+}
+
+void loadAuthControls();
 void loadRooms();

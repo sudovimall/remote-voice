@@ -1,65 +1,86 @@
 use crate::{
-    Result,
+    Error, Result,
     domain::room::{Room, RoomSummary},
     state::AppState,
 };
 use axum::{
     Json, Router,
     extract::{Path, State},
-    routing::{get, post},
+    http::HeaderMap,
+    routing::get,
 };
-use serde::Deserialize;
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/rooms", get(list_rooms))
         .route("/api/rooms/{room_id}", get(get_room))
-        .route(
-            "/api/rooms/{room_id}/members/{member_id}/speaking",
-            post(set_member_can_speak),
-        )
-}
-
-#[derive(Debug, Deserialize)]
-struct SetSpeakingRequest {
-    actor_member_id: String,
-    can_speak: bool,
 }
 
 async fn get_room(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(room_id): Path<String>,
 ) -> Result<Json<Room>> {
+    if state.auth.is_enabled() {
+        super::auth::api_user(&state, &headers)?;
+    }
     Ok(Json(state.rooms.get_room(&room_id)?))
 }
 
-async fn list_rooms(State(state): State<AppState>) -> Result<Json<Vec<RoomSummary>>> {
-    Ok(Json(state.rooms.list_room_summaries()?))
-}
-
-async fn set_member_can_speak(
+async fn list_rooms(
     State(state): State<AppState>,
-    Path((room_id, member_id)): Path<(String, String)>,
-    Json(payload): Json<SetSpeakingRequest>,
-) -> Result<Json<Room>> {
-    let room = state.rooms.set_member_can_speak(
-        &room_id,
-        &payload.actor_member_id,
-        &member_id,
-        payload.can_speak,
-    )?;
-    Ok(Json(room))
+    headers: HeaderMap,
+) -> Result<Json<Vec<RoomSummary>>> {
+    if state.auth.is_enabled() {
+        super::auth::api_user(&state, &headers)?;
+        let mut summaries = state.rooms.list_room_summaries()?;
+        let service = state.auth.service().ok_or(Error::AuthDisabled)?;
+        for persistent in service.store().list_open_persistent_rooms()? {
+            if summaries
+                .iter()
+                .any(|summary| summary.id == persistent.room_id)
+            {
+                continue;
+            }
+            summaries.push(RoomSummary {
+                id: persistent.room_id,
+                member_count: 0,
+            });
+        }
+        summaries.sort_by(|left, right| left.id.cmp(&right.id));
+        return Ok(Json(summaries));
+    }
+    Ok(Json(state.rooms.list_room_summaries()?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::router;
-    use crate::state::AppState;
+    use crate::{
+        auth::{
+            AuthRuntime, password::hash_password, service::AuthService, session::now_epoch_seconds,
+        },
+        state::AppState,
+        storage::sqlite::SqliteStore,
+    };
     use axum::{
         body::{Body, to_bytes},
-        http::{Request, StatusCode},
+        http::{Request, StatusCode, header},
     };
+    use std::sync::Arc;
     use tower::ServiceExt;
+
+    fn auth_state() -> (AppState, Arc<AuthService>) {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("打开内存数据库"));
+        let service = Arc::new(AuthService::new_for_test(store, 24));
+        let admin_hash = hash_password("secret").expect("生成密码 hash");
+        service
+            .sync_admin("admin", &admin_hash, "管理员", 10)
+            .expect("同步管理员");
+        let state =
+            AppState::new_with_auth(8, AuthRuntime::Enabled(service.clone())).expect("创建状态");
+        (state, service)
+    }
 
     #[tokio::test]
     async fn 创建房间后可以查询房间() {
@@ -131,6 +152,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn 认证开启时房间列表包含持久化空房间() {
+        let (state, service) = auth_state();
+        let login = service
+            .login_at("admin", "secret", now_epoch_seconds())
+            .expect("管理员登录");
+        service
+            .store()
+            .create_persistent_room("ABC123", login.user.id, now_epoch_seconds())
+            .expect("创建持久房间");
+        let app = router().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/rooms")
+                    .header(
+                        header::COOKIE,
+                        format!("remote_voice_session={}", login.token),
+                    )
+                    .body(Body::empty())
+                    .expect("构造查询房间列表请求"),
+            )
+            .await
+            .expect("查询房间列表响应");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("读取房间列表响应体");
+        let rooms: serde_json::Value = serde_json::from_slice(&body).expect("列表响应是 JSON");
+        let rooms = rooms.as_array().expect("列表响应是数组");
+
+        assert!(rooms.iter().any(|room| {
+            room["id"] == "ABC123" && room["member_count"] == 0 && room.get("members").is_none()
+        }));
+    }
+
+    #[tokio::test]
     async fn http_不再创建或加入房间() {
         let state = AppState::new(8).expect("创建应用状态");
         let created = state.rooms.create_room("房主").expect("创建房间");
@@ -162,5 +222,39 @@ mod tests {
             .await
             .expect("读取加入房间响应");
         assert_eq!(join_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn http_发言权限接口不再接受客户端伪造_actor() {
+        let state = AppState::new(8).expect("创建应用状态");
+        let owner = state.rooms.create_room("房主").expect("创建房间");
+        let member = state
+            .rooms
+            .join_room(&owner.room.id, "成员")
+            .expect("成员加入");
+        let app = router().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/rooms/{}/members/{}/speaking",
+                        owner.room.id, member.member.id
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "actor_member_id": owner.member.id,
+                            "can_speak": false
+                        })
+                        .to_string(),
+                    ))
+                    .expect("构造发言权限请求"),
+            )
+            .await
+            .expect("读取发言权限响应");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -1,0 +1,164 @@
+<script setup>
+import { reactive, ref } from "vue";
+import { useRoomSession } from "../composables/useRoomSession.js";
+import ChatNotifications from "./room/ChatNotifications.vue";
+import ChatPanel from "./room/ChatPanel.vue";
+import MembersPanel from "./room/MembersPanel.vue";
+import RoomTabs from "./room/RoomTabs.vue";
+import RoomTopbar from "./room/RoomTopbar.vue";
+import ScreenSharePanel from "./room/ScreenSharePanel.vue";
+import VoicePanel from "./room/VoicePanel.vue";
+
+const room = reactive(useRoomSession());
+const screenPanel = ref(null);
+
+function openScreenPopout() {
+  screenPanel.value?.openPopout();
+}
+
+function fullscreenScreenShare() {
+  screenPanel.value?.fullscreenMain();
+}
+</script>
+
+<template>
+  <main
+    class="room-shell signal-page"
+    :class="{ 'voice-pane-collapsed': room.voicePaneCollapsed }"
+  >
+    <RoomTopbar
+      :connection-label="room.connectionLabel"
+      :room-id-label="room.roomIdLabel"
+      :voice-pane-collapsed="room.voicePaneCollapsed"
+      @toggle-voice-pane="room.setVoicePaneCollapsed(!room.voicePaneCollapsed)"
+    />
+
+    <div id="room-error" class="room-alert" role="status" :hidden="!room.errorMessage">
+      {{ room.errorMessage }}
+    </div>
+
+    <section class="room-grid">
+      <section
+        id="side-panel"
+        class="members-pane"
+        aria-labelledby="members-title"
+        :data-active-panel="room.activeSidePanel"
+      >
+        <div class="pane-head">
+          <div>
+            <h2 id="members-title">{{ room.panelTitle }}</h2>
+            <span id="members-meta" class="meta-copy">{{ room.membersMeta }}</span>
+          </div>
+          <div class="pane-controls">
+            <div id="screen-toolbar" class="screen-toolbar" :hidden="room.activeSidePanel !== 'screen'">
+              <button
+                id="start-screen-share"
+                type="button"
+                class="quiet-button"
+                :hidden="Boolean(room.currentScreenShare)"
+                :disabled="!room.mediaReady || !room.canShareScreen"
+                :title="room.canShareScreen ? '开始共享屏幕' : '当前浏览器不支持屏幕共享'"
+                @click="room.startScreenShare"
+              >
+                开始共享屏幕
+              </button>
+              <button
+                id="open-screen-popout"
+                type="button"
+                class="quiet-button"
+                :disabled="!room.currentScreenShare || !room.activeScreenStream"
+                @click="openScreenPopout"
+              >
+                弹窗
+              </button>
+              <button
+                id="fullscreen-screen-share"
+                type="button"
+                class="quiet-button"
+                :disabled="!room.currentScreenShare || !room.activeScreenStream"
+                @click="fullscreenScreenShare"
+              >
+                全屏
+              </button>
+              <button
+                id="stop-screen-share"
+                type="button"
+                class="quiet-button"
+                :hidden="!room.canStopScreenShare"
+                @click="room.stopScreenShare"
+              >
+                停止共享
+              </button>
+            </div>
+            <RoomTabs
+              :active-panel="room.activeSidePanel"
+              :unread-badge="room.unreadBadgeLabel"
+              @select="room.setActiveSidePanel"
+            />
+          </div>
+        </div>
+      </section>
+
+      <section class="stage-pane" aria-label="房间主区域">
+        <div class="stage-content">
+          <ChatNotifications :mention-reminder="room.mentionReminder" :toast="room.chatToast" />
+          <MembersPanel
+            v-show="room.activeSidePanel === 'members'"
+            :current-room="room.currentRoom"
+            :get-member-volume="room.memberVolume"
+            :latency-snapshot="room.latencySnapshot"
+            :members="room.members"
+            :not-listening-member-ids="room.notListeningMemberIds"
+            :own-member-id="room.ownMemberId"
+            :speaking-member-ids="room.speakingMemberIds"
+            @set-member-volume="room.setMemberVolume"
+            @toggle-listening="room.toggleMemberListening"
+            @toggle-permission="room.toggleMemberPermission"
+          />
+          <ChatPanel
+            v-model="room.chatInput"
+            :active="room.activeSidePanel === 'chat'"
+            :hide-mention-picker="room.hideMentionPicker"
+            :mention-picker-index="room.mentionPickerIndex"
+            :mention-picker-members="room.mentionPickerMembers"
+            :messages="room.chatMessages"
+            :own-member-id="room.ownMemberId"
+            :render-mention-picker="room.renderMentionPicker"
+            :select-mention="room.selectMention"
+            :set-mention-picker-index="room.setMentionPickerIndex"
+            :submit-message="room.submitChatMessage"
+          />
+          <ScreenSharePanel
+            ref="screenPanel"
+            :active="room.activeSidePanel === 'screen'"
+            :can-share="room.canShareScreen"
+            :can-stop="room.canStopScreenShare"
+            :media-ready="room.mediaReady"
+            :screen-popout-title="room.screenPopoutTitle"
+            :screen-share-title="room.screenShareTitle"
+            :stream="room.activeScreenStream"
+          />
+        </div>
+      </section>
+
+      <VoicePanel
+        v-show="!room.voicePaneCollapsed"
+        :device-state-label="room.deviceStateLabel"
+        :downlink-state-label="room.downlinkStateLabel"
+        :media-ready="room.mediaReady"
+        :media-state-label="room.mediaStateLabel"
+        :mic-state-label="room.micStateLabel"
+        :microphone-gain-level="room.microphoneGainLevel"
+        :microphone-gain-percent="room.microphoneGainPercent"
+        :microphone-gain-supported="room.microphoneGainSupported"
+        :mute-self-label="room.muteSelfLabel"
+        :permission-note="room.permissionNote"
+        @leave="room.leaveRoom"
+        @set-microphone-gain="room.setMicrophoneGain"
+        @toggle-mute="room.toggleSelfMuted"
+      />
+    </section>
+
+    <div id="remote-audio" hidden aria-hidden="true"></div>
+  </main>
+</template>

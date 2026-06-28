@@ -1,6 +1,7 @@
 use crate::{
     Error, Result,
-    domain::room::{ChatMention, ChatMessage, Room},
+    auth::{CurrentUser, session::now_epoch_seconds},
+    domain::room::{ChatMention, ChatMessage, MemberRole, Room},
     media::{IceCandidate, MediaEvent},
     state::AppState,
 };
@@ -9,12 +10,14 @@ use axum::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, future::pending, sync::RwLock};
 use tokio::sync::mpsc;
+use tracing::error;
 
 const SIGNAL_QUEUE_CAPACITY: usize = 256;
 
@@ -257,19 +260,30 @@ impl SignalHub {
 
 pub async fn websocket(
     State(state): State<AppState>,
+    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
-) -> impl IntoResponse {
-    upgrade.on_upgrade(move |socket| handle_socket(state, socket))
+) -> Response {
+    let current_user = if state.auth.is_enabled() {
+        match super::auth::current_user_from_headers(&state, &headers) {
+            Ok(user) => Some(user),
+            Err(_) => return Error::Unauthenticated.into_response(),
+        }
+    } else {
+        None
+    };
+
+    upgrade
+        .on_upgrade(move |socket| handle_socket(state, socket, current_user))
+        .into_response()
 }
 
-async fn handle_socket(state: AppState, socket: WebSocket) {
+async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<CurrentUser>) {
     let (mut sender, mut receiver) = socket.split();
     let mut joined_room_id: Option<String> = None;
     let mut joined_member_id: Option<String> = None;
     let mut outbound: Option<mpsc::Receiver<ServerSignal>> = None;
     let mut local_ice_candidates: Option<mpsc::Receiver<IceCandidate>> = None;
     let mut media_events = state.media.subscribe_events();
-    let mut explicit_leave = false;
 
     loop {
         tokio::select! {
@@ -320,6 +334,19 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 
                         let room_id = join.room.id.clone();
                         let member_id = join.member.id.clone();
+                        if let Some(user) = &current_user {
+                            if let Some(service) = state.auth.service() {
+                                if let Err(error) = service.store().create_persistent_room(
+                                    &room_id,
+                                    user.id,
+                                    now_epoch_seconds(),
+                                ) {
+                                    let _ = state.rooms.leave_room(&room_id, &member_id);
+                                    let _ = send_error(&mut sender, Some(request_id), error).await;
+                                    continue;
+                                }
+                            }
+                        }
                         let room_receiver = match state.signals.register(&room_id, &member_id) {
                             Ok(receiver) => receiver,
                             Err(error) => {
@@ -352,7 +379,12 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             continue;
                         }
 
-                        let join = match state.rooms.join_room(&room_id, nickname) {
+                        let join = match join_room_for_current_user(
+                            &state,
+                            current_user.as_ref(),
+                            &room_id,
+                            nickname,
+                        ) {
                             Ok(join) => join,
                             Err(error) => {
                                 let _ = send_error(&mut sender, Some(request_id), error).await;
@@ -446,7 +478,6 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                             continue;
                         }
 
-                        explicit_leave = true;
                         break;
                     }
                     ClientSignal::SetSelfMuted { request_id, self_muted } => {
@@ -818,28 +849,22 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
         broadcast_screen_viewer_count(&state, &room_id, viewer_count).await;
         let _ = state.signals.unregister(&room_id, &member_id);
 
-        if explicit_leave {
-            broadcast_explicit_leave(&state, &room_id, &member_id);
-        } else if let Ok(room) = state.rooms.mark_member_disconnected(&room_id, &member_id) {
-            let _ = state.signals.broadcast(
-                &room_id,
-                ServerSignal::MemberUpdated {
-                    room,
-                    member_id: member_id.clone(),
-                },
-                None,
-            );
-            schedule_disconnected_cleanup(state, room_id, member_id);
-        }
+        broadcast_departure(&state, &room_id, &member_id, current_user.as_ref());
     }
 }
 
-fn broadcast_explicit_leave(state: &AppState, room_id: &str, member_id: &str) {
+fn broadcast_departure(
+    state: &AppState,
+    room_id: &str,
+    member_id: &str,
+    current_user: Option<&CurrentUser>,
+) {
     let Ok(room) = state.rooms.leave_room(room_id, member_id) else {
         return;
     };
 
     if room.owner_member_id == member_id {
+        close_persistent_room_for_owner_if_enabled(state, room_id, current_user);
         let _ = state.signals.broadcast(
             room_id,
             ServerSignal::RoomClosed {
@@ -860,31 +885,76 @@ fn broadcast_explicit_leave(state: &AppState, room_id: &str, member_id: &str) {
     }
 }
 
-fn schedule_disconnected_cleanup(state: AppState, room_id: String, member_id: String) {
-    tokio::spawn(async move {
-        tokio::time::sleep(state.disconnect_grace_period).await;
+fn close_persistent_room_for_owner_if_enabled(
+    state: &AppState,
+    room_id: &str,
+    current_user: Option<&CurrentUser>,
+) {
+    let Some(service) = state.auth.service() else {
+        return;
+    };
+    let Some(current_user) = current_user else {
+        error!(room_id, "认证开启但房主连接缺少用户身份，跳过持久房间关闭");
+        return;
+    };
 
-        let Ok(Some(room)) = state.rooms.expire_disconnected_member(&room_id, &member_id) else {
-            return;
-        };
-
-        if room.owner_member_id == member_id {
-            let _ = state.signals.broadcast(
-                &room_id,
-                ServerSignal::RoomClosed {
-                    room_id: room_id.clone(),
-                },
-                None,
-            );
-            let _ = state.signals.clear_room(&room_id);
-        } else {
-            let _ = state.signals.broadcast(
-                &room_id,
-                ServerSignal::MemberLeft { room, member_id },
-                None,
-            );
+    match service.store().find_persistent_room(room_id) {
+        Ok(Some(persistent)) if persistent.owner_user_id == current_user.id => {
+            if let Err(error) = service
+                .store()
+                .close_persistent_room(room_id, now_epoch_seconds())
+            {
+                error!(room_id, %error, "关闭持久房间失败");
+            }
         }
-    });
+        Ok(_) => {}
+        Err(error) => {
+            error!(room_id, %error, "查询持久房间失败");
+        }
+    }
+}
+
+fn join_room_for_current_user(
+    state: &AppState,
+    current_user: Option<&CurrentUser>,
+    room_id: &str,
+    nickname: String,
+) -> Result<crate::domain::room::RoomJoin> {
+    let Some(user) = current_user else {
+        return state.rooms.join_room(room_id, nickname);
+    };
+    if !state.auth.is_enabled() {
+        return state.rooms.join_room(room_id, nickname);
+    }
+
+    let service = state.auth.service().ok_or(Error::AuthDisabled)?;
+    let Some(persistent) = service.store().find_persistent_room(room_id)? else {
+        return state.rooms.join_room(room_id, nickname);
+    };
+
+    if persistent.closed_at_epoch_seconds.is_some() {
+        return Err(Error::RoomClosed);
+    }
+
+    let role = if persistent.owner_user_id == user.id {
+        MemberRole::Owner
+    } else {
+        MemberRole::Member
+    };
+    let join = match state
+        .rooms
+        .join_room_with_role(room_id, nickname.clone(), role.clone())
+    {
+        Ok(join) => join,
+        Err(Error::RoomNotFound) => state
+            .rooms
+            .restore_room_with_member(room_id, nickname, role)?,
+        Err(error) => return Err(error),
+    };
+    service
+        .store()
+        .touch_persistent_room(room_id, now_epoch_seconds())?;
+    Ok(join)
 }
 
 async fn broadcast_screen_viewer_count(state: &AppState, room_id: &str, viewer_count: usize) {

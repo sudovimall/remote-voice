@@ -5,14 +5,18 @@ import {
   ENTRY_INTENT_KEY,
   NICKNAME_KEY,
   ROOM_SESSION_KEY,
+  clearRoomNotListening,
+  clearRoomPanel,
   loadRoomPanel,
   clearRoomEntryIntent,
   clearRoomSession,
+  loadRoomNotListening,
   directRoomEntry,
   loadNickname,
   lobbyRoomId,
   loadRoomEntryIntent,
   loadRoomSession,
+  saveRoomNotListening,
   saveRoomPanel,
   saveNickname,
   saveRoomEntryIntent,
@@ -159,4 +163,30 @@ test("room panel storage restores a screen view only for the matching room", () 
 
   assert.equal(saveRoomPanel(storage, "ABC123", "invalid"), "members");
   assert.equal(loadRoomPanel(storage, "ABC123"), "members");
+});
+
+test("room scoped listening preferences are saved and cleared by room", () => {
+  const storage = memoryStorage();
+
+  assert.deepEqual(loadRoomNotListening(storage, "ABC123"), []);
+  assert.deepEqual(saveRoomNotListening(storage, " abc123 ", ["m_b", " ", "m_b", "m_c"]), [
+    "m_b",
+    "m_c",
+  ]);
+  assert.deepEqual(loadRoomNotListening(storage, "ABC123"), ["m_b", "m_c"]);
+  assert.deepEqual(loadRoomNotListening(storage, "OTHER"), []);
+
+  clearRoomNotListening(storage, "ABC123");
+  assert.deepEqual(loadRoomNotListening(storage, "ABC123"), []);
+});
+
+test("room panel cleanup removes only the target room preference", () => {
+  const storage = memoryStorage();
+  saveRoomPanel(storage, "ABC123", "screen");
+  saveRoomPanel(storage, "OTHER", "chat");
+
+  clearRoomPanel(storage, "ABC123");
+
+  assert.equal(loadRoomPanel(storage, "ABC123"), "members");
+  assert.equal(loadRoomPanel(storage, "OTHER"), "chat");
 });

@@ -1,10 +1,11 @@
-port: 8080
+port: 18080
 room:
   max_members: 8
   disconnect_grace_seconds: 30
 media:
   udp_port_min: 40000
   udp_port_max: 40100
+  public_ip: 127.0.0.1
 screen_share:
   max_width: 1280
   max_height: 720
@@ -18,3 +19,9 @@ screen_share:
       max_bitrate_bps: 1200000
     - max_viewers: 8
       max_bitrate_bps: 800000
+auth:
+  enabled: false
+storage:
+  kind: sqlite
+  sqlite:
+    path: remote-voice.db

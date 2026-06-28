@@ -150,6 +150,15 @@ impl RoomStore {
     }
 
     pub fn join_room(&self, room_id: &str, nickname: impl Into<String>) -> Result<RoomJoin> {
+        self.join_room_with_role(room_id, nickname, MemberRole::Member)
+    }
+
+    pub fn join_room_with_role(
+        &self,
+        room_id: &str,
+        nickname: impl Into<String>,
+        role: MemberRole,
+    ) -> Result<RoomJoin> {
         let nickname = nickname.into();
         let mut rooms = self.write_rooms()?;
         let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
@@ -159,17 +168,61 @@ impl RoomStore {
         }
 
         let member = loop {
-            let candidate = self.new_member(nickname.clone(), MemberRole::Member);
+            let candidate = self.new_member(nickname.clone(), role.clone());
             if !room.members.contains_key(&candidate.id) {
                 break candidate;
             }
         };
+
+        if role == MemberRole::Owner {
+            for existing in room.members.values_mut() {
+                existing.role = MemberRole::Member;
+            }
+            room.owner_member_id = member.id.clone();
+        }
 
         room.members.insert(member.id.clone(), member.clone());
         room.last_active_epoch_seconds = now_epoch_seconds();
 
         Ok(RoomJoin {
             room: room.clone(),
+            resume_token: member.resume_token.clone(),
+            member,
+        })
+    }
+
+    pub fn restore_room_with_member(
+        &self,
+        room_id: &str,
+        nickname: impl Into<String>,
+        role: MemberRole,
+    ) -> Result<RoomJoin> {
+        let mut rooms = self.write_rooms()?;
+        if rooms.contains_key(room_id) {
+            return Err(Error::InvalidMessage("房间已经在运行中".to_string()));
+        }
+
+        let member = self.new_member(nickname, role.clone());
+        let now = now_epoch_seconds();
+        let owner_member_id = if role == MemberRole::Owner {
+            member.id.clone()
+        } else {
+            String::new()
+        };
+        let room = Room {
+            id: room_id.to_string(),
+            owner_member_id,
+            members: HashMap::from([(member.id.clone(), member.clone())]),
+            created_at_epoch_seconds: now,
+            last_active_epoch_seconds: now,
+            screen_share: None,
+            chat_messages: Vec::new(),
+        };
+
+        rooms.insert(room_id.to_string(), room.clone());
+
+        Ok(RoomJoin {
+            room,
             resume_token: member.resume_token.clone(),
             member,
         })
@@ -379,9 +432,7 @@ impl RoomStore {
         let member = room.members.get(member_id).ok_or(Error::MemberNotFound)?;
 
         if !member.connected {
-            return Err(Error::InvalidMessage(
-                "离线成员不能共享屏幕".to_string(),
-            ));
+            return Err(Error::InvalidMessage("离线成员不能共享屏幕".to_string()));
         }
 
         if let Some(screen_share) = &room.screen_share {
@@ -490,6 +541,11 @@ impl RoomStore {
         room.last_active_epoch_seconds = now_epoch_seconds();
 
         Ok(room.clone())
+    }
+
+    pub fn close_room(&self, room_id: &str) -> Result<Room> {
+        let mut rooms = self.write_rooms()?;
+        rooms.remove(room_id).ok_or(Error::RoomNotFound)
     }
 
     fn new_member(&self, nickname: impl Into<String>, role: MemberRole) -> Member {

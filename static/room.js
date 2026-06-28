@@ -1,10 +1,14 @@
 import {
+  clearRoomNotListening,
   clearRoomEntryIntent,
+  clearRoomPanel,
   clearRoomSession,
   directRoomEntry,
   loadRoomPanel,
   loadRoomEntryIntent,
+  loadRoomNotListening,
   loadRoomSession,
+  saveRoomNotListening,
   saveRoomPanel,
   saveRoomSession,
 } from "/assets/room-entry.mjs";
@@ -43,6 +47,7 @@ import {
   sendChatMessageSignal,
 } from "/assets/chat-controls.mjs";
 import {
+  clearMemberVolumesForRoom,
   clampMicrophoneGain,
   clampPlaybackVolume,
   loadMemberVolume,
@@ -71,6 +76,7 @@ const chatMessagesNode = document.querySelector("#chat-messages");
 const mentionReminder = document.querySelector("#mention-reminder");
 const mentionReminderTitle = document.querySelector("#mention-reminder-title");
 const mentionReminderText = document.querySelector("#mention-reminder-text");
+const chatToastContainer = document.querySelector("#chat-toast-container");
 const chatForm = document.querySelector("#chat-form");
 const mentionPicker = document.querySelector("#mention-picker");
 const chatInput = document.querySelector("#chat-input");
@@ -120,6 +126,7 @@ let selectedMentions = [];
 let mentionPickerMembers = [];
 let mentionPickerIndex = 0;
 let mentionReminderTimer = null;
+let chatToastTimer = null;
 let latencySnapshot = { serverMs: null, members: {} };
 let memberVolumes = new Map();
 let microphoneGainLevel = loadMicrophoneGain(window.localStorage);
@@ -428,6 +435,31 @@ function showMentionReminder(message) {
   mentionReminderTimer = window.setTimeout(clearMentionReminder, MENTION_REMINDER_MS);
 }
 
+function clearChatToast() {
+  if (chatToastTimer) {
+    window.clearTimeout(chatToastTimer);
+    chatToastTimer = null;
+  }
+  chatToastContainer?.replaceChildren();
+}
+
+function showChatToast(message) {
+  if (!chatToastContainer || message?.member_id === ownMemberId) {
+    return;
+  }
+
+  const toast = textNode("article", "chat-toast", "");
+  toast.append(
+    textNode("strong", "", `${message.nickname || "成员"} 发来消息`),
+    textNode("span", "", message.content || ""),
+  );
+  chatToastContainer.replaceChildren(toast);
+  if (chatToastTimer) {
+    window.clearTimeout(chatToastTimer);
+  }
+  chatToastTimer = window.setTimeout(clearChatToast, 5000);
+}
+
 function activeMentionQuery() {
   const cursor = chatInput.selectionStart ?? chatInput.value.length;
   const prefix = chatInput.value.slice(0, cursor);
@@ -554,8 +586,44 @@ function setMicrophoneGain(value) {
   renderMicrophoneGainControl();
 }
 
-function rememberListeningState(memberIds = []) {
-  notListeningMemberIds = new Set(memberIds);
+function rememberListeningState(memberIds = [], persist = true) {
+  const values = Array.from(new Set(memberIds.filter(Boolean)));
+  notListeningMemberIds = new Set(values);
+  if (persist && currentRoom?.id) {
+    saveRoomNotListening(window.localStorage, currentRoom.id, values);
+  }
+}
+
+function existingPublisherIds(room, memberIds) {
+  return Array.from(new Set(memberIds)).filter(
+    (memberId) => memberId && memberId !== ownMemberId && room?.members?.[memberId],
+  );
+}
+
+function applyStoredListeningState(room, serverMemberIds = []) {
+  const storedMemberIds = existingPublisherIds(
+    room,
+    loadRoomNotListening(window.localStorage, room?.id),
+  );
+  const mergedMemberIds = Array.from(new Set([...serverMemberIds, ...storedMemberIds]));
+  rememberListeningState(mergedMemberIds);
+
+  for (const memberId of storedMemberIds) {
+    if (!serverMemberIds.includes(memberId)) {
+      sendRoomControl(memberListeningSignal(memberId, false));
+    }
+  }
+}
+
+function clearRoomScopedSettings(roomId = currentRoom?.id || routeRoomId) {
+  if (!roomId) {
+    return;
+  }
+
+  clearRoomSession(window.sessionStorage);
+  clearRoomPanel(window.sessionStorage, roomId);
+  clearRoomNotListening(window.localStorage, roomId);
+  clearMemberVolumesForRoom(window.localStorage, roomId);
 }
 
 function rememberLatencySnapshot(snapshot) {
@@ -799,6 +867,7 @@ function handleChatMessage(message) {
     ownMemberId,
   );
   showMentionReminder(message);
+  showChatToast(message);
   renderUnreadBadge();
   renderChatMessages();
 }
@@ -918,6 +987,7 @@ function renderEmptyMembers(message) {
 
 function renderRoom(room) {
   const members = membersForRoom(room);
+  rememberListeningState(existingPublisherIds(room, Array.from(notListeningMemberIds)));
   for (const member of members) {
     if (member.id !== ownMemberId) {
       memberVolume(member.id);
@@ -945,12 +1015,13 @@ function handleRoomSignal(signal) {
     return;
   }
 
+  const previousRoomId = currentRoom?.id || signal.room_id || routeRoomId;
   currentRoom = nextRoomSnapshot(currentRoom, signal);
   if (signal.type === "room_closed") {
     mediaSession?.close();
-    clearRoomSession(window.sessionStorage);
+    clearRoomScopedSettings(previousRoomId);
     roomSession = null;
-    rememberListeningState();
+    rememberListeningState([], false);
     speakingMemberIds = new Set();
     clearSpeakingTimers();
     setConnection("房间已关闭");
@@ -1055,7 +1126,11 @@ function scheduleReconnect() {
 
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = null;
-    connectRoom({ mode: "resume", session: roomSession });
+    connectRoom({
+      mode: "join",
+      roomId: roomSession.roomId,
+      nickname: roomSession.nickname,
+    });
   }, 1000);
 }
 
@@ -1087,10 +1162,10 @@ async function connectRoom(intent) {
     await nextClient.connect();
     const joined = await nextClient.enter(entrySignal(intent));
     rememberJoinedRoom(joined, intent);
-    rememberListeningState(joined.not_listening_member_ids);
     memberVolumes = new Map();
     currentRoom = joined.room;
     ownMemberId = joined.member_id;
+    applyStoredListeningState(joined.room, joined.not_listening_member_ids ?? []);
     rememberChatMessages(joined.chat_messages);
     clearRoomEntryIntent(window.sessionStorage);
     roomIdNode.textContent = joined.room.id;
@@ -1114,7 +1189,7 @@ async function connectRoom(intent) {
     if (intent.mode === "resume") {
       clearRoomSession(window.sessionStorage);
       roomSession = null;
-      rememberListeningState();
+      rememberListeningState([], false);
       speakingMemberIds = new Set();
       clearSpeakingTimers();
       rememberChatMessages();
@@ -1286,6 +1361,8 @@ chatInput.addEventListener("blur", () => {
 
 leaveRoom.addEventListener("click", () => {
   intentionalShutdown = true;
+  const leavingRoomId = currentRoom?.id || routeRoomId;
+  const leavingEndsRoom = currentRoom?.owner_member_id === ownMemberId;
   if (reconnectTimer) {
     window.clearTimeout(reconnectTimer);
   }
@@ -1294,9 +1371,13 @@ leaveRoom.addEventListener("click", () => {
   } catch (_error) {
     // The server will handle a closed socket as a recoverable disconnect.
   }
-  clearRoomSession(window.sessionStorage);
+  if (leavingEndsRoom) {
+    clearRoomScopedSettings(leavingRoomId);
+  } else {
+    clearRoomSession(window.sessionStorage);
+  }
   roomSession = null;
-  rememberListeningState();
+  rememberListeningState([], false);
   speakingMemberIds = new Set();
   clearSpeakingTimers();
   rememberChatMessages();
@@ -1321,7 +1402,11 @@ if (!routeRoomId) {
     connectRoom(intent);
   } else if (session) {
     roomSession = session;
-    connectRoom({ mode: "resume", session });
+    connectRoom({
+      mode: "join",
+      roomId: session.roomId,
+      nickname: session.nickname,
+    });
   } else {
     const directEntry = directRoomEntry(window.localStorage, routeRoomId);
     if (directEntry?.mode === "join") {
