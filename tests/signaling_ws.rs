@@ -37,6 +37,12 @@ fn auth_state() -> (AppState, Arc<AuthService>) {
     (state, service)
 }
 
+fn auth_state_with_grace(disconnect_grace_period: Duration) -> (AppState, Arc<AuthService>) {
+    let (mut state, service) = auth_state();
+    state.disconnect_grace_period = disconnect_grace_period;
+    (state, service)
+}
+
 async fn spawn_app(state: AppState) -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -295,7 +301,7 @@ async fn create_audio_offer() -> String {
 #[tokio::test]
 async fn websocket_认证开启时未登录访问_ws_被拒绝() {
     let (state, _service) = auth_state();
-    let ws_url = spawn_app(state).await;
+    let ws_url = spawn_app(state.clone()).await;
 
     let error = connect_async(ws_url).await.expect_err("未登录不能升级 ws");
 
@@ -308,7 +314,7 @@ async fn websocket_认证用户创建房间会写入持久房间() {
     let login = service
         .login_at("admin", "secret", now_epoch_seconds())
         .expect("管理员登录");
-    let ws_url = spawn_app(state).await;
+    let ws_url = spawn_app(state.clone()).await;
     let cookie = format!("remote_voice_session={}", login.token);
 
     let (_ws, room_id, _member_id) =
@@ -323,8 +329,39 @@ async fn websocket_认证用户创建房间会写入持久房间() {
 }
 
 #[tokio::test]
-async fn websocket_认证房主断开会关闭持久房间() {
-    let (state, service) = auth_state();
+async fn websocket_认证房主普通断开不会立即关闭持久房间() {
+    let (state, service) = auth_state_with_grace(Duration::from_millis(250));
+    let login = service
+        .login_at("admin", "secret", now_epoch_seconds())
+        .expect("管理员登录");
+    let ws_url = spawn_app(state.clone()).await;
+    let cookie = format!("remote_voice_session={}", login.token);
+    let (mut owner_ws, room_id, _owner_id) =
+        connect_create_with_cookie(&ws_url, &cookie, "create-auth", "管理员").await;
+
+    owner_ws.close(None).await.expect("关闭房主 ws");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        service
+            .store()
+            .find_open_persistent_room(&room_id)
+            .expect("查询持久房间")
+            .is_some()
+    );
+    assert!(
+        !state
+            .rooms
+            .get_room(&room_id)
+            .expect("房间仍处于恢复宽限期")
+            .members[&_owner_id]
+            .connected
+    );
+}
+
+#[tokio::test]
+async fn websocket_认证房主断线超时后关闭持久房间() {
+    let (state, service) = auth_state_with_grace(Duration::from_millis(30));
     let login = service
         .login_at("admin", "secret", now_epoch_seconds())
         .expect("管理员登录");
@@ -334,7 +371,7 @@ async fn websocket_认证房主断开会关闭持久房间() {
         connect_create_with_cookie(&ws_url, &cookie, "create-auth", "管理员").await;
 
     owner_ws.close(None).await.expect("关闭房主 ws");
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
 
     assert!(
         service
@@ -808,8 +845,63 @@ async fn websocket_joined_room_返回恢复凭据() {
 }
 
 #[tokio::test]
-async fn websocket_普通成员断线后恢复凭据不能恢复且重新加入生成新成员() {
-    let state = AppState::new(8).expect("创建应用状态");
+async fn websocket_普通成员普通断开后可以在宽限期内恢复() {
+    let state = AppState::with_disconnect_grace_period(8, Duration::from_millis(250))
+        .expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, room_id, _owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut member_ws, _) = connect_async(&ws_url).await.expect("连接成员 ws");
+    member_ws
+        .send(Message::Text(
+            json!({
+                "type": "join_room",
+                "request_id": "join-member",
+                "room_id": room_id,
+                "nickname": "队友",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送 join_room");
+    let member_joined = read_until_type(&mut member_ws, "joined_room").await;
+    let member_id = member_joined["member_id"]
+        .as_str()
+        .expect("成员 ID")
+        .to_string();
+    let resume_token = member_joined["resume_token"]
+        .as_str()
+        .expect("恢复凭据")
+        .to_string();
+    let owner_joined = read_until_type(&mut owner_ws, "member_joined").await;
+    let leaked_resume_token = owner_joined["room"]["members"][&member_id]["resume_token"]
+        .as_str()
+        .map(str::to_string);
+    assert!(leaked_resume_token.is_none(), "房间快照不能暴露恢复凭据");
+
+    member_ws.close(None).await.expect("关闭成员 ws");
+    let updated = read_until_type(&mut owner_ws, "member_updated").await;
+    assert_eq!(updated["member_id"], member_id);
+    assert_eq!(updated["room"]["members"][&member_id]["connected"], false);
+
+    let mut resumed_ws = connect_existing_member(
+        &ws_url,
+        &room_id,
+        "resume-member",
+        &member_id,
+        &resume_token,
+    )
+    .await;
+    let resumed = read_until_type(&mut owner_ws, "member_updated").await;
+    assert_eq!(resumed["member_id"], member_id);
+    assert_eq!(resumed["room"]["members"][&member_id]["connected"], true);
+    resumed_ws.close(None).await.expect("关闭恢复 ws");
+}
+
+#[tokio::test]
+async fn websocket_普通成员断线超时后恢复凭据不能恢复且重新加入生成新成员() {
+    let state =
+        AppState::with_disconnect_grace_period(8, Duration::from_millis(30)).expect("创建应用状态");
     let ws_url = spawn_app(state).await;
     let (mut owner_ws, room_id, _owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
     let (mut member_ws, _) = connect_async(&ws_url).await.expect("连接成员 ws");
@@ -837,6 +929,8 @@ async fn websocket_普通成员断线后恢复凭据不能恢复且重新加入�
     let _ = read_until_type(&mut owner_ws, "member_joined").await;
 
     member_ws.close(None).await.expect("关闭成员 ws");
+    let left = read_until_type(&mut owner_ws, "member_left").await;
+    assert_eq!(left["member_id"], member_id);
 
     let (mut resumed_ws, _) = connect_async(&ws_url).await.expect("连接恢复 ws");
     resumed_ws
@@ -906,22 +1000,40 @@ async fn websocket_恢复凭据错误时拒绝恢复() {
 }
 
 #[tokio::test]
-async fn websocket_房主断线时立即关闭房间() {
-    let state = AppState::new(8).expect("创建应用状态");
+async fn websocket_房主普通断开后可以在宽限期内恢复() {
+    let state = AppState::with_disconnect_grace_period(8, Duration::from_millis(250))
+        .expect("创建应用状态");
     let ws_url = spawn_app(state.clone()).await;
-    let (mut owner_ws, room_id, owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
-    let (mut member_ws, _) = connect_join(&ws_url, &room_id, "join-member", "队友").await;
+    let (mut owner_ws, room_id, owner_id, resume_token) =
+        connect_create_with_resume(&ws_url, "create-owner", "房主").await;
+    let (mut member_ws, member_id) = connect_join(&ws_url, &room_id, "join-member", "队友").await;
     let _ = read_until_type(&mut owner_ws, "member_joined").await;
 
     owner_ws.close(None).await.expect("关闭房主 ws");
 
-    let closed = read_until_type(&mut member_ws, "room_closed").await;
-    assert_eq!(closed["room_id"], room_id);
-    assert!(matches!(
-        state.rooms.get_room(&room_id),
-        Err(voice::Error::RoomNotFound)
-    ));
-    assert!(!owner_id.is_empty());
+    let updated = read_until_type(&mut member_ws, "member_updated").await;
+    assert_eq!(updated["member_id"], owner_id);
+    assert_eq!(updated["room"]["members"][&owner_id]["connected"], false);
+
+    let mut resumed_ws =
+        connect_existing_member(&ws_url, &room_id, "resume-owner", &owner_id, &resume_token).await;
+    resumed_ws
+        .send(Message::Text(
+            json!({
+                "type": "set_member_can_speak",
+                "request_id": "owner-after-resume",
+                "member_id": member_id,
+                "can_speak": false,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("恢复后的房主修改权限");
+
+    let owner_update = read_until_type(&mut resumed_ws, "member_updated").await;
+    assert_eq!(owner_update["request_id"], Value::Null);
+    assert_eq!(owner_update["room"]["owner_member_id"], owner_id);
 }
 
 #[tokio::test]

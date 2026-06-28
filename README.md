@@ -40,6 +40,8 @@ media:
   udp_port_max: 40100
 ```
 
+修改 `auth.enabled`、管理员密码哈希、session cookie 或 SQLite 路径后需要重启后端才会生效。关闭认证不会删除已有 SQLite 用户、session、邀请码或持久房间数据，再次开启认证时会继续使用同一个数据库。
+
 如果服务部署在云厂商公网 IP 到实例私网 IP 的 NAT 后面，还要配置对外发布的公网 IP：
 
 ```yaml

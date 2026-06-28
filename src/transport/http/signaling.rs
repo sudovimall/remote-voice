@@ -284,6 +284,7 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
     let mut outbound: Option<mpsc::Receiver<ServerSignal>> = None;
     let mut local_ice_candidates: Option<mpsc::Receiver<IceCandidate>> = None;
     let mut media_events = state.media.subscribe_events();
+    let mut explicit_leave = false;
 
     loop {
         tokio::select! {
@@ -351,6 +352,11 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             Ok(receiver) => receiver,
                             Err(error) => {
                                 let _ = state.rooms.leave_room(&room_id, &member_id);
+                                close_persistent_room_for_owner_if_enabled(
+                                    &state,
+                                    &room_id,
+                                    current_user.as_ref(),
+                                );
                                 let _ = send_error(&mut sender, Some(request_id), error).await;
                                 continue;
                             }
@@ -396,7 +402,11 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                         let room_receiver = match state.signals.register(&room_id, &member_id) {
                             Ok(receiver) => receiver,
                             Err(error) => {
-                                let _ = state.rooms.leave_room(&room_id, &member_id);
+                                if let Ok(room) = state.rooms.leave_room(&room_id, &member_id) {
+                                    if room.members.is_empty() {
+                                        let _ = state.rooms.close_room(&room_id);
+                                    }
+                                }
                                 let _ = send_error(&mut sender, Some(request_id), error).await;
                                 continue;
                             }
@@ -478,6 +488,7 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             continue;
                         }
 
+                        explicit_leave = true;
                         break;
                     }
                     ClientSignal::SetSelfMuted { request_id, self_muted } => {
@@ -849,10 +860,40 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
         broadcast_screen_viewer_count(&state, &room_id, viewer_count).await;
         let _ = state.signals.unregister(&room_id, &member_id);
 
-        broadcast_departure(&state, &room_id, &member_id, current_user.as_ref());
+        if explicit_leave {
+            broadcast_departure(&state, &room_id, &member_id, current_user.as_ref());
+        } else {
+            broadcast_disconnect(state, room_id, member_id, current_user);
+        }
     }
 }
 
+// 将非显式 WebSocket 断开转换为可恢复离线状态，避免刷新或热重载误关房间。
+fn broadcast_disconnect(
+    state: AppState,
+    room_id: String,
+    member_id: String,
+    current_user: Option<CurrentUser>,
+) {
+    match state.rooms.mark_member_disconnected(&room_id, &member_id) {
+        Ok(room) => {
+            let _ = state.signals.broadcast(
+                &room_id,
+                ServerSignal::MemberUpdated {
+                    room,
+                    member_id: member_id.clone(),
+                },
+                None,
+            );
+            schedule_disconnected_cleanup(state, room_id, member_id, current_user);
+        }
+        Err(error) => {
+            error!(room_id, member_id, %error, "标记成员断线失败");
+        }
+    }
+}
+
+// 处理用户明确发送 leave_room 的离开语义；房主显式离开会立即关闭房间。
 fn broadcast_departure(
     state: &AppState,
     room_id: &str,
@@ -883,6 +924,40 @@ fn broadcast_departure(
             None,
         );
     }
+}
+
+// 在断线宽限期后清理仍未恢复的成员；房主超时才关闭持久房间。
+fn schedule_disconnected_cleanup(
+    state: AppState,
+    room_id: String,
+    member_id: String,
+    current_user: Option<CurrentUser>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(state.disconnect_grace_period).await;
+
+        let Ok(Some(room)) = state.rooms.expire_disconnected_member(&room_id, &member_id) else {
+            return;
+        };
+
+        if room.owner_member_id == member_id {
+            close_persistent_room_for_owner_if_enabled(&state, &room_id, current_user.as_ref());
+            let _ = state.signals.broadcast(
+                &room_id,
+                ServerSignal::RoomClosed {
+                    room_id: room_id.clone(),
+                },
+                None,
+            );
+            let _ = state.signals.clear_room(&room_id);
+        } else {
+            let _ = state.signals.broadcast(
+                &room_id,
+                ServerSignal::MemberLeft { room, member_id },
+                None,
+            );
+        }
+    });
 }
 
 fn close_persistent_room_for_owner_if_enabled(
