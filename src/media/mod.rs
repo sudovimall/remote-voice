@@ -59,19 +59,22 @@ pub struct MediaController {
     member_not_listening: Arc<Mutex<HashMap<SessionKey, HashSet<String>>>>,
     screen_share_owners: Arc<Mutex<HashMap<String, String>>>,
     screen_share_viewers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    video_call_publishers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     event_sender: broadcast::Sender<MediaEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaEvent {
     InboundAudioTrack { room_id: String, member_id: String },
-    InboundVideoTrack { room_id: String, member_id: String },
+    InboundScreenVideoTrack { room_id: String, member_id: String },
+    InboundCameraVideoTrack { room_id: String, member_id: String },
 }
 
 struct MediaSession {
     peer_connection: Arc<RTCPeerConnection>,
     downlink_senders: Vec<Arc<RTCRtpSender>>,
-    video_downlink_sender: Option<Arc<RTCRtpSender>>,
+    screen_video_downlink_sender: Option<Arc<RTCRtpSender>>,
+    camera_video_downlink_senders: Vec<Arc<RTCRtpSender>>,
     can_speak: bool,
     inbound_tracks: HashMap<usize, InboundTrack>,
     outbound_tracks: HashMap<String, OutboundTrack>,
@@ -80,7 +83,8 @@ struct MediaSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaTrackKind {
     Audio,
-    Video,
+    ScreenShareVideo,
+    CameraVideo,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +235,7 @@ impl MediaController {
             member_not_listening: Arc::new(Mutex::new(HashMap::new())),
             screen_share_owners: Arc::new(Mutex::new(HashMap::new())),
             screen_share_viewers: Arc::new(Mutex::new(HashMap::new())),
+            video_call_publishers: Arc::new(Mutex::new(HashMap::new())),
             event_sender: broadcast::channel(MEDIA_EVENT_QUEUE_CAPACITY).0,
         })
     }
@@ -274,12 +279,13 @@ impl MediaController {
 
         if let Some(peer_connection) = existing_peer_connection {
             if wants_video {
-                ensure_video_downlink_slot(
+                ensure_video_downlink_slots(
                     Arc::clone(&self.sessions),
                     &key,
                     &peer_connection,
                     room_id,
                     member_id,
+                    self.downlink_slot_count,
                 )
                 .await?;
             }
@@ -287,10 +293,17 @@ impl MediaController {
             forward_local_ice_candidates(&peer_connection, local_ice_sender);
             let answer = create_answer(&peer_connection, offer).await?;
             if wants_video {
-                attach_existing_video_to_subscriber(
+                attach_existing_screen_video_to_subscriber(
                     Arc::clone(&self.sessions),
                     Arc::clone(&self.screen_share_owners),
                     Arc::clone(&self.screen_share_viewers),
+                    room_id,
+                    member_id,
+                )
+                .await?;
+                attach_existing_camera_videos_to_subscriber(
+                    Arc::clone(&self.sessions),
+                    Arc::clone(&self.video_call_publishers),
                     room_id,
                     member_id,
                 )
@@ -316,16 +329,28 @@ impl MediaController {
             self.downlink_slot_count,
         )
         .await?;
-        let video_downlink_sender = if wants_video {
-            Some(add_video_downlink_slot(&peer_connection, room_id, member_id).await?)
+        let screen_video_downlink_sender = if wants_video {
+            Some(add_screen_video_downlink_slot(&peer_connection, room_id, member_id).await?)
         } else {
             None
+        };
+        let camera_video_downlink_senders = if wants_video {
+            add_camera_video_downlink_slots(
+                &peer_connection,
+                room_id,
+                member_id,
+                self.downlink_slot_count,
+            )
+            .await?
+        } else {
+            Vec::new()
         };
 
         let sessions = Arc::clone(&self.sessions);
         let member_not_listening = Arc::clone(&self.member_not_listening);
         let screen_share_owners = Arc::clone(&self.screen_share_owners);
         let screen_share_viewers = Arc::clone(&self.screen_share_viewers);
+        let video_call_publishers = Arc::clone(&self.video_call_publishers);
         let session_key = (room_id.to_string(), member_id.to_string());
         let event_sender = self.event_sender.clone();
         let track_peer_connection = Arc::clone(&peer_connection);
@@ -338,16 +363,24 @@ impl MediaController {
             let member_not_listening = Arc::clone(&member_not_listening);
             let screen_share_owners = Arc::clone(&screen_share_owners);
             let screen_share_viewers = Arc::clone(&screen_share_viewers);
+            let video_call_publishers = Arc::clone(&video_call_publishers);
 
             Box::pin(async move {
                 let kind = match track.kind() {
                     RTPCodecType::Audio => MediaTrackKind::Audio,
                     RTPCodecType::Video => {
-                        let owners = screen_share_owners.lock().await;
-                        if owners.get(&session_key.0) != Some(&session_key.1) {
+                        let Some(kind) = classify_inbound_video_track(
+                            Arc::clone(&sessions),
+                            Arc::clone(&screen_share_owners),
+                            Arc::clone(&video_call_publishers),
+                            &session_key,
+                            &track,
+                        )
+                        .await
+                        else {
                             return;
-                        }
-                        MediaTrackKind::Video
+                        };
+                        kind
                     }
                     _ => return,
                 };
@@ -355,7 +388,8 @@ impl MediaController {
                 let inbound_track =
                     InboundTrack::from_remote_track(&track, &session_key.0, &session_key.1, kind);
                 let fanout_track = Arc::clone(&inbound_track.fanout_track);
-                let outbound_track_id = format!("{}:{}", session_key.1, inbound_track.id);
+                let outbound_track_id =
+                    fanout_track_id(&session_key.1, &inbound_track.id, inbound_track.kind);
                 let sessions_for_reader = Arc::clone(&sessions);
                 let track_id = track.tid();
                 let should_attach = {
@@ -382,6 +416,7 @@ impl MediaController {
                         track_id,
                         kind,
                         Arc::clone(&screen_share_owners),
+                        Arc::clone(&video_call_publishers),
                     ));
 
                     match kind {
@@ -403,8 +438,8 @@ impl MediaController {
                                 });
                             }
                         }
-                        MediaTrackKind::Video => {
-                            if attach_video_to_subscribers(
+                        MediaTrackKind::ScreenShareVideo => {
+                            if attach_screen_video_to_subscribers(
                                 Arc::clone(&sessions),
                                 Arc::clone(&screen_share_viewers),
                                 &session_key.0,
@@ -415,7 +450,24 @@ impl MediaController {
                             .await
                             .is_ok()
                             {
-                                let _ = event_sender.send(MediaEvent::InboundVideoTrack {
+                                let _ = event_sender.send(MediaEvent::InboundScreenVideoTrack {
+                                    room_id: session_key.0,
+                                    member_id: session_key.1,
+                                });
+                            }
+                        }
+                        MediaTrackKind::CameraVideo => {
+                            if attach_camera_video_to_subscribers(
+                                Arc::clone(&sessions),
+                                &session_key.0,
+                                &session_key.1,
+                                outbound_track_id,
+                                fanout_track,
+                            )
+                            .await
+                            .is_ok()
+                            {
+                                let _ = event_sender.send(MediaEvent::InboundCameraVideoTrack {
                                     room_id: session_key.0,
                                     member_id: session_key.1,
                                 });
@@ -440,7 +492,8 @@ impl MediaController {
                 MediaSession {
                     peer_connection: Arc::clone(&peer_connection),
                     downlink_senders,
-                    video_downlink_sender,
+                    screen_video_downlink_sender,
+                    camera_video_downlink_senders,
                     can_speak,
                     inbound_tracks: HashMap::new(),
                     outbound_tracks: HashMap::new(),
@@ -508,10 +561,17 @@ impl MediaController {
         )
         .await?;
         if wants_video {
-            attach_existing_video_to_subscriber(
+            attach_existing_screen_video_to_subscriber(
                 Arc::clone(&self.sessions),
                 Arc::clone(&self.screen_share_owners),
                 Arc::clone(&self.screen_share_viewers),
+                room_id,
+                member_id,
+            )
+            .await?;
+            attach_existing_camera_videos_to_subscriber(
+                Arc::clone(&self.sessions),
+                Arc::clone(&self.video_call_publishers),
                 room_id,
                 member_id,
             )
@@ -575,6 +635,8 @@ impl MediaController {
         }
         self.clear_screen_share_owner_if_matches(room_id, member_id)
             .await?;
+        self.clear_video_call_publisher_if_matches(room_id, member_id)
+            .await?;
         let session = {
             let mut sessions = self.sessions.lock().await;
             sessions.remove(&key)
@@ -602,7 +664,7 @@ impl MediaController {
                     .lock()
                     .await
                     .insert(room_id.to_string(), member_id.to_string());
-                attach_existing_video_to_subscribers_for_publisher(
+                attach_existing_screen_video_to_subscribers_for_publisher(
                     Arc::clone(&self.sessions),
                     Arc::clone(&self.screen_share_viewers),
                     room_id,
@@ -617,12 +679,14 @@ impl MediaController {
                         Arc::clone(&self.sessions),
                         room_id,
                         &previous_member_id,
+                        MediaTrackKind::ScreenShareVideo,
                     )
                     .await?;
                     remove_inbound_video_tracks(
                         Arc::clone(&self.sessions),
                         room_id,
                         &previous_member_id,
+                        MediaTrackKind::ScreenShareVideo,
                     )
                     .await;
                 }
@@ -648,6 +712,79 @@ impl MediaController {
         Ok(())
     }
 
+    /// 同步房间层的摄像头发布状态，并在停止发布时释放对应下行槽位。
+    pub async fn set_video_call_publisher(
+        &self,
+        room_id: &str,
+        member_id: &str,
+        publishing: bool,
+    ) -> Result<usize> {
+        if publishing {
+            self.video_call_publishers
+                .lock()
+                .await
+                .entry(room_id.to_string())
+                .or_default()
+                .insert(member_id.to_string());
+            attach_existing_camera_video_to_subscribers_for_publisher(
+                Arc::clone(&self.sessions),
+                room_id,
+                member_id,
+            )
+            .await?;
+        } else {
+            self.clear_video_call_publisher_if_matches(room_id, member_id)
+                .await?;
+        }
+
+        Ok(self.video_call_publisher_count(room_id).await)
+    }
+
+    async fn clear_video_call_publisher_if_matches(
+        &self,
+        room_id: &str,
+        member_id: &str,
+    ) -> Result<()> {
+        let removed = {
+            let mut publishers = self.video_call_publishers.lock().await;
+            let Some(room_publishers) = publishers.get_mut(room_id) else {
+                return Ok(());
+            };
+            let removed = room_publishers.remove(member_id);
+            if room_publishers.is_empty() {
+                publishers.remove(room_id);
+            }
+            removed
+        };
+        if removed {
+            detach_publisher_video_from_subscribers(
+                Arc::clone(&self.sessions),
+                room_id,
+                member_id,
+                MediaTrackKind::CameraVideo,
+            )
+            .await?;
+            remove_inbound_video_tracks(
+                Arc::clone(&self.sessions),
+                room_id,
+                member_id,
+                MediaTrackKind::CameraVideo,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    /// 返回当前房间摄像头发布人数，供信令层广播给前端做码率降级。
+    pub async fn video_call_publisher_count(&self, room_id: &str) -> usize {
+        self.video_call_publishers
+            .lock()
+            .await
+            .get(room_id)
+            .map(HashSet::len)
+            .unwrap_or(0)
+    }
+
     pub async fn set_screen_viewing(
         &self,
         room_id: &str,
@@ -668,7 +805,7 @@ impl MediaController {
         }
 
         if viewing {
-            attach_existing_video_to_subscriber(
+            attach_existing_screen_video_to_subscriber(
                 Arc::clone(&self.sessions),
                 Arc::clone(&self.screen_share_owners),
                 Arc::clone(&self.screen_share_viewers),
@@ -823,6 +960,46 @@ impl MediaController {
         );
         Ok(())
     }
+
+    #[cfg(test)]
+    async fn store_test_video_inbound_track(
+        &self,
+        room_id: &str,
+        publisher_member_id: &str,
+        kind: MediaTrackKind,
+    ) -> Result<String> {
+        let source_id = match kind {
+            MediaTrackKind::ScreenShareVideo => "test-screen",
+            MediaTrackKind::CameraVideo => "test-camera",
+            MediaTrackKind::Audio => "test-audio",
+        };
+        let track_id = fanout_track_id(publisher_member_id, source_id, kind);
+        let fanout_track = Arc::new(TrackLocalStaticRTP::new(
+            webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability {
+                mime_type: "video/vp8".to_string(),
+                clock_rate: 90000,
+                ..Default::default()
+            },
+            track_id.clone(),
+            format!("room-{room_id}"),
+        ));
+        let key = (room_id.to_string(), publisher_member_id.to_string());
+        let mut sessions = self.sessions.lock().await;
+        let publisher = sessions.get_mut(&key).ok_or(Error::MemberNotFound)?;
+        publisher.inbound_tracks.insert(
+            kind as usize,
+            InboundTrack {
+                id: source_id.to_string(),
+                stream_id: format!("room-{room_id}"),
+                ssrc: 0,
+                mime_type: "video/vp8".to_string(),
+                kind,
+                packet_count: 0,
+                fanout_track,
+            },
+        );
+        Ok(track_id)
+    }
 }
 
 async fn create_answer(
@@ -888,40 +1065,79 @@ async fn add_downlink_slots(
     Ok(downlink_senders)
 }
 
-async fn add_video_downlink_slot(
+async fn add_screen_video_downlink_slot(
     peer_connection: &RTCPeerConnection,
     room_id: &str,
     member_id: &str,
 ) -> Result<Arc<RTCRtpSender>> {
     peer_connection
         .add_track(
-            new_video_downlink_slot_track(room_id, member_id) as Arc<dyn TrackLocal + Send + Sync>
+            new_screen_video_downlink_slot_track(room_id, member_id)
+                as Arc<dyn TrackLocal + Send + Sync>,
         )
         .await
         .map_err(|err| Error::Internal(format!("创建下行屏幕共享槽位失败: {err}")))
 }
 
-async fn ensure_video_downlink_slot(
+async fn add_camera_video_downlink_slots(
+    peer_connection: &RTCPeerConnection,
+    room_id: &str,
+    member_id: &str,
+    slot_count: usize,
+) -> Result<Vec<Arc<RTCRtpSender>>> {
+    let mut senders = Vec::with_capacity(slot_count);
+    for slot_index in 0..slot_count {
+        let sender = peer_connection
+            .add_track(new_camera_video_downlink_slot_track(room_id, member_id, slot_index)
+                as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .map_err(|err| Error::Internal(format!("创建下行摄像头槽位失败: {err}")))?;
+        senders.push(sender);
+    }
+    Ok(senders)
+}
+
+async fn ensure_video_downlink_slots(
     sessions: Arc<Mutex<SessionMap>>,
     key: &SessionKey,
     peer_connection: &RTCPeerConnection,
     room_id: &str,
     member_id: &str,
+    camera_slot_count: usize,
 ) -> Result<()> {
-    let needs_sender = {
+    let (needs_screen_sender, needed_camera_slots) = {
         let sessions = sessions.lock().await;
-        sessions
-            .get(key)
-            .is_some_and(|session| session.video_downlink_sender.is_none())
+        let Some(session) = sessions.get(key) else {
+            return Ok(());
+        };
+        (
+            session.screen_video_downlink_sender.is_none(),
+            camera_slot_count.saturating_sub(session.camera_video_downlink_senders.len()),
+        )
     };
-    if !needs_sender {
+    let screen_sender = if needs_screen_sender {
+        Some(add_screen_video_downlink_slot(peer_connection, room_id, member_id).await?)
+    } else {
+        None
+    };
+    let camera_senders = if needed_camera_slots > 0 {
+        add_camera_video_downlink_slots(peer_connection, room_id, member_id, needed_camera_slots)
+            .await?
+    } else {
+        Vec::new()
+    };
+    if screen_sender.is_none() && camera_senders.is_empty() {
         return Ok(());
     }
 
-    let sender = add_video_downlink_slot(peer_connection, room_id, member_id).await?;
     let mut sessions = sessions.lock().await;
     if let Some(session) = sessions.get_mut(key) {
-        session.video_downlink_sender = Some(sender);
+        if let Some(sender) = screen_sender {
+            session.screen_video_downlink_sender = Some(sender);
+        }
+        session
+            .camera_video_downlink_senders
+            .extend(camera_senders);
     }
     Ok(())
 }
@@ -943,7 +1159,7 @@ fn new_downlink_slot_track(
     ))
 }
 
-fn new_video_downlink_slot_track(room_id: &str, member_id: &str) -> Arc<TrackLocalStaticRTP> {
+fn new_screen_video_downlink_slot_track(room_id: &str, member_id: &str) -> Arc<TrackLocalStaticRTP> {
     Arc::new(TrackLocalStaticRTP::new(
         RTCRtpCodecCapability {
             mime_type: MIME_TYPE_VP8.to_string(),
@@ -951,6 +1167,22 @@ fn new_video_downlink_slot_track(room_id: &str, member_id: &str) -> Arc<TrackLoc
             ..Default::default()
         },
         format!("{member_id}:screen-downlink"),
+        format!("room-{room_id}"),
+    ))
+}
+
+fn new_camera_video_downlink_slot_track(
+    room_id: &str,
+    member_id: &str,
+    slot_index: usize,
+) -> Arc<TrackLocalStaticRTP> {
+    Arc::new(TrackLocalStaticRTP::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_VP8.to_string(),
+            clock_rate: 90000,
+            ..Default::default()
+        },
+        format!("{member_id}:camera-downlink-{slot_index}"),
         format!("room-{room_id}"),
     ))
 }
@@ -971,12 +1203,15 @@ impl MediaSession {
         MediaSessionSnapshot {
             inbound_track_count: tracks.len(),
             audio_track_count: tracks.iter().filter(|track| track.kind == "audio").count(),
-            video_track_count: tracks.iter().filter(|track| track.kind == "video").count(),
+            video_track_count: tracks
+                .iter()
+                .filter(|track| track.kind.ends_with("video"))
+                .count(),
             inbound_packet_count: tracks.iter().map(|track| track.packet_count).sum(),
             outbound_track_count: outbound_tracks.len(),
             outbound_video_track_count: outbound_tracks
                 .iter()
-                .filter(|track| track.kind == "video")
+                .filter(|track| track.kind.ends_with("video"))
                 .count(),
             tracks,
             outbound_tracks,
@@ -1010,7 +1245,7 @@ impl InboundTrack {
             packet_count: 0,
             fanout_track: Arc::new(TrackLocalStaticRTP::new(
                 track.codec().capability,
-                format!("{member_id}:{}", track.id()),
+                fanout_track_id(member_id, &track.id(), kind),
                 format!("room-{room_id}"),
             )),
         }
@@ -1032,7 +1267,74 @@ impl MediaTrackKind {
     fn as_str(self) -> &'static str {
         match self {
             MediaTrackKind::Audio => "audio",
-            MediaTrackKind::Video => "video",
+            MediaTrackKind::ScreenShareVideo => "screen_video",
+            MediaTrackKind::CameraVideo => "camera_video",
+        }
+    }
+
+}
+
+fn fanout_track_id(member_id: &str, track_id: &str, kind: MediaTrackKind) -> String {
+    match kind {
+        MediaTrackKind::Audio => format!("{member_id}:audio:{track_id}"),
+        MediaTrackKind::ScreenShareVideo => format!("{member_id}:screen:{track_id}"),
+        MediaTrackKind::CameraVideo => format!("{member_id}:camera:{track_id}"),
+    }
+}
+
+async fn classify_inbound_video_track(
+    sessions: Arc<Mutex<SessionMap>>,
+    screen_share_owners: Arc<Mutex<HashMap<String, String>>>,
+    video_call_publishers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    session_key: &SessionKey,
+    track: &TrackRemote,
+) -> Option<MediaTrackKind> {
+    let is_screen_owner = screen_share_owners
+        .lock()
+        .await
+        .get(&session_key.0)
+        .is_some_and(|owner| owner == &session_key.1);
+    let is_camera_publisher = video_call_publishers
+        .lock()
+        .await
+        .get(&session_key.0)
+        .is_some_and(|publishers| publishers.contains(&session_key.1));
+    let marker = format!(
+        "{} {} {}",
+        track.id().to_ascii_lowercase(),
+        track.stream_id().to_ascii_lowercase(),
+        track.rid().to_ascii_lowercase()
+    );
+
+    if marker.contains("screen") || marker.contains("display") {
+        return is_screen_owner.then_some(MediaTrackKind::ScreenShareVideo);
+    }
+    if marker.contains("camera") || marker.contains("cam") {
+        return is_camera_publisher.then_some(MediaTrackKind::CameraVideo);
+    }
+
+    match (is_screen_owner, is_camera_publisher) {
+        (true, false) => Some(MediaTrackKind::ScreenShareVideo),
+        (false, true) => Some(MediaTrackKind::CameraVideo),
+        (false, false) => None,
+        (true, true) => {
+            let sessions = sessions.lock().await;
+            let session = sessions.get(session_key)?;
+            let has_screen = session
+                .inbound_tracks
+                .values()
+                .any(|track| track.kind == MediaTrackKind::ScreenShareVideo);
+            let has_camera = session
+                .inbound_tracks
+                .values()
+                .any(|track| track.kind == MediaTrackKind::CameraVideo);
+            if !has_screen {
+                Some(MediaTrackKind::ScreenShareVideo)
+            } else if !has_camera {
+                Some(MediaTrackKind::CameraVideo)
+            } else {
+                None
+            }
         }
     }
 }
@@ -1046,7 +1348,11 @@ fn sender_for_outbound_track(
             .downlink_senders
             .get(outbound_track.downlink_slot_index)
             .cloned(),
-        MediaTrackKind::Video => session.video_downlink_sender.clone(),
+        MediaTrackKind::ScreenShareVideo => session.screen_video_downlink_sender.clone(),
+        MediaTrackKind::CameraVideo => session
+            .camera_video_downlink_senders
+            .get(outbound_track.downlink_slot_index)
+            .cloned(),
     }
 }
 
@@ -1059,6 +1365,7 @@ async fn read_inbound_rtp(
     track_id: usize,
     kind: MediaTrackKind,
     screen_share_owners: Arc<Mutex<HashMap<String, String>>>,
+    video_call_publishers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
 ) {
     loop {
         let packet = match track.read_rtp().await {
@@ -1083,18 +1390,23 @@ async fn read_inbound_rtp(
             match kind {
                 // 服务端在 RTP 边界执行房间发言权限，避免被禁言客户端继续推音频。
                 MediaTrackKind::Audio => session.can_speak,
-                MediaTrackKind::Video => true,
+                MediaTrackKind::ScreenShareVideo | MediaTrackKind::CameraVideo => true,
             }
         };
 
         let should_forward = should_forward
             && match kind {
                 MediaTrackKind::Audio => true,
-                MediaTrackKind::Video => screen_share_owners
+                MediaTrackKind::ScreenShareVideo => screen_share_owners
                     .lock()
                     .await
                     .get(&session_key.0)
                     .is_some_and(|owner| owner == &session_key.1),
+                MediaTrackKind::CameraVideo => video_call_publishers
+                    .lock()
+                    .await
+                    .get(&session_key.0)
+                    .is_some_and(|publishers| publishers.contains(&session_key.1)),
             };
 
         if should_forward {
@@ -1265,7 +1577,7 @@ async fn detach_publisher_audio_from_subscriber(
     Ok(())
 }
 
-async fn attach_video_to_subscribers(
+async fn attach_screen_video_to_subscribers(
     sessions: Arc<Mutex<SessionMap>>,
     screen_share_viewers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     room_id: &str,
@@ -1281,7 +1593,7 @@ async fn attach_video_to_subscribers(
             .filter_map(|((session_room_id, member_id), session)| {
                 if session_room_id == room_id
                     && member_id != publisher_member_id
-                    && session.video_downlink_sender.is_some()
+                    && session.screen_video_downlink_sender.is_some()
                     && viewers
                         .get(room_id)
                         .is_some_and(|room_viewers| room_viewers.contains(member_id))
@@ -1295,7 +1607,7 @@ async fn attach_video_to_subscribers(
     };
 
     for subscriber_key in subscriber_keys {
-        attach_video_to_subscriber(
+        attach_screen_video_to_subscriber(
             Arc::clone(&sessions),
             subscriber_key,
             publisher_member_id,
@@ -1308,7 +1620,7 @@ async fn attach_video_to_subscribers(
     Ok(())
 }
 
-async fn attach_video_to_subscriber(
+async fn attach_screen_video_to_subscriber(
     sessions: Arc<Mutex<SessionMap>>,
     subscriber_key: SessionKey,
     publisher_member_id: &str,
@@ -1320,7 +1632,7 @@ async fn attach_video_to_subscriber(
         let Some(subscriber) = sessions.get_mut(&subscriber_key) else {
             return Ok(());
         };
-        let Some(downlink_sender) = subscriber.video_downlink_sender.clone() else {
+        let Some(downlink_sender) = subscriber.screen_video_downlink_sender.clone() else {
             return Ok(());
         };
 
@@ -1329,7 +1641,7 @@ async fn attach_video_to_subscriber(
             OutboundTrack {
                 publisher_member_id: publisher_member_id.to_string(),
                 track_id: track_id.to_string(),
-                kind: MediaTrackKind::Video,
+                kind: MediaTrackKind::ScreenShareVideo,
                 downlink_slot_index: 0,
                 fanout_track: Arc::clone(&fanout_track),
             },
@@ -1345,11 +1657,140 @@ async fn attach_video_to_subscriber(
         Arc::clone(&sessions),
         subscriber_key.0.clone(),
         publisher_member_id.to_string(),
+        MediaTrackKind::ScreenShareVideo,
     );
     forward_subscriber_video_rtcp_feedback(
         Arc::clone(&sessions),
         subscriber_key.0,
         publisher_member_id.to_string(),
+        MediaTrackKind::ScreenShareVideo,
+        downlink_sender,
+    );
+    Ok(())
+}
+
+async fn attach_camera_video_to_subscribers(
+    sessions: Arc<Mutex<SessionMap>>,
+    room_id: &str,
+    publisher_member_id: &str,
+    track_id: String,
+    fanout_track: Arc<TrackLocalStaticRTP>,
+) -> Result<()> {
+    let subscriber_keys = {
+        let sessions = sessions.lock().await;
+        sessions
+            .iter()
+            .filter_map(|((session_room_id, member_id), session)| {
+                if session_room_id == room_id
+                    && member_id != publisher_member_id
+                    && !session.camera_video_downlink_senders.is_empty()
+                {
+                    Some((session_room_id.clone(), member_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for subscriber_key in subscriber_keys {
+        attach_camera_video_to_subscriber(
+            Arc::clone(&sessions),
+            subscriber_key,
+            publisher_member_id,
+            &track_id,
+            Arc::clone(&fanout_track),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn attach_camera_video_to_subscriber(
+    sessions: Arc<Mutex<SessionMap>>,
+    subscriber_key: SessionKey,
+    publisher_member_id: &str,
+    track_id: &str,
+    fanout_track: Arc<TrackLocalStaticRTP>,
+) -> Result<()> {
+    let downlink_sender = {
+        let mut sessions = sessions.lock().await;
+        let Some(subscriber) = sessions.get_mut(&subscriber_key) else {
+            return Ok(());
+        };
+        if subscriber.camera_video_downlink_senders.is_empty() {
+            return Ok(());
+        }
+
+        let existing = subscriber.outbound_tracks.iter().find_map(|(track_id, outbound_track)| {
+            if outbound_track.kind == MediaTrackKind::CameraVideo
+                && outbound_track.publisher_member_id == publisher_member_id
+            {
+                Some((track_id.clone(), outbound_track.downlink_slot_index))
+            } else {
+                None
+            }
+        });
+        let downlink_slot_index = match existing {
+            Some((existing_track_id, slot_index)) => {
+                if existing_track_id != track_id {
+                    subscriber.outbound_tracks.remove(&existing_track_id);
+                }
+                slot_index
+            }
+            None => {
+                let occupied_slots = subscriber
+                    .outbound_tracks
+                    .values()
+                    .filter(|track| track.kind == MediaTrackKind::CameraVideo)
+                    .map(|track| track.downlink_slot_index)
+                    .collect::<HashSet<_>>();
+                (0..subscriber.camera_video_downlink_senders.len())
+                    .find(|slot_index| !occupied_slots.contains(slot_index))
+                    .ok_or_else(|| {
+                        Error::Internal(format!(
+                            "成员 {} 订阅发布者 {} 时下行摄像头槽位不足",
+                            subscriber_key.1, publisher_member_id
+                        ))
+                    })?
+            }
+        };
+
+        let downlink_sender = subscriber
+            .camera_video_downlink_senders
+            .get(downlink_slot_index)
+            .cloned()
+            .ok_or_else(|| Error::Internal("下行摄像头槽位不存在".to_string()))?;
+
+        subscriber.outbound_tracks.insert(
+            track_id.to_string(),
+            OutboundTrack {
+                publisher_member_id: publisher_member_id.to_string(),
+                track_id: track_id.to_string(),
+                kind: MediaTrackKind::CameraVideo,
+                downlink_slot_index,
+                fanout_track: Arc::clone(&fanout_track),
+            },
+        );
+        downlink_sender
+    };
+
+    downlink_sender
+        .replace_track(Some(fanout_track as Arc<dyn TrackLocal + Send + Sync>))
+        .await
+        .map_err(|err| Error::Internal(format!("替换下行摄像头槽位失败: {err}")))?;
+    schedule_publisher_video_keyframes(
+        Arc::clone(&sessions),
+        subscriber_key.0.clone(),
+        publisher_member_id.to_string(),
+        MediaTrackKind::CameraVideo,
+    );
+    forward_subscriber_video_rtcp_feedback(
+        Arc::clone(&sessions),
+        subscriber_key.0,
+        publisher_member_id.to_string(),
+        MediaTrackKind::CameraVideo,
         downlink_sender,
     );
     Ok(())
@@ -1359,6 +1800,7 @@ fn forward_subscriber_video_rtcp_feedback(
     sessions: Arc<Mutex<SessionMap>>,
     room_id: String,
     publisher_member_id: String,
+    kind: MediaTrackKind,
     downlink_sender: Arc<RTCRtpSender>,
 ) {
     tokio::spawn(async move {
@@ -1376,7 +1818,7 @@ fn forward_subscriber_video_rtcp_feedback(
                 let Some(media_ssrc) = publisher
                     .inbound_tracks
                     .values()
-                    .find(|track| track.kind == MediaTrackKind::Video)
+                    .find(|track| track.kind == kind)
                     .map(|track| track.ssrc)
                 else {
                     break;
@@ -1428,6 +1870,7 @@ fn schedule_publisher_video_keyframes(
     sessions: Arc<Mutex<SessionMap>>,
     room_id: String,
     publisher_member_id: String,
+    kind: MediaTrackKind,
 ) {
     tokio::spawn(async move {
         for delay_ms in VIDEO_KEYFRAME_REQUEST_DELAYS_MS {
@@ -1438,6 +1881,7 @@ fn schedule_publisher_video_keyframes(
                 Arc::clone(&sessions),
                 &room_id,
                 &publisher_member_id,
+                kind,
             )
             .await;
         }
@@ -1448,6 +1892,7 @@ async fn request_publisher_video_keyframe(
     sessions: Arc<Mutex<SessionMap>>,
     room_id: &str,
     publisher_member_id: &str,
+    kind: MediaTrackKind,
 ) -> Result<()> {
     let request = {
         let sessions = sessions.lock().await;
@@ -1458,7 +1903,7 @@ async fn request_publisher_video_keyframe(
         let Some(media_ssrc) = publisher
             .inbound_tracks
             .values()
-            .find(|track| track.kind == MediaTrackKind::Video)
+            .find(|track| track.kind == kind)
             .map(|track| track.ssrc)
         else {
             return Ok(());
@@ -1474,7 +1919,7 @@ async fn request_publisher_video_keyframe(
             media_ssrc: request.1,
         })])
         .await
-        .map_err(|err| Error::Internal(format!("请求屏幕共享关键帧失败: {err}")))?;
+        .map_err(|err| Error::Internal(format!("请求视频关键帧失败: {err}")))?;
     Ok(())
 }
 
@@ -1482,6 +1927,7 @@ async fn detach_publisher_video_from_subscribers(
     sessions: Arc<Mutex<SessionMap>>,
     room_id: &str,
     publisher_member_id: &str,
+    kind: MediaTrackKind,
 ) -> Result<()> {
     let downlink_senders = {
         let mut sessions = sessions.lock().await;
@@ -1496,7 +1942,7 @@ async fn detach_publisher_video_from_subscribers(
                     .outbound_tracks
                     .iter()
                     .filter_map(|(track_id, outbound_track)| {
-                        if outbound_track.kind == MediaTrackKind::Video
+                        if outbound_track.kind == kind
                             && outbound_track.publisher_member_id == publisher_member_id
                         {
                             Some(track_id.clone())
@@ -1505,25 +1951,67 @@ async fn detach_publisher_video_from_subscribers(
                         }
                     })
                     .collect::<Vec<_>>();
+                if track_ids.is_empty() {
+                    return None;
+                }
+                let slot_index = track_ids
+                    .iter()
+                    .find_map(|track_id| {
+                        session
+                            .outbound_tracks
+                            .get(track_id)
+                            .map(|track| track.downlink_slot_index)
+                    })
+                    .unwrap_or(0);
 
                 for track_id in track_ids {
                     session.outbound_tracks.remove(&track_id);
                 }
 
-                session
-                    .video_downlink_sender
-                    .clone()
-                    .map(|sender| (session_room_id.clone(), listener_member_id.clone(), sender))
+                match kind {
+                    MediaTrackKind::ScreenShareVideo => session
+                        .screen_video_downlink_sender
+                        .clone()
+                        .map(|sender| {
+                            (
+                                session_room_id.clone(),
+                                listener_member_id.clone(),
+                                0,
+                                sender,
+                            )
+                        }),
+                    MediaTrackKind::CameraVideo => {
+                        session.camera_video_downlink_senders.get(slot_index).cloned().map(
+                            |sender| {
+                                (
+                                    session_room_id.clone(),
+                                    listener_member_id.clone(),
+                                    slot_index,
+                                    sender,
+                                )
+                            },
+                        )
+                    }
+                    MediaTrackKind::Audio => None,
+                }
             })
             .collect::<Vec<_>>()
     };
 
-    for (session_room_id, listener_member_id, downlink_sender) in downlink_senders {
-        let empty_slot = new_video_downlink_slot_track(&session_room_id, &listener_member_id);
+    for (session_room_id, listener_member_id, slot_index, downlink_sender) in downlink_senders {
+        let empty_slot = match kind {
+            MediaTrackKind::ScreenShareVideo => {
+                new_screen_video_downlink_slot_track(&session_room_id, &listener_member_id)
+            }
+            MediaTrackKind::CameraVideo => {
+                new_camera_video_downlink_slot_track(&session_room_id, &listener_member_id, slot_index)
+            }
+            MediaTrackKind::Audio => continue,
+        };
         downlink_sender
             .replace_track(Some(empty_slot as Arc<dyn TrackLocal + Send + Sync>))
             .await
-            .map_err(|err| Error::Internal(format!("移除下行屏幕共享槽位失败: {err}")))?;
+            .map_err(|err| Error::Internal(format!("移除下行视频槽位失败: {err}")))?;
     }
 
     Ok(())
@@ -1556,7 +2044,7 @@ async fn attach_existing_audio_to_subscriber(
                     .map(|track| {
                         (
                             publisher_member_id.clone(),
-                            format!("{}:{}", publisher_member_id, track.id),
+                            fanout_track_id(publisher_member_id, &track.id, track.kind),
                             Arc::clone(&track.fanout_track),
                         )
                     })
@@ -1625,7 +2113,7 @@ async fn attach_existing_publisher_audio_to_subscriber(
             .filter(|track| track.kind == MediaTrackKind::Audio)
             .map(|track| {
                 (
-                    format!("{}:{}", publisher_member_id, track.id),
+                    fanout_track_id(publisher_member_id, &track.id, track.kind),
                     Arc::clone(&track.fanout_track),
                 )
             })
@@ -1647,7 +2135,7 @@ async fn attach_existing_publisher_audio_to_subscriber(
     Ok(())
 }
 
-async fn attach_existing_video_to_subscriber(
+async fn attach_existing_screen_video_to_subscriber(
     sessions: Arc<Mutex<SessionMap>>,
     screen_share_owners: Arc<Mutex<HashMap<String, String>>>,
     screen_share_viewers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
@@ -1680,7 +2168,7 @@ async fn attach_existing_video_to_subscriber(
         let Some(subscriber) = sessions.get(&subscriber_key) else {
             return Ok(());
         };
-        if subscriber.video_downlink_sender.is_none() {
+        if subscriber.screen_video_downlink_sender.is_none() {
             return Ok(());
         }
 
@@ -1692,10 +2180,10 @@ async fn attach_existing_video_to_subscriber(
         publisher
             .inbound_tracks
             .values()
-            .filter(|track| track.kind == MediaTrackKind::Video)
+            .filter(|track| track.kind == MediaTrackKind::ScreenShareVideo)
             .map(|track| {
                 (
-                    format!("{}:{}", publisher_member_id, track.id),
+                    fanout_track_id(&publisher_member_id, &track.id, track.kind),
                     Arc::clone(&track.fanout_track),
                 )
             })
@@ -1703,7 +2191,7 @@ async fn attach_existing_video_to_subscriber(
     };
 
     for (track_id, fanout_track) in existing_video {
-        attach_video_to_subscriber(
+        attach_screen_video_to_subscriber(
             Arc::clone(&sessions),
             subscriber_key.clone(),
             &publisher_member_id,
@@ -1717,7 +2205,7 @@ async fn attach_existing_video_to_subscriber(
     Ok(())
 }
 
-async fn attach_existing_video_to_subscribers_for_publisher(
+async fn attach_existing_screen_video_to_subscribers_for_publisher(
     sessions: Arc<Mutex<SessionMap>>,
     screen_share_viewers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     room_id: &str,
@@ -1733,10 +2221,10 @@ async fn attach_existing_video_to_subscribers_for_publisher(
         publisher
             .inbound_tracks
             .values()
-            .filter(|track| track.kind == MediaTrackKind::Video)
+            .filter(|track| track.kind == MediaTrackKind::ScreenShareVideo)
             .map(|track| {
                 (
-                    format!("{}:{}", publisher_member_id, track.id),
+                    fanout_track_id(publisher_member_id, &track.id, track.kind),
                     Arc::clone(&track.fanout_track),
                 )
             })
@@ -1744,9 +2232,113 @@ async fn attach_existing_video_to_subscribers_for_publisher(
     };
 
     for (track_id, fanout_track) in existing_video {
-        attach_video_to_subscribers(
+        attach_screen_video_to_subscribers(
             Arc::clone(&sessions),
             Arc::clone(&screen_share_viewers),
+            room_id,
+            publisher_member_id,
+            track_id,
+            fanout_track,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn attach_existing_camera_videos_to_subscriber(
+    sessions: Arc<Mutex<SessionMap>>,
+    video_call_publishers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    room_id: &str,
+    member_id: &str,
+) -> Result<()> {
+    let room_publishers = {
+        let publishers = video_call_publishers.lock().await;
+        publishers.get(room_id).cloned().unwrap_or_default()
+    };
+    if room_publishers.is_empty() {
+        return Ok(());
+    }
+
+    let subscriber_key = (room_id.to_string(), member_id.to_string());
+    let existing_camera = {
+        let sessions = sessions.lock().await;
+        let Some(subscriber) = sessions.get(&subscriber_key) else {
+            return Ok(());
+        };
+        if subscriber.camera_video_downlink_senders.is_empty() {
+            return Ok(());
+        }
+
+        sessions
+            .iter()
+            .flat_map(|((session_room_id, publisher_member_id), session)| {
+                if session_room_id != room_id
+                    || publisher_member_id == member_id
+                    || !room_publishers.contains(publisher_member_id)
+                {
+                    return Vec::new();
+                }
+
+                session
+                    .inbound_tracks
+                    .values()
+                    .filter(|track| track.kind == MediaTrackKind::CameraVideo)
+                    .map(|track| {
+                        (
+                            publisher_member_id.clone(),
+                            fanout_track_id(publisher_member_id, &track.id, track.kind),
+                            Arc::clone(&track.fanout_track),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (publisher_member_id, track_id, fanout_track) in existing_camera {
+        attach_camera_video_to_subscriber(
+            Arc::clone(&sessions),
+            subscriber_key.clone(),
+            &publisher_member_id,
+            &track_id,
+            fanout_track,
+        )
+        .await
+        .map_err(|err| Error::Internal(format!("恢复下行摄像头失败: {err}")))?;
+    }
+
+    Ok(())
+}
+
+async fn attach_existing_camera_video_to_subscribers_for_publisher(
+    sessions: Arc<Mutex<SessionMap>>,
+    room_id: &str,
+    publisher_member_id: &str,
+) -> Result<()> {
+    let existing_camera = {
+        let sessions = sessions.lock().await;
+        let publisher_key = (room_id.to_string(), publisher_member_id.to_string());
+        let Some(publisher) = sessions.get(&publisher_key) else {
+            return Ok(());
+        };
+
+        publisher
+            .inbound_tracks
+            .values()
+            .filter(|track| track.kind == MediaTrackKind::CameraVideo)
+            .map(|track| {
+                (
+                    fanout_track_id(publisher_member_id, &track.id, track.kind),
+                    Arc::clone(&track.fanout_track),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (track_id, fanout_track) in existing_camera {
+        attach_camera_video_to_subscribers(
+            Arc::clone(&sessions),
             room_id,
             publisher_member_id,
             track_id,
@@ -1774,7 +2366,7 @@ async fn detach_current_video_from_subscriber(
             .outbound_tracks
             .iter()
             .filter_map(|(track_id, outbound_track)| {
-                if outbound_track.kind == MediaTrackKind::Video {
+                if outbound_track.kind == MediaTrackKind::ScreenShareVideo {
                     Some(track_id.clone())
                 } else {
                     None
@@ -1786,14 +2378,14 @@ async fn detach_current_video_from_subscriber(
             subscriber.outbound_tracks.remove(&track_id);
         }
 
-        subscriber.video_downlink_sender.clone()
+        subscriber.screen_video_downlink_sender.clone()
     };
 
     let Some(downlink_sender) = downlink_sender else {
         return Ok(());
     };
 
-    let empty_slot = new_video_downlink_slot_track(room_id, listener_member_id);
+    let empty_slot = new_screen_video_downlink_slot_track(room_id, listener_member_id);
     downlink_sender
         .replace_track(Some(empty_slot as Arc<dyn TrackLocal + Send + Sync>))
         .await
@@ -1804,6 +2396,7 @@ async fn remove_inbound_video_tracks(
     sessions: Arc<Mutex<SessionMap>>,
     room_id: &str,
     publisher_member_id: &str,
+    kind: MediaTrackKind,
 ) {
     let key = (room_id.to_string(), publisher_member_id.to_string());
     let mut sessions = sessions.lock().await;
@@ -1812,7 +2405,7 @@ async fn remove_inbound_video_tracks(
     };
     session
         .inbound_tracks
-        .retain(|_, track| track.kind != MediaTrackKind::Video);
+        .retain(|_, track| track.kind != kind);
 }
 
 #[cfg(test)]
@@ -2438,7 +3031,7 @@ mod tests {
             .expect("共享者媒体会话存在")
             .tracks
             .into_iter()
-            .find(|track| track.kind == "video")
+            .find(|track| track.kind == "screen_video")
             .expect("共享者视频 track 存在")
             .ssrc;
         assert!(
@@ -2498,7 +3091,7 @@ mod tests {
             .expect("共享者媒体会话存在")
             .tracks
             .into_iter()
-            .find(|track| track.kind == "video")
+            .find(|track| track.kind == "screen_video")
             .expect("共享者视频 track 存在")
             .ssrc;
         publisher_track
@@ -2570,6 +3163,114 @@ mod tests {
 
         listener.close().await.expect("关闭听众 PeerConnection");
         publisher.close().await.expect("关闭发布者 PeerConnection");
+    }
+
+    #[tokio::test]
+    async fn 两个摄像头发布者会占用听众的独立下行槽位() {
+        let media = MediaController::new().expect("创建媒体控制器");
+        let room_id = "room-1";
+
+        for member_id in ["publisher-1", "publisher-2", "listener-1"] {
+            media
+                .handle_offer(room_id, member_id, create_audio_video_offer(3).await)
+                .await
+                .expect("建立带视频槽位的媒体会话");
+        }
+        for publisher_member_id in ["publisher-1", "publisher-2"] {
+            media
+                .store_test_video_inbound_track(
+                    room_id,
+                    publisher_member_id,
+                    super::MediaTrackKind::CameraVideo,
+                )
+                .await
+                .expect("登记测试摄像头上行");
+            media
+                .set_video_call_publisher(room_id, publisher_member_id, true)
+                .await
+                .expect("开启摄像头发布状态");
+        }
+
+        let listener = media
+            .session_snapshot(room_id, "listener-1")
+            .await
+            .expect("听众会话存在");
+        assert_eq!(listener.outbound_video_track_count, 2);
+        assert!(
+            listener
+                .outbound_tracks
+                .iter()
+                .any(|track| track.publisher_member_id == "publisher-1"
+                    && track.kind == "camera_video")
+        );
+        assert!(
+            listener
+                .outbound_tracks
+                .iter()
+                .any(|track| track.publisher_member_id == "publisher-2"
+                    && track.kind == "camera_video")
+        );
+    }
+
+    #[tokio::test]
+    async fn 停止屏幕共享不会移除摄像头下行槽位() {
+        let media = MediaController::new().expect("创建媒体控制器");
+        let room_id = "room-1";
+
+        for member_id in ["publisher-1", "listener-1"] {
+            media
+                .handle_offer(room_id, member_id, create_audio_video_offer(2).await)
+                .await
+                .expect("建立带视频槽位的媒体会话");
+        }
+        media
+            .set_screen_viewing(room_id, "listener-1", true)
+            .await
+            .expect("听众开始观看屏幕");
+        media
+            .store_test_video_inbound_track(
+                room_id,
+                "publisher-1",
+                super::MediaTrackKind::ScreenShareVideo,
+            )
+            .await
+            .expect("登记测试屏幕共享上行");
+        media
+            .set_screen_share_owner(room_id, Some("publisher-1"))
+            .await
+            .expect("开启屏幕共享发布状态");
+        media
+            .store_test_video_inbound_track(
+                room_id,
+                "publisher-1",
+                super::MediaTrackKind::CameraVideo,
+            )
+            .await
+            .expect("登记测试摄像头上行");
+        media
+            .set_video_call_publisher(room_id, "publisher-1", true)
+            .await
+            .expect("开启摄像头发布状态");
+
+        assert_eq!(
+            media
+                .session_snapshot(room_id, "listener-1")
+                .await
+                .expect("听众会话存在")
+                .outbound_video_track_count,
+            2
+        );
+
+        media
+            .set_screen_share_owner(room_id, None)
+            .await
+            .expect("停止屏幕共享");
+        let listener = media
+            .session_snapshot(room_id, "listener-1")
+            .await
+            .expect("听众会话存在");
+        assert_eq!(listener.outbound_video_track_count, 1);
+        assert_eq!(listener.outbound_tracks[0].kind, "camera_video");
     }
 
     #[tokio::test]
@@ -2731,6 +3432,46 @@ mod tests {
             .add_transceiver_from_kind(RTPCodecType::Audio, None)
             .await
             .expect("添加 audio transceiver");
+        let offer = peer_connection
+            .create_offer(None)
+            .await
+            .expect("创建测试 offer");
+        peer_connection
+            .set_local_description(offer.clone())
+            .await
+            .expect("设置测试 local description");
+        peer_connection
+            .close()
+            .await
+            .expect("关闭测试 PeerConnection");
+        offer.sdp
+    }
+
+    async fn create_audio_video_offer(video_count: usize) -> String {
+        let mut media_engine = MediaEngine::default();
+        media_engine
+            .register_default_codecs()
+            .expect("注册默认 codecs");
+        let registry = register_default_interceptors(Registry::new(), &mut media_engine)
+            .expect("注册默认 interceptors");
+        let api = APIBuilder::new()
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(registry)
+            .build();
+        let peer_connection = api
+            .new_peer_connection(RTCConfiguration::default())
+            .await
+            .expect("创建测试 PeerConnection");
+        peer_connection
+            .add_transceiver_from_kind(RTPCodecType::Audio, None)
+            .await
+            .expect("添加 audio transceiver");
+        for _ in 0..video_count {
+            peer_connection
+                .add_transceiver_from_kind(RTPCodecType::Video, None)
+                .await
+                .expect("添加 video transceiver");
+        }
         let offer = peer_connection
             .create_offer(None)
             .await
@@ -3055,7 +3796,7 @@ mod tests {
                 {
                     if matches!(
                         event,
-                        super::MediaEvent::InboundVideoTrack { member_id, .. }
+                        super::MediaEvent::InboundScreenVideoTrack { member_id, .. }
                             if member_id == publisher_member_id
                     ) {
                         return;

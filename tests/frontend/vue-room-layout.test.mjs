@@ -24,6 +24,14 @@ const screenSharePanel = readFileSync(
   new URL("../../frontend/src/components/room/ScreenSharePanel.vue", import.meta.url),
   "utf8",
 );
+const videoGridPanel = readFileSync(
+  new URL("../../frontend/src/components/room/VideoGridPanel.vue", import.meta.url),
+  "utf8",
+);
+const voicePanel = readFileSync(
+  new URL("../../frontend/src/components/room/VoicePanel.vue", import.meta.url),
+  "utf8",
+);
 const chatNotifications = readFileSync(
   new URL("../../frontend/src/components/room/ChatNotifications.vue", import.meta.url),
   "utf8",
@@ -31,21 +39,38 @@ const chatNotifications = readFileSync(
 
 test("Vue room view renders members chat and screen panels in the center stage", () => {
   const stageIndex = roomView.indexOf('class="stage-pane"');
+  const videoGridIndex = roomView.indexOf("<VideoGridPanel");
   const memberListIndex = roomView.indexOf("<MembersPanel");
   const chatPanelIndex = roomView.indexOf("<ChatPanel");
   const screenPanelIndex = roomView.indexOf("<ScreenSharePanel");
   const voicePaneIndex = roomView.indexOf("<VoicePanel");
 
   assert.ok(stageIndex > 0, "stage pane exists");
-  assert.ok(memberListIndex > stageIndex, "members are inside center stage");
+  assert.ok(videoGridIndex > stageIndex, "video grid is inside center stage");
+  assert.ok(memberListIndex > videoGridIndex, "members follow the video grid inside center stage");
   assert.ok(chatPanelIndex > memberListIndex, "chat follows members inside center stage");
   assert.ok(screenPanelIndex > chatPanelIndex, "screen share follows chat inside center stage");
   assert.ok(voicePaneIndex > screenPanelIndex, "voice pane stays outside the center stage");
+  assert.match(videoGridPanel, /id="video-grid-panel"/);
   assert.match(membersPanel, /id="member-list"/);
   assert.match(chatPanel, /id="chat-panel"/);
   assert.match(screenSharePanel, /id="screen-panel"/);
   assert.doesNotMatch(roomView, /class="stage-idle"/);
   assert.match(css, /\.stage-content\b/);
+  assert.match(css, /\.video-grid-panel\b/);
+  assert.match(css, /\.video-tile\b/);
+});
+
+test("Vue room view wires camera controls to the media boundary", () => {
+  assert.match(roomView, /:local-camera-stream="room\.localCameraStream"/);
+  assert.match(roomView, /:remote-camera-streams="room\.remoteCameraStreams"/);
+  assert.match(roomView, /:video-call-publishers="room\.currentRoom\?\.video_call_publishers \?\? \{\}"/);
+  assert.match(roomView, /@toggle-camera="room\.toggleCamera"/);
+  assert.match(voicePanel, /id="toggle-camera"/);
+  assert.match(voicePanel, /id="camera-state"/);
+  assert.match(roomSession, /\bhandleVideoCallStarted\b/);
+  assert.match(roomSession, /\bhandleVideoCallStopped\b/);
+  assert.match(roomSession, /\bapplyVideoCallPublisherCount\b/);
 });
 
 test("incoming chat messages show a temporary toast notification", () => {

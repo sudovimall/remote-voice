@@ -705,10 +705,105 @@ button:disabled {
 }
 
 .stage-content > .member-list,
+.stage-content > .room-overview-panel,
 .stage-content > .chat-panel,
 .stage-content > .screen-panel {
   grid-area: 1 / 1;
   min-height: 0;
+}
+
+.room-overview-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  min-height: 0;
+}
+
+.room-overview-panel > .member-list {
+  min-height: 0;
+  overflow: auto;
+}
+
+.video-grid-panel {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
+  gap: 10px;
+  max-height: min(42vh, 420px);
+  overflow: auto;
+}
+
+.video-tile {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--bg-strong) 80%, black);
+}
+
+.video-tile video,
+.video-tile-placeholder,
+.video-tile-meta {
+  grid-area: 1 / 1;
+}
+
+.video-tile video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.video-tile-placeholder {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--accent) 10%, transparent), transparent),
+    color-mix(in srgb, var(--bg-strong) 84%, transparent);
+}
+
+.video-avatar {
+  display: grid;
+  width: 46px;
+  height: 46px;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  font-weight: 900;
+}
+
+.video-tile-meta {
+  align-self: end;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  color: var(--text);
+  background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.68));
+  font-size: 0.78rem;
+}
+
+.video-tile-meta strong,
+.video-tile-meta span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.video-tile-meta span {
+  color: var(--muted);
+}
+
+.video-tile-speaking {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 .screen-panel {
@@ -821,7 +916,7 @@ button:disabled {
 
 .voice-pane {
   display: grid;
-  grid-template-rows: auto auto auto auto auto;
+  grid-template-rows: auto auto auto auto auto auto;
   gap: 14px;
   align-content: start;
 }
@@ -888,6 +983,17 @@ button:disabled {
 
 .quiet-button-wide {
   flex: 1;
+}
+
+.camera-control {
+  display: grid;
+  gap: 8px;
+}
+
+.camera-control span {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 800;
 }
 
 .screen-popout {

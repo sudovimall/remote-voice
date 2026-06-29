@@ -30,6 +30,7 @@ pub fn router(state: AppState) -> Router {
 #[derive(Debug, Serialize)]
 struct ClientConfig {
     screen_share: crate::config::settings::ScreenShareSettings,
+    video_call: crate::config::settings::VideoCallSettings,
 }
 
 async fn client_config(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -39,6 +40,7 @@ async fn client_config(State(state): State<AppState>, headers: HeaderMap) -> Res
 
     Json(ClientConfig {
         screen_share: state.screen_share,
+        video_call: state.video_call,
     })
     .into_response()
 }
@@ -235,6 +237,15 @@ mod tests {
                   max_bitrate_bps: 1500000
                 - max_viewers: 4
                   max_bitrate_bps: 600000
+            video_call:
+              max_width: 800
+              max_height: 450
+              max_frame_rate: 18
+              bitrate_rules:
+                - max_publishers: 1
+                  max_bitrate_bps: 900000
+                - max_publishers: 4
+                  max_bitrate_bps: 450000
             "#,
         )
         .expect("解析配置");
@@ -261,6 +272,13 @@ mod tests {
         assert_eq!(
             config["screen_share"]["bitrate_rules"][1]["max_bitrate_bps"],
             600000
+        );
+        assert_eq!(config["video_call"]["max_width"], 800);
+        assert_eq!(config["video_call"]["max_height"], 450);
+        assert_eq!(config["video_call"]["max_frame_rate"], 18);
+        assert_eq!(
+            config["video_call"]["bitrate_rules"][1]["max_bitrate_bps"],
+            450000
         );
     }
 }

@@ -39,6 +39,20 @@ export function stopScreenShareSignal(requestId) {
   };
 }
 
+export function startVideoCallSignal(requestId) {
+  return {
+    type: "start_video_call",
+    request_id: requestId,
+  };
+}
+
+export function stopVideoCallSignal(requestId) {
+  return {
+    type: "stop_video_call",
+    request_id: requestId,
+  };
+}
+
 export function setScreenViewingSignal(viewing, requestId) {
   const signal = {
     type: "set_screen_viewing",
@@ -86,6 +100,26 @@ export function nextRoomSnapshot(currentRoom, signal) {
     return {
       ...currentRoom,
       screen_share: null,
+    };
+  }
+  if (signal.type === "video_call_started") {
+    return {
+      ...currentRoom,
+      video_call_publishers: {
+        ...(currentRoom?.video_call_publishers ?? {}),
+        [signal.member_id]: {
+          member_id: signal.member_id,
+          nickname: signal.nickname,
+        },
+      },
+    };
+  }
+  if (signal.type === "video_call_stopped") {
+    const nextPublishers = { ...(currentRoom?.video_call_publishers ?? {}) };
+    delete nextPublishers[signal.member_id];
+    return {
+      ...currentRoom,
+      video_call_publishers: nextPublishers,
     };
   }
   if (signal.room) {

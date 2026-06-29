@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { MediaSession } from "../../static/media-session.mjs";
+import { MediaSession } from "../../frontend/src/lib/media-session.js";
 
 function deferred() {
   let resolve;
@@ -74,6 +74,32 @@ function mediaHarness(options = {}) {
     },
     getTracks() {
       return [displayTrack];
+    },
+  };
+  const cameraTrack = {
+    kind: "video",
+    stopped: false,
+    listeners: {},
+    addEventListener(type, listener) {
+      this.listeners[type] = listener;
+    },
+    stop() {
+      this.stopped = true;
+    },
+    emitEnded() {
+      this.listeners.ended?.();
+    },
+  };
+  const cameraStream = {
+    id: "camera-stream",
+    getAudioTracks() {
+      return [];
+    },
+    getVideoTracks() {
+      return [cameraTrack];
+    },
+    getTracks() {
+      return [cameraTrack];
     },
   };
   class FakeAudioContext {
@@ -244,7 +270,7 @@ function mediaHarness(options = {}) {
   const client = {
     async request(signal) {
       sent.push(signal);
-      if (options.requestError) {
+      if (options.requestError && (!options.requestErrorAtOffer || signal.sdp === options.requestErrorAtOffer)) {
         throw options.requestError;
       }
       if (signal.type === "webrtc_offer") {
@@ -260,14 +286,31 @@ function mediaHarness(options = {}) {
   const states = [];
   const errors = [];
   const screenStreams = [];
+  const localCameraStreams = [];
+  const remoteCameraStreams = [];
   const screenStops = [];
+  const cameraStops = [];
   let displayConstraints = null;
+  const userMediaCalls = [];
   const session = new MediaSession(client, {
     screenShare: options.screenShare,
+    videoCall: options.videoCall,
     mediaDevices: {
       async getUserMedia(constraints) {
-        assert.deepEqual(constraints, { audio: true });
-        return stream;
+        userMediaCalls.push(constraints);
+        if (constraints?.audio === true) {
+          assert.deepEqual(constraints, { audio: true });
+          return stream;
+        }
+        assert.deepEqual(constraints, options.expectedCameraConstraints ?? {
+          video: {
+            width: { max: 640 },
+            height: { max: 360 },
+            frameRate: { max: 15 },
+          },
+          audio: false,
+        });
+        return cameraStream;
       },
       async getDisplayMedia(constraints) {
         displayConstraints = constraints;
@@ -308,10 +351,21 @@ function mediaHarness(options = {}) {
     onScreenShareEnded() {
       screenStops.push("ended");
     },
+    onLocalCameraStream(stream) {
+      localCameraStreams.push(stream);
+    },
+    onRemoteCameraStreams(entries) {
+      remoteCameraStreams.push(entries);
+    },
+    onCameraEnded() {
+      cameraStops.push("ended");
+    },
   });
 
   return {
     audioNodes,
+    cameraStream,
+    cameraTrack,
     destinationTrack,
     displayStream,
     displayTrack,
@@ -328,9 +382,13 @@ function mediaHarness(options = {}) {
     session,
     screenStreams,
     screenStops,
+    cameraStops,
+    localCameraStreams,
+    remoteCameraStreams,
     speakingStates,
     states,
     track,
+    userMediaCalls,
   };
 }
 
@@ -372,14 +430,10 @@ test("media session reserves remote audio slots for multi-member rooms", async (
   await harness.session.start();
 
   assert.deepEqual(harness.peerConnections[0].transceivers, [
-    ["audio", { direction: "recvonly" }],
-    ["audio", { direction: "recvonly" }],
-    ["audio", { direction: "recvonly" }],
-    ["audio", { direction: "recvonly" }],
-    ["audio", { direction: "recvonly" }],
-    ["audio", { direction: "recvonly" }],
-    ["video", { direction: "recvonly" }],
+    ...Array.from({ length: 6 }, () => ["audio", { direction: "recvonly" }]),
+    ...Array.from({ length: 8 }, () => ["video", { direction: "recvonly" }]),
   ]);
+  assert.deepEqual(harness.userMediaCalls, [{ audio: true }]);
 });
 
 test("media session forwards local and remote ICE", async () => {
@@ -670,6 +724,106 @@ test("media session uses backend screen share config", async () => {
   });
 });
 
+test("media session starts bandwidth-limited camera from backend config", async () => {
+  const harness = mediaHarness({
+    videoCall: {
+      max_width: 320,
+      max_height: 180,
+      max_frame_rate: 10,
+      bitrate_rules: [
+        { max_publishers: 2, max_bitrate_bps: 400_000 },
+        { max_publishers: 8, max_bitrate_bps: 250_000 },
+      ],
+    },
+    expectedCameraConstraints: {
+      video: {
+        width: { max: 320 },
+        height: { max: 180 },
+        frameRate: { max: 10 },
+      },
+      audio: false,
+    },
+  });
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+
+  await harness.session.startCamera();
+
+  assert.equal(peerConnection.addedTracks.at(-1)[0], harness.cameraTrack);
+  assert.equal(peerConnection.addedTracks.at(-1)[1], harness.cameraStream);
+  assert.equal(peerConnection.offerCount, 2);
+  assert.deepEqual(harness.localCameraStreams, [harness.cameraStream]);
+  assert.deepEqual(harness.userMediaCalls.at(-1), {
+    video: {
+      width: { max: 320 },
+      height: { max: 180 },
+      frameRate: { max: 10 },
+    },
+    audio: false,
+  });
+  assert.deepEqual(peerConnection.senders.at(-1).parameters, {
+    encodings: [{ maxBitrate: 400_000 }],
+  });
+});
+
+test("media session updates camera bitrate from publisher count", async () => {
+  const harness = mediaHarness();
+  await harness.session.start();
+
+  await harness.session.startCamera();
+  const sender = harness.peerConnections[0].senders.at(-1);
+
+  assert.deepEqual(sender.parameters, {
+    encodings: [{ maxBitrate: 800_000 }],
+  });
+
+  await harness.session.setVideoCallPublisherCount(5);
+
+  assert.deepEqual(sender.parameters, {
+    encodings: [{ maxBitrate: 300_000 }],
+  });
+});
+
+test("media session stops camera tracks and renegotiates", async () => {
+  const harness = mediaHarness();
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+
+  await harness.session.startCamera();
+  const sender = peerConnection.senders.at(-1);
+  await harness.session.stopCamera();
+
+  assert.equal(harness.cameraTrack.stopped, true);
+  assert.equal(peerConnection.removedSender, sender);
+  assert.equal(peerConnection.offerCount, 3);
+  assert.deepEqual(harness.localCameraStreams, [harness.cameraStream, null]);
+});
+
+test("camera track ended reports video call stopped", async () => {
+  const harness = mediaHarness();
+  await harness.session.start();
+  await harness.session.startCamera();
+
+  harness.cameraTrack.emitEnded();
+
+  assert.deepEqual(harness.cameraStops, ["ended"]);
+});
+
+test("camera start failure during renegotiation releases local camera resources", async () => {
+  const harness = mediaHarness({
+    requestError: new Error("camera negotiation failed"),
+    requestErrorAtOffer: "offer-2",
+  });
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+
+  await assert.rejects(() => harness.session.startCamera(), /camera negotiation failed/);
+
+  assert.equal(harness.cameraTrack.stopped, true);
+  assert.equal(peerConnection.removedSender, peerConnection.senders.at(-1));
+  assert.deepEqual(harness.localCameraStreams, [harness.cameraStream, null]);
+});
+
 test("media session stops display tracks and renegotiates", async () => {
   const harness = mediaHarness();
   await harness.session.start();
@@ -729,6 +883,37 @@ test("remote video track without stream creates a stream for screen sharing", as
   assert.deepEqual(harness.screenStreams[0].stream.getVideoTracks(), [remoteTrack]);
   assert.equal(harness.screenStreams[0].memberId, "m_member");
   assert.equal(harness.audioNodes.length, 0);
+});
+
+test("remote camera video track is reported separately from screen sharing", async () => {
+  const harness = mediaHarness();
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+  const remoteTrack = {
+    id: "m_member:camera:track",
+    kind: "video",
+    addEventListener() {},
+  };
+
+  peerConnection.emitTrack(undefined, remoteTrack);
+
+  assert.equal(harness.screenStreams.length, 0);
+  assert.equal(harness.audioNodes.length, 0);
+  assert.equal(harness.remoteCameraStreams.length, 1);
+  assert.equal(harness.remoteCameraStreams[0][0].memberId, "m_member");
+  assert.deepEqual(harness.remoteCameraStreams[0][0].stream.getVideoTracks(), [remoteTrack]);
+});
+
+test("remote video track without member id is ignored and reported", async () => {
+  const harness = mediaHarness();
+  await harness.session.start();
+  const peerConnection = harness.peerConnections[0];
+
+  peerConnection.emitTrack(undefined, { id: "remote-video-track", kind: "video" });
+
+  assert.equal(harness.screenStreams.length, 0);
+  assert.equal(harness.remoteCameraStreams.length, 0);
+  assert.match(harness.errors.at(-1).message, /无法识别远端视频发布者/);
 });
 
 test("media session calls timer functions with the global context", async () => {

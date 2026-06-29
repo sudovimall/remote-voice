@@ -82,6 +82,12 @@ pub enum ClientSignal {
     StopScreenShare {
         request_id: Option<String>,
     },
+    StartVideoCall {
+        request_id: Option<String>,
+    },
+    StopVideoCall {
+        request_id: Option<String>,
+    },
     // 浏览器发给后端 PeerConnection 的 offer；不再携带目标成员，也不会被转发给其他成员。
     WebrtcOffer {
         request_id: Option<String>,
@@ -154,6 +160,16 @@ pub enum ServerSignal {
     ScreenShareViewerCountUpdated {
         member_id: String,
         viewer_count: usize,
+    },
+    VideoCallStarted {
+        member_id: String,
+        nickname: String,
+    },
+    VideoCallStopped {
+        member_id: String,
+    },
+    VideoCallPublisherCountUpdated {
+        publisher_count: usize,
     },
     WebrtcAnswer {
         request_id: Option<String>,
@@ -755,6 +771,94 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             }
                         }
                     }
+                    ClientSignal::StartVideoCall { request_id } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                            let _ = send_not_joined(&mut sender, request_id).await;
+                            continue;
+                        };
+
+                        match state.rooms.start_video_call(room_id, member_id) {
+                            Ok(room) => {
+                                let publisher = room.video_call_publishers.get(member_id).cloned();
+                                match state
+                                    .media
+                                    .set_video_call_publisher(room_id, member_id, true)
+                                    .await
+                                {
+                                    Ok(publisher_count) => {
+                                        if let Some(publisher) = publisher {
+                                            let _ = state.signals.broadcast(
+                                                room_id,
+                                                ServerSignal::VideoCallStarted {
+                                                    member_id: publisher.member_id,
+                                                    nickname: publisher.nickname,
+                                                },
+                                                None,
+                                            );
+                                        }
+                                        broadcast_video_call_publisher_count(
+                                            &state,
+                                            room_id,
+                                            publisher_count,
+                                        )
+                                        .await;
+                                    }
+                                    Err(error) => {
+                                        let _ = state.rooms.stop_video_call(room_id, member_id);
+                                        let _ = send_error(&mut sender, request_id, error).await;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ = send_error(&mut sender, request_id, error).await;
+                            }
+                        }
+                    }
+                    ClientSignal::StopVideoCall { request_id } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                            let _ = send_not_joined(&mut sender, request_id).await;
+                            continue;
+                        };
+
+                        let was_publishing = state
+                            .rooms
+                            .get_room(room_id)
+                            .ok()
+                            .is_some_and(|room| room.video_call_publishers.contains_key(member_id));
+                        match state.rooms.stop_video_call(room_id, member_id) {
+                            Ok(_room) => {
+                                match state
+                                    .media
+                                    .set_video_call_publisher(room_id, member_id, false)
+                                    .await
+                                {
+                                    Ok(publisher_count) => {
+                                        if was_publishing {
+                                            let _ = state.signals.broadcast(
+                                                room_id,
+                                                ServerSignal::VideoCallStopped {
+                                                    member_id: member_id.to_string(),
+                                                },
+                                                None,
+                                            );
+                                            broadcast_video_call_publisher_count(
+                                                &state,
+                                                room_id,
+                                                publisher_count,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let _ = send_error(&mut sender, request_id, error).await;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ = send_error(&mut sender, request_id, error).await;
+                            }
+                        }
+                    }
                     ClientSignal::WebrtcOffer { request_id, sdp } => {
                         let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
                             let _ = send_not_joined(&mut sender, request_id).await;
@@ -875,8 +979,31 @@ fn broadcast_disconnect(
     member_id: String,
     current_user: Option<CurrentUser>,
 ) {
+    let was_video_publisher = state
+        .rooms
+        .get_room(&room_id)
+        .ok()
+        .is_some_and(|room| room.video_call_publishers.contains_key(&member_id));
     match state.rooms.mark_member_disconnected(&room_id, &member_id) {
         Ok(room) => {
+            if was_video_publisher {
+                let _ = state.signals.broadcast(
+                    &room_id,
+                    ServerSignal::VideoCallStopped {
+                        member_id: member_id.clone(),
+                    },
+                    None,
+                );
+                let publisher_count = room.video_call_publishers.len();
+                tokio::spawn({
+                    let state = state.clone();
+                    let room_id = room_id.clone();
+                    async move {
+                        broadcast_video_call_publisher_count(&state, &room_id, publisher_count)
+                            .await;
+                    }
+                });
+            }
             let _ = state.signals.broadcast(
                 &room_id,
                 ServerSignal::MemberUpdated {
@@ -900,6 +1027,11 @@ fn broadcast_departure(
     member_id: &str,
     current_user: Option<&CurrentUser>,
 ) {
+    let was_video_publisher = state
+        .rooms
+        .get_room(room_id)
+        .ok()
+        .is_some_and(|room| room.video_call_publishers.contains_key(member_id));
     let Ok(room) = state.rooms.leave_room(room_id, member_id) else {
         return;
     };
@@ -915,6 +1047,21 @@ fn broadcast_departure(
         );
         let _ = state.signals.clear_room(room_id);
     } else {
+        if was_video_publisher {
+            let _ = state.signals.broadcast(
+                room_id,
+                ServerSignal::VideoCallStopped {
+                    member_id: member_id.to_string(),
+                },
+                None,
+            );
+            let publisher_count = room.video_call_publishers.len();
+            let state = state.clone();
+            let room_id = room_id.to_string();
+            tokio::spawn(async move {
+                broadcast_video_call_publisher_count(&state, &room_id, publisher_count).await;
+            });
+        }
         let _ = state.signals.broadcast(
             room_id,
             ServerSignal::MemberLeft {
@@ -936,6 +1083,11 @@ fn schedule_disconnected_cleanup(
     tokio::spawn(async move {
         tokio::time::sleep(state.disconnect_grace_period).await;
 
+        let was_video_publisher = state
+            .rooms
+            .get_room(&room_id)
+            .ok()
+            .is_some_and(|room| room.video_call_publishers.contains_key(&member_id));
         let Ok(Some(room)) = state.rooms.expire_disconnected_member(&room_id, &member_id) else {
             return;
         };
@@ -951,6 +1103,21 @@ fn schedule_disconnected_cleanup(
             );
             let _ = state.signals.clear_room(&room_id);
         } else {
+            if was_video_publisher {
+                let _ = state.signals.broadcast(
+                    &room_id,
+                    ServerSignal::VideoCallStopped {
+                        member_id: member_id.clone(),
+                    },
+                    None,
+                );
+                broadcast_video_call_publisher_count(
+                    &state,
+                    &room_id,
+                    room.video_call_publishers.len(),
+                )
+                .await;
+            }
             let _ = state.signals.broadcast(
                 &room_id,
                 ServerSignal::MemberLeft { room, member_id },
@@ -1052,6 +1219,18 @@ async fn broadcast_screen_viewer_count(state: &AppState, room_id: &str, viewer_c
     );
 }
 
+async fn broadcast_video_call_publisher_count(
+    state: &AppState,
+    room_id: &str,
+    publisher_count: usize,
+) {
+    let _ = state.signals.broadcast(
+        room_id,
+        ServerSignal::VideoCallPublisherCountUpdated { publisher_count },
+        None,
+    );
+}
+
 fn request_id_from_text(text: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(text)
         .ok()
@@ -1080,7 +1259,8 @@ fn renegotiation_signal_for_event(
                 member_id: member_id.clone(),
             })
         }
-        MediaEvent::InboundVideoTrack { room_id, member_id }
+        MediaEvent::InboundScreenVideoTrack { room_id, member_id }
+        | MediaEvent::InboundCameraVideoTrack { room_id, member_id }
             if joined_room_id == Some(room_id.as_str())
                 && joined_member_id.is_some()
                 && joined_member_id != Some(member_id.as_str()) =>

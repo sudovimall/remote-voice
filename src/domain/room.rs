@@ -46,6 +46,13 @@ pub struct ScreenShareState {
     pub nickname: String,
 }
 
+/// 记录成员摄像头发布状态，供房间快照恢复视频宫格占位。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoCallState {
+    pub member_id: String,
+    pub nickname: String,
+}
+
 impl Member {
     pub fn not_listening_member_ids(&self) -> Vec<String> {
         sorted_member_ids(&self.not_listening_member_ids)
@@ -60,6 +67,8 @@ pub struct Room {
     pub created_at_epoch_seconds: u64,
     pub last_active_epoch_seconds: u64,
     pub screen_share: Option<ScreenShareState>,
+    #[serde(default)]
+    pub video_call_publishers: HashMap<String, VideoCallState>,
     #[serde(skip, default)]
     chat_messages: Vec<ChatMessage>,
 }
@@ -137,6 +146,7 @@ impl RoomStore {
             created_at_epoch_seconds: now,
             last_active_epoch_seconds: now,
             screen_share: None,
+            video_call_publishers: HashMap::new(),
             chat_messages: Vec::new(),
         };
 
@@ -216,6 +226,7 @@ impl RoomStore {
             created_at_epoch_seconds: now,
             last_active_epoch_seconds: now,
             screen_share: None,
+            video_call_publishers: HashMap::new(),
             chat_messages: Vec::new(),
         };
 
@@ -479,6 +490,42 @@ impl RoomStore {
         Ok(room.clone())
     }
 
+    /// 开启成员摄像头发布状态；先占用房间状态可以避免本地拿到权限后被服务端拒绝。
+    pub fn start_video_call(&self, room_id: &str, member_id: &str) -> Result<Room> {
+        let mut rooms = self.write_rooms()?;
+        let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
+        let member = room.members.get(member_id).ok_or(Error::MemberNotFound)?;
+
+        if !member.connected {
+            return Err(Error::InvalidMessage("离线成员不能开启摄像头。".to_string()));
+        }
+
+        room.video_call_publishers
+            .entry(member_id.to_string())
+            .or_insert_with(|| VideoCallState {
+                member_id: member.id.clone(),
+                nickname: member.nickname.clone(),
+            });
+        room.last_active_epoch_seconds = now_epoch_seconds();
+
+        Ok(room.clone())
+    }
+
+    /// 关闭成员摄像头发布状态；重复关闭保持幂等，便于权限拒绝和协商失败时释放占位。
+    pub fn stop_video_call(&self, room_id: &str, member_id: &str) -> Result<Room> {
+        let mut rooms = self.write_rooms()?;
+        let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
+
+        if !room.members.contains_key(member_id) {
+            return Err(Error::MemberNotFound);
+        }
+
+        room.video_call_publishers.remove(member_id);
+        room.last_active_epoch_seconds = now_epoch_seconds();
+
+        Ok(room.clone())
+    }
+
     pub fn mark_member_disconnected(&self, room_id: &str, member_id: &str) -> Result<Room> {
         let mut rooms = self.write_rooms()?;
         let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
@@ -489,6 +536,7 @@ impl RoomStore {
 
         member.connected = false;
         clear_screen_share_for_member(room, member_id);
+        clear_video_call_for_member(room, member_id);
         room.last_active_epoch_seconds = now_epoch_seconds();
 
         Ok(room.clone())
@@ -516,6 +564,7 @@ impl RoomStore {
         room.members.remove(member_id);
         remove_listening_references(room, member_id);
         clear_screen_share_for_member(room, member_id);
+        clear_video_call_for_member(room, member_id);
         room.last_active_epoch_seconds = now_epoch_seconds();
 
         Ok(Some(room.clone()))
@@ -538,6 +587,7 @@ impl RoomStore {
         room.members.remove(member_id);
         remove_listening_references(room, member_id);
         clear_screen_share_for_member(room, member_id);
+        clear_video_call_for_member(room, member_id);
         room.last_active_epoch_seconds = now_epoch_seconds();
 
         Ok(room.clone())
@@ -601,6 +651,10 @@ fn clear_screen_share_for_member(room: &mut Room, member_id: &str) {
     {
         room.screen_share = None;
     }
+}
+
+fn clear_video_call_for_member(room: &mut Room, member_id: &str) {
+    room.video_call_publishers.remove(member_id);
 }
 
 fn sorted_member_ids(member_ids: &HashSet<String>) -> Vec<String> {

@@ -5,6 +5,10 @@ defineProps({
   mediaReady: { type: Boolean, required: true },
   mediaStateLabel: { type: String, required: true },
   micStateLabel: { type: String, required: true },
+  cameraBusy: { type: Boolean, required: true },
+  cameraStateLabel: { type: String, required: true },
+  cameraToggleLabel: { type: String, required: true },
+  canUseCamera: { type: Boolean, required: true },
   microphoneGainLevel: { type: Number, required: true },
   microphoneGainPercent: { type: String, required: true },
   microphoneGainSupported: { type: Boolean, required: true },
@@ -12,7 +16,7 @@ defineProps({
   permissionNote: { type: String, required: true },
 });
 
-const emit = defineEmits(["leave", "setMicrophoneGain", "toggleMute"]);
+const emit = defineEmits(["leave", "setMicrophoneGain", "toggleCamera", "toggleMute"]);
 </script>
 
 <template>
@@ -58,6 +62,20 @@ const emit = defineEmits(["leave", "setMicrophoneGain", "toggleMute"]);
     </div>
 
     <div id="permission-note" class="permission-note">{{ permissionNote }}</div>
+
+    <div class="camera-control">
+      <button
+        id="toggle-camera"
+        type="button"
+        class="quiet-button quiet-button-wide"
+        :disabled="!mediaReady || !canUseCamera || cameraBusy"
+        :title="canUseCamera ? '切换摄像头视频' : '当前浏览器不支持摄像头'"
+        @click="emit('toggleCamera')"
+      >
+        {{ cameraToggleLabel }}
+      </button>
+      <span id="camera-state">{{ cameraStateLabel }}</span>
+    </div>
 
     <div class="voice-actions">
       <button

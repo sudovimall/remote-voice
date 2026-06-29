@@ -9,9 +9,11 @@ import {
   resumeRoomSignal,
   setScreenViewingSignal,
   startScreenShareSignal,
+  startVideoCallSignal,
   stopScreenShareSignal,
+  stopVideoCallSignal,
   websocketUrl,
-} from "../../static/room-state.mjs";
+} from "../../frontend/src/lib/room-state.js";
 
 test("room signals create an owner and join a target room", () => {
   assert.deepEqual(createRoomSignal("房主", "create-1"), {
@@ -68,6 +70,17 @@ test("screen share signals start and stop sharing", () => {
   assert.deepEqual(setScreenViewingSignal(true), {
     type: "set_screen_viewing",
     viewing: true,
+  });
+});
+
+test("video call signals start and stop camera publishing", () => {
+  assert.deepEqual(startVideoCallSignal("camera-start"), {
+    type: "start_video_call",
+    request_id: "camera-start",
+  });
+  assert.deepEqual(stopVideoCallSignal("camera-stop"), {
+    type: "stop_video_call",
+    request_id: "camera-stop",
   });
 });
 
@@ -139,6 +152,37 @@ test("room snapshots follow room messages and room closure", () => {
       },
     ).screen_share,
     null,
+  );
+  assert.deepEqual(
+    nextRoomSnapshot(joinedRoom, {
+      type: "video_call_started",
+      member_id: "m_member",
+      nickname: "队友",
+    }).video_call_publishers,
+    {
+      m_member: {
+        member_id: "m_member",
+        nickname: "队友",
+      },
+    },
+  );
+  assert.deepEqual(
+    nextRoomSnapshot(
+      {
+        ...joinedRoom,
+        video_call_publishers: {
+          m_member: {
+            member_id: "m_member",
+            nickname: "队友",
+          },
+        },
+      },
+      {
+        type: "video_call_stopped",
+        member_id: "m_member",
+      },
+    ).video_call_publishers,
+    {},
   );
   assert.equal(
     nextRoomSnapshot(joinedRoom, {

@@ -1,7 +1,7 @@
 use crate::{
     Result,
     auth::AuthRuntime,
-    config::settings::{ScreenShareSettings, Settings},
+    config::settings::{ScreenShareSettings, Settings, VideoCallSettings},
     domain::room::RoomStore,
     media::MediaController,
     transport::http::signaling::SignalHub,
@@ -14,6 +14,7 @@ pub struct AppState {
     pub signals: Arc<SignalHub>,
     pub media: Arc<MediaController>,
     pub screen_share: ScreenShareSettings,
+    pub video_call: VideoCallSettings,
     pub disconnect_grace_period: Duration,
     pub auth: AuthRuntime,
 }
@@ -32,6 +33,7 @@ impl AppState {
             signals: Arc::new(SignalHub::new()),
             media: Arc::new(MediaController::new()?),
             screen_share: ScreenShareSettings::default(),
+            video_call: VideoCallSettings::default(),
             disconnect_grace_period,
             auth: AuthRuntime::Disabled,
         })
@@ -43,6 +45,7 @@ impl AppState {
             signals: Arc::new(SignalHub::new()),
             media: Arc::new(MediaController::new()?),
             screen_share: ScreenShareSettings::default(),
+            video_call: VideoCallSettings::default(),
             disconnect_grace_period: Duration::from_secs(30),
             auth,
         })
@@ -62,6 +65,7 @@ impl AppState {
                 settings.media.public_ip.clone(),
             )?),
             screen_share: settings.screen_share.clone(),
+            video_call: settings.video_call.clone(),
             disconnect_grace_period: Duration::from_secs(settings.room.disconnect_grace_seconds),
             auth: AuthRuntime::from_settings(settings)?,
         })

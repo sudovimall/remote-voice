@@ -267,6 +267,18 @@ export function useRoomSession() {
       screenShare.handleScreenShareStopped(signal);
       return;
     }
+    if (signal.type === "video_call_started") {
+      media.handleVideoCallStarted(signal);
+      return;
+    }
+    if (signal.type === "video_call_stopped") {
+      media.handleVideoCallStopped(signal);
+      return;
+    }
+    if (signal.type === "video_call_publisher_count_updated") {
+      media.applyVideoCallPublisherCount(signal.publisher_count);
+      return;
+    }
     if (signal.type === "error") {
       showError(signal.message || "房间信令发生错误。");
     }
@@ -327,6 +339,7 @@ export function useRoomSession() {
     preferences.rememberListeningState(validNotListening);
     preferences.applyMemberVolumes();
     media.renderVoiceState();
+    media.syncVideoCallPublishers(room);
     screenShare.syncScreenViewingState();
   }
 
@@ -483,6 +496,10 @@ export function useRoomSession() {
   return {
     activeScreenStream: screenShare.activeScreenStream,
     activeSidePanel,
+    cameraBusy: media.cameraBusy,
+    cameraStateLabel: media.cameraStateLabel,
+    cameraToggleLabel: media.cameraToggleLabel,
+    canUseCamera: media.canUseCamera,
     canShareScreen: screenShare.canShareScreen,
     canStopScreenShare: screenShare.canStopScreenShare,
     chatInput: chat.chatInput,
@@ -499,6 +516,7 @@ export function useRoomSession() {
     hideMentionPicker: chat.hideMentionPicker,
     latencySnapshot: media.latencySnapshot,
     leaveRoom,
+    localCameraStream: media.localCameraStream,
     localScreenStream,
     mediaReady: media.mediaReady,
     mediaStateLabel: media.mediaStateLabel,
@@ -518,6 +536,7 @@ export function useRoomSession() {
     ownMemberId,
     panelTitle,
     permissionNote: media.permissionNote,
+    remoteCameraStreams: media.remoteCameraStreams,
     renderMentionPicker: chat.renderMentionPicker,
     roomIdLabel,
     screenPopoutTitle: screenShare.screenPopoutTitle,
@@ -535,6 +554,7 @@ export function useRoomSession() {
     submitChatMessage: chat.submitChatMessage,
     toggleMemberListening,
     toggleMemberPermission,
+    toggleCamera: media.toggleCamera,
     toggleSelfMuted: media.toggleSelfMuted,
     unreadBadgeLabel: chat.unreadBadgeLabel,
     voicePaneCollapsed: preferences.voicePaneCollapsed,

@@ -834,6 +834,102 @@ async fn websocket_joined_room_返回屏幕共享状态() {
 }
 
 #[tokio::test]
+async fn websocket_视频通话开始停止会广播发布人数() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, room_id, _owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut first_ws, first_id) = connect_join(&ws_url, &room_id, "join-first", "一号").await;
+    let (mut second_ws, second_id) = connect_join(&ws_url, &room_id, "join-second", "二号").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+    let _ = read_until_type(&mut first_ws, "member_joined").await;
+
+    first_ws
+        .send(Message::Text(
+            json!({
+                "type": "start_video_call",
+                "request_id": "video-first",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("一号开启摄像头");
+    let started = read_until_type(&mut owner_ws, "video_call_started").await;
+    assert_eq!(started["member_id"], first_id);
+    assert_eq!(started["nickname"], "一号");
+    let count = read_until_type(&mut owner_ws, "video_call_publisher_count_updated").await;
+    assert_eq!(count["publisher_count"], 1);
+
+    second_ws
+        .send(Message::Text(
+            json!({
+                "type": "start_video_call",
+                "request_id": "video-second",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("二号开启摄像头");
+    let started = read_until_type(&mut owner_ws, "video_call_started").await;
+    assert_eq!(started["member_id"], second_id);
+    let count = read_until_type(&mut owner_ws, "video_call_publisher_count_updated").await;
+    assert_eq!(count["publisher_count"], 2);
+
+    first_ws
+        .send(Message::Text(
+            json!({
+                "type": "stop_video_call",
+                "request_id": "video-stop",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("一号关闭摄像头");
+    let stopped = read_until_type(&mut owner_ws, "video_call_stopped").await;
+    assert_eq!(stopped["member_id"], first_id);
+    let count = read_until_type(&mut owner_ws, "video_call_publisher_count_updated").await;
+    assert_eq!(count["publisher_count"], 1);
+}
+
+#[tokio::test]
+async fn websocket_joined_room_返回视频通话发布者状态() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let owner = state.rooms.create_room("房主").expect("创建房间");
+    let publisher = state
+        .rooms
+        .join_room(&owner.room.id, "摄像头")
+        .expect("成员加入");
+    state
+        .rooms
+        .start_video_call(&owner.room.id, &publisher.member.id)
+        .expect("成员开启摄像头");
+    let ws_url = spawn_app(state).await;
+
+    let (mut viewer_ws, _) = connect_async(&ws_url).await.expect("连接 ws");
+    viewer_ws
+        .send(Message::Text(
+            json!({
+                "type": "join_room",
+                "request_id": "join-viewer",
+                "room_id": owner.room.id,
+                "nickname": "观众",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送 join_room");
+    let joined = read_until_type(&mut viewer_ws, "joined_room").await;
+    assert_eq!(
+        joined["room"]["video_call_publishers"][&publisher.member.id]["nickname"],
+        "摄像头"
+    );
+}
+
+#[tokio::test]
 async fn websocket_joined_room_返回恢复凭据() {
     let state = AppState::new(8).expect("创建应用状态");
     let ws_url = spawn_app(state).await;

@@ -27,6 +27,7 @@ function serviceCandidate(candidate) {
 
 // The first sendrecv audio m-line carries one remote track; reserve the rest for a full 8-member room.
 const EXTRA_REMOTE_AUDIO_SLOTS = 6;
+const REMOTE_CAMERA_VIDEO_SLOTS = 7;
 const DEFAULT_LATENCY_INTERVAL_MS = 1500;
 const DEFAULT_SPEAKING_INTERVAL_MS = 250;
 const SPEAKING_AUDIO_LEVEL = 0.035;
@@ -39,6 +40,16 @@ const DEFAULT_SCREEN_SHARE_CONFIG = {
     { maxViewers: 1, maxBitrateBps: 2_000_000 },
     { maxViewers: 2, maxBitrateBps: 1_200_000 },
     { maxViewers: Number.POSITIVE_INFINITY, maxBitrateBps: 800_000 },
+  ],
+};
+const DEFAULT_VIDEO_CALL_CONFIG = {
+  maxWidth: 640,
+  maxHeight: 360,
+  maxFrameRate: 15,
+  bitrateRules: [
+    { maxPublishers: 1, maxBitrateBps: 800_000 },
+    { maxPublishers: 4, maxBitrateBps: 500_000 },
+    { maxPublishers: Number.POSITIVE_INFINITY, maxBitrateBps: 300_000 },
   ],
 };
 
@@ -116,7 +127,42 @@ function normalizeScreenShareConfig(config = {}) {
   };
 }
 
+function normalizeVideoCallConfig(config = {}) {
+  const rules = Array.isArray(config?.bitrate_rules)
+    ? config.bitrate_rules
+    : Array.isArray(config?.bitrateRules)
+      ? config.bitrateRules
+      : [];
+  const bitrateRules = rules
+    .map((rule) => ({
+      maxPublishers: positiveInteger(rule?.max_publishers ?? rule?.maxPublishers, 0),
+      maxBitrateBps: positiveInteger(rule?.max_bitrate_bps ?? rule?.maxBitrateBps, 0),
+    }))
+    .filter((rule) => rule.maxPublishers > 0 && rule.maxBitrateBps > 0)
+    .sort((left, right) => left.maxPublishers - right.maxPublishers);
+
+  return {
+    maxWidth: configValue(config, "max_width", "maxWidth", DEFAULT_VIDEO_CALL_CONFIG.maxWidth),
+    maxHeight: configValue(config, "max_height", "maxHeight", DEFAULT_VIDEO_CALL_CONFIG.maxHeight),
+    maxFrameRate: configValue(
+      config,
+      "max_frame_rate",
+      "maxFrameRate",
+      DEFAULT_VIDEO_CALL_CONFIG.maxFrameRate,
+    ),
+    bitrateRules: bitrateRules.length ? bitrateRules : DEFAULT_VIDEO_CALL_CONFIG.bitrateRules,
+  };
+}
+
 function screenShareVideoConstraints(config) {
+  return {
+    width: { max: config.maxWidth },
+    height: { max: config.maxHeight },
+    frameRate: { max: config.maxFrameRate },
+  };
+}
+
+function cameraVideoConstraints(config) {
   return {
     width: { max: config.maxWidth },
     height: { max: config.maxHeight },
@@ -140,6 +186,22 @@ function screenShareBitrate(viewerCount = 1, config = DEFAULT_SCREEN_SHARE_CONFI
     ?? DEFAULT_SCREEN_SHARE_CONFIG.bitrateRules.at(-1).maxBitrateBps;
 }
 
+function normalizedVideoCallPublisherCount(publisherCount) {
+  const numeric = Number(publisherCount);
+  if (!Number.isFinite(numeric)) {
+    return 1;
+  }
+
+  return Math.max(1, Math.floor(numeric));
+}
+
+function videoCallBitrate(publisherCount = 1, config = DEFAULT_VIDEO_CALL_CONFIG) {
+  const publishers = normalizedVideoCallPublisherCount(publisherCount);
+  return config.bitrateRules.find((rule) => publishers <= rule.maxPublishers)?.maxBitrateBps
+    ?? config.bitrateRules.at(-1)?.maxBitrateBps
+    ?? DEFAULT_VIDEO_CALL_CONFIG.bitrateRules.at(-1).maxBitrateBps;
+}
+
 function videoOnlyStream(event, MediaStreamImpl) {
   const videoTracks = event.track?.kind === "video"
     ? [event.track]
@@ -149,6 +211,15 @@ function videoOnlyStream(event, MediaStreamImpl) {
   }
 
   return event.streams?.[0] ?? null;
+}
+
+function remoteTrackInfo(trackId = "") {
+  const parts = trackId.split(":");
+  if (parts.length < 2) {
+    return { memberId: "", source: "" };
+  }
+  const [memberId = "", source = ""] = parts;
+  return { memberId, source };
 }
 
 function selectedCandidatePair(stats) {
@@ -207,8 +278,12 @@ export class MediaSession {
     this.onSpeaking = options.onSpeaking;
     this.onScreenStream = options.onScreenStream;
     this.onScreenShareEnded = options.onScreenShareEnded;
+    this.onLocalCameraStream = options.onLocalCameraStream;
+    this.onRemoteCameraStreams = options.onRemoteCameraStreams;
+    this.onCameraEnded = options.onCameraEnded;
     this.onError = options.onError;
     this.screenShareConfig = normalizeScreenShareConfig(options.screenShare);
+    this.videoCallConfig = normalizeVideoCallConfig(options.videoCall);
     this.latencyIntervalMs = options.latencyIntervalMs ?? DEFAULT_LATENCY_INTERVAL_MS;
     this.speakingIntervalMs = options.speakingIntervalMs ?? DEFAULT_SPEAKING_INTERVAL_MS;
     this.setIntervalImpl =
@@ -231,6 +306,11 @@ export class MediaSession {
     this.displaySender = null;
     this.screenShareViewerCount = 1;
     this.stoppingScreenShare = false;
+    this.cameraStream = null;
+    this.cameraSender = null;
+    this.cameraPublisherCount = 1;
+    this.remoteCameraStreams = new Map();
+    this.stoppingCamera = false;
     this.latencyTimer = null;
     this.speakingTimer = null;
     this.lastSpeaking = false;
@@ -261,6 +341,9 @@ export class MediaSession {
       this.peerConnection.addTransceiver("audio", { direction: "recvonly" });
     }
     this.peerConnection.addTransceiver("video", { direction: "recvonly" });
+    for (let index = 0; index < REMOTE_CAMERA_VIDEO_SLOTS; index += 1) {
+      this.peerConnection.addTransceiver("video", { direction: "recvonly" });
+    }
 
     try {
       await this.negotiate();
@@ -359,6 +442,129 @@ export class MediaSession {
 
   canShareScreen() {
     return Boolean(this.mediaDevices?.getDisplayMedia);
+  }
+
+  canUseCamera() {
+    return Boolean(this.mediaDevices?.getUserMedia);
+  }
+
+  async setVideoCallPublisherCount(publisherCount) {
+    const nextPublisherCount = normalizedVideoCallPublisherCount(publisherCount);
+    if (nextPublisherCount === this.cameraPublisherCount) {
+      return;
+    }
+
+    this.cameraPublisherCount = nextPublisherCount;
+    if (this.cameraSender) {
+      await this.applyCameraBitrate(this.cameraSender);
+    }
+  }
+
+  async startCamera() {
+    if (!this.peerConnection) {
+      throw new Error("媒体会话尚未连接。");
+    }
+    if (!this.canUseCamera()) {
+      throw new Error("当前浏览器不支持摄像头。");
+    }
+
+    await this.stopCamera({ renegotiate: false, notify: false });
+    const cameraStream = await this.mediaDevices.getUserMedia({
+      video: cameraVideoConstraints(this.videoCallConfig),
+      audio: false,
+    });
+    const [cameraTrack] = cameraStream.getVideoTracks?.() ?? [];
+    if (!cameraTrack) {
+      for (const track of cameraStream.getTracks?.() ?? []) {
+        track.stop();
+      }
+      throw new Error("没有可用的摄像头视频轨道。");
+    }
+
+    cameraTrack.addEventListener?.("ended", () => {
+      if (this.stoppingCamera || this.cameraStream !== cameraStream) {
+        return;
+      }
+      this.onCameraEnded?.();
+    });
+
+    this.cameraStream = cameraStream;
+    this.cameraSender = this.peerConnection.addTrack(cameraTrack, cameraStream);
+    this.onLocalCameraStream?.(cameraStream);
+    try {
+      await this.applyCameraBitrate(this.cameraSender);
+      await this.renegotiate();
+      return cameraStream;
+    } catch (error) {
+      await this.stopCamera({ renegotiate: false });
+      throw error;
+    }
+  }
+
+  async stopCamera(options = {}) {
+    const { renegotiate = true, notify = true } = options;
+    const cameraStream = this.cameraStream;
+    const cameraSender = this.cameraSender;
+    if (!cameraStream && !cameraSender) {
+      return;
+    }
+
+    this.stoppingCamera = true;
+    for (const track of cameraStream?.getTracks?.() ?? []) {
+      track.stop();
+    }
+    if (cameraSender && this.peerConnection?.removeTrack) {
+      this.peerConnection.removeTrack(cameraSender);
+    } else if (cameraSender?.replaceTrack) {
+      await cameraSender.replaceTrack(null);
+    }
+    this.cameraStream = null;
+    this.cameraSender = null;
+    this.stoppingCamera = false;
+    if (notify) {
+      this.onLocalCameraStream?.(null);
+    }
+    if (renegotiate && this.peerConnection) {
+      await this.renegotiate();
+    }
+  }
+
+  async applyCameraBitrate(sender) {
+    if (!sender?.setParameters) {
+      return;
+    }
+
+    try {
+      const maxBitrate = videoCallBitrate(this.cameraPublisherCount, this.videoCallConfig);
+      const parameters = sender.getParameters?.() ?? {};
+      parameters.encodings = [{ ...(parameters.encodings?.[0] ?? {}), maxBitrate }];
+      await sender.setParameters(parameters);
+    } catch (error) {
+      this.onError?.(error);
+    }
+  }
+
+  remoteCameraStreamEntries() {
+    return Array.from(this.remoteCameraStreams.values());
+  }
+
+  clearRemoteCameraStream(memberId) {
+    if (!memberId || !this.remoteCameraStreams.has(memberId)) {
+      return;
+    }
+    this.remoteCameraStreams.delete(memberId);
+    this.onRemoteCameraStreams?.(this.remoteCameraStreamEntries());
+  }
+
+  rememberRemoteCameraStream(memberId, stream, track) {
+    if (!memberId || !stream) {
+      return;
+    }
+    this.remoteCameraStreams.set(memberId, { memberId, stream });
+    const cleanup = () => this.clearRemoteCameraStream(memberId);
+    track?.addEventListener?.("ended", cleanup, { once: true });
+    track?.addEventListener?.("mute", cleanup, { once: true });
+    this.onRemoteCameraStreams?.(this.remoteCameraStreamEntries());
   }
 
   async setScreenShareViewerCount(viewerCount) {
@@ -471,12 +677,16 @@ export class MediaSession {
     for (const track of this.localStream?.getTracks() ?? []) {
       track.stop();
     }
+    await this.stopCamera({ renegotiate: false, notify: false });
     await this.stopScreenShare({ renegotiate: false, notify: false });
     await this.releaseAudioGraph();
     for (const entry of this.audioNodes.values()) {
       entry.audio.remove();
     }
     this.audioNodes.clear();
+    this.remoteCameraStreams.clear();
+    this.onRemoteCameraStreams?.(this.remoteCameraStreamEntries());
+    this.onLocalCameraStream?.(null);
 
     if (this.peerConnection) {
       await this.peerConnection.close();
@@ -629,12 +839,21 @@ export class MediaSession {
     });
 
     peerConnection.addEventListener("track", (event) => {
-      const memberId = memberIdFromTrackId(event.track?.id);
+      const { memberId, source } = remoteTrackInfo(event.track?.id);
       if (memberId) {
         this.remoteTrackMembers.set(event.track.id, memberId);
       }
       if (event.track?.kind === "video") {
-        this.onScreenStream?.(videoOnlyStream(event, this.MediaStreamImpl), memberId);
+        if (!memberId) {
+          this.onError?.(new Error("无法识别远端视频发布者。"));
+          return;
+        }
+        const stream = videoOnlyStream(event, this.MediaStreamImpl);
+        if (source === "camera") {
+          this.rememberRemoteCameraStream(memberId, stream, event.track);
+        } else {
+          this.onScreenStream?.(stream, memberId);
+        }
         return;
       }
       if (event.track?.kind === "audio") {
@@ -642,7 +861,16 @@ export class MediaSession {
         return;
       }
       if ((event.streams?.[0]?.getVideoTracks?.() ?? []).length > 0) {
-        this.onScreenStream?.(videoOnlyStream(event, this.MediaStreamImpl), memberId);
+        if (!memberId) {
+          this.onError?.(new Error("无法识别远端视频发布者。"));
+          return;
+        }
+        const stream = videoOnlyStream(event, this.MediaStreamImpl);
+        if (source === "camera") {
+          this.rememberRemoteCameraStream(memberId, stream, event.track);
+        } else {
+          this.onScreenStream?.(stream, memberId);
+        }
         return;
       }
       this.playRemoteStream(event.streams?.[0], memberId);

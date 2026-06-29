@@ -190,6 +190,74 @@ fn 共享者离开或断线过期后释放共享占用() {
 }
 
 #[test]
+fn 多个成员可以开启并幂等关闭摄像头() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间");
+    let first = store.join_room(&owner.room.id, "一号").expect("加入房间");
+    let second = store.join_room(&owner.room.id, "二号").expect("加入房间");
+
+    let room = store
+        .start_video_call(&owner.room.id, &first.member.id)
+        .expect("一号开启摄像头");
+    assert_eq!(room.video_call_publishers.len(), 1);
+    assert_eq!(
+        room.video_call_publishers[&first.member.id].nickname,
+        "一号"
+    );
+
+    let room = store
+        .start_video_call(&owner.room.id, &first.member.id)
+        .expect("重复开启摄像头保持幂等");
+    assert_eq!(room.video_call_publishers.len(), 1);
+
+    let room = store
+        .start_video_call(&owner.room.id, &second.member.id)
+        .expect("二号也可以开启摄像头");
+    assert_eq!(room.video_call_publishers.len(), 2);
+
+    let room = store
+        .stop_video_call(&owner.room.id, &first.member.id)
+        .expect("一号关闭摄像头");
+    assert!(!room.video_call_publishers.contains_key(&first.member.id));
+    assert!(room.video_call_publishers.contains_key(&second.member.id));
+
+    let room = store
+        .stop_video_call(&owner.room.id, &first.member.id)
+        .expect("重复关闭摄像头保持幂等");
+    assert_eq!(room.video_call_publishers.len(), 1);
+}
+
+#[test]
+fn 离线成员不能开启摄像头且断线离开会释放摄像头状态() {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间");
+    let leaver = store.join_room(&owner.room.id, "离开者").expect("加入房间");
+
+    store
+        .start_video_call(&owner.room.id, &leaver.member.id)
+        .expect("成员开启摄像头");
+    let room = store
+        .mark_member_disconnected(&owner.room.id, &leaver.member.id)
+        .expect("成员断线");
+    assert!(!room.video_call_publishers.contains_key(&leaver.member.id));
+    let error = store
+        .start_video_call(&owner.room.id, &leaver.member.id)
+        .expect_err("离线成员不能开启摄像头");
+    assert!(matches!(error, Error::InvalidMessage(_)));
+
+    store
+        .resume_room(&owner.room.id, &leaver.member.id, &leaver.resume_token)
+        .expect("成员恢复连接");
+    store
+        .start_video_call(&owner.room.id, &leaver.member.id)
+        .expect("恢复后重新开启摄像头");
+    let room = store
+        .leave_room(&owner.room.id, &leaver.member.id)
+        .expect("成员离开");
+    assert!(!room.video_call_publishers.contains_key(&leaver.member.id));
+}
+
+#[test]
 fn 成员恢复原身份后保留不听名单() {
     let store = RoomStore::new(8);
     let owner = store.create_room("房主").expect("创建房间");

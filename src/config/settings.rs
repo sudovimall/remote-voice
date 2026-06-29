@@ -1,5 +1,5 @@
 use crate::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt::{Display, Formatter};
 use tracing::info;
 
@@ -13,6 +13,8 @@ pub struct Settings {
     pub media: MediaSettings,
     #[serde(default)]
     pub screen_share: ScreenShareSettings,
+    #[serde(default)]
+    pub video_call: VideoCallSettings,
     #[serde(default)]
     pub auth: AuthSettings,
     #[serde(default)]
@@ -54,6 +56,27 @@ pub struct ScreenShareSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenShareBitrateRule {
     pub max_viewers: u32,
+    pub max_bitrate_bps: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoCallSettings {
+    #[serde(default = "default_video_call_max_width")]
+    pub max_width: u32,
+    #[serde(default = "default_video_call_max_height")]
+    pub max_height: u32,
+    #[serde(default = "default_video_call_max_frame_rate")]
+    pub max_frame_rate: u32,
+    #[serde(
+        default = "default_video_call_bitrate_rules",
+        deserialize_with = "deserialize_video_call_bitrate_rules"
+    )]
+    pub bitrate_rules: Vec<VideoCallBitrateRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoCallBitrateRule {
+    pub max_publishers: u32,
     pub max_bitrate_bps: u32,
 }
 
@@ -145,6 +168,17 @@ impl Default for ScreenShareSettings {
     }
 }
 
+impl Default for VideoCallSettings {
+    fn default() -> Self {
+        Self {
+            max_width: default_video_call_max_width(),
+            max_height: default_video_call_max_height(),
+            max_frame_rate: default_video_call_max_frame_rate(),
+            bitrate_rules: default_video_call_bitrate_rules(),
+        }
+    }
+}
+
 impl Default for AuthSettings {
     fn default() -> Self {
         Self {
@@ -231,6 +265,60 @@ fn default_screen_share_bitrate_rules() -> Vec<ScreenShareBitrateRule> {
     ]
 }
 
+fn default_video_call_max_width() -> u32 {
+    640
+}
+
+fn default_video_call_max_height() -> u32 {
+    360
+}
+
+fn default_video_call_max_frame_rate() -> u32 {
+    15
+}
+
+fn default_video_call_bitrate_rules() -> Vec<VideoCallBitrateRule> {
+    vec![
+        VideoCallBitrateRule {
+            max_publishers: 1,
+            max_bitrate_bps: 800_000,
+        },
+        VideoCallBitrateRule {
+            max_publishers: 4,
+            max_bitrate_bps: 500_000,
+        },
+        VideoCallBitrateRule {
+            max_publishers: 8,
+            max_bitrate_bps: 300_000,
+        },
+    ]
+}
+
+fn deserialize_video_call_bitrate_rules<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<VideoCallBitrateRule>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let rules = Vec::<VideoCallBitrateRule>::deserialize(deserializer)?;
+    Ok(normalize_video_call_bitrate_rules(rules))
+}
+
+fn normalize_video_call_bitrate_rules(
+    rules: Vec<VideoCallBitrateRule>,
+) -> Vec<VideoCallBitrateRule> {
+    let mut rules = rules
+        .into_iter()
+        .filter(|rule| rule.max_publishers > 0 && rule.max_bitrate_bps > 0)
+        .collect::<Vec<_>>();
+    if rules.is_empty() {
+        return default_video_call_bitrate_rules();
+    }
+
+    rules.sort_by_key(|rule| rule.max_publishers);
+    rules
+}
+
 fn default_session_cookie_name() -> String {
     "remote_voice_session".to_string()
 }
@@ -292,7 +380,7 @@ impl Display for Settings {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "[监听端口 = {}, 房间人数上限 = {}, 断线保留秒数 = {}, 聊天历史条数 = {}, 媒体 UDP 端口范围 = {}-{}, 对外媒体 IP = {}, 屏幕共享 = {}x{}@{}fps, 认证 = {}]",
+            "[监听端口 = {}, 房间人数上限 = {}, 断线保留秒数 = {}, 聊天历史条数 = {}, 媒体 UDP 端口范围 = {}-{}, 对外媒体 IP = {}, 屏幕共享 = {}x{}@{}fps, 视频通话 = {}x{}@{}fps, 认证 = {}]",
             self.port,
             self.room.max_members,
             self.room.disconnect_grace_seconds,
@@ -303,6 +391,9 @@ impl Display for Settings {
             self.screen_share.max_width,
             self.screen_share.max_height,
             self.screen_share.max_frame_rate,
+            self.video_call.max_width,
+            self.video_call.max_height,
+            self.video_call.max_frame_rate,
             if self.auth.enabled {
                 "开启"
             } else {
@@ -329,6 +420,10 @@ pub fn init_config() -> Result<Settings> {
 	              max_width: 1280
 	              max_height: 720
 	              max_frame_rate: 12
+	            video_call:
+	              max_width: 640
+	              max_height: 360
+	              max_frame_rate: 15
 	           "#
             .to_string()
         }),
@@ -358,6 +453,10 @@ mod tests {
         assert_eq!(settings.screen_share.max_height, 720);
         assert_eq!(settings.screen_share.max_frame_rate, 12);
         assert_eq!(settings.screen_share.bitrate_rules.len(), 3);
+        assert_eq!(settings.video_call.max_width, 640);
+        assert_eq!(settings.video_call.max_height, 360);
+        assert_eq!(settings.video_call.max_frame_rate, 15);
+        assert_eq!(settings.video_call.bitrate_rules.len(), 3);
     }
 
     #[test]
@@ -415,6 +514,57 @@ mod tests {
     }
 
     #[test]
+    fn 视频通话码率策略可以配置并过滤无效规则() {
+        let settings: Settings = serde_yaml::from_str(
+            r#"
+            port: 9000
+            video_call:
+              max_width: 960
+              max_height: 540
+              max_frame_rate: 20
+              bitrate_rules:
+                - max_publishers: 4
+                  max_bitrate_bps: 500000
+                - max_publishers: 0
+                  max_bitrate_bps: 1
+                - max_publishers: 1
+                  max_bitrate_bps: 900000
+            "#,
+        )
+        .expect("解析视频通话配置");
+
+        assert_eq!(settings.video_call.max_width, 960);
+        assert_eq!(settings.video_call.max_height, 540);
+        assert_eq!(settings.video_call.max_frame_rate, 20);
+        assert_eq!(settings.video_call.bitrate_rules.len(), 2);
+        assert_eq!(settings.video_call.bitrate_rules[0].max_publishers, 1);
+        assert_eq!(
+            settings.video_call.bitrate_rules[0].max_bitrate_bps,
+            900000
+        );
+        assert!(settings.to_string().contains("视频通话 = 960x540@20fps"));
+    }
+
+    #[test]
+    fn 视频通话码率策略为空时使用默认值() {
+        let settings: Settings = serde_yaml::from_str(
+            r#"
+            port: 9000
+            video_call:
+              bitrate_rules: []
+            "#,
+        )
+        .expect("解析空视频码率配置");
+
+        assert_eq!(settings.video_call.bitrate_rules.len(), 3);
+        assert_eq!(settings.video_call.bitrate_rules[0].max_publishers, 1);
+        assert_eq!(
+            settings.video_call.bitrate_rules[2].max_bitrate_bps,
+            300000
+        );
+    }
+
+    #[test]
     fn 配置日志展示使用中文字段名() {
         let settings: Settings = serde_yaml::from_str(
             r#"
@@ -437,6 +587,7 @@ mod tests {
         assert!(display.contains("聊天历史条数 = 25"));
         assert!(display.contains("媒体 UDP 端口范围 = 41000-41015"));
         assert!(display.contains("对外媒体 IP = 未配置"));
+        assert!(display.contains("视频通话 = 640x360@15fps"));
     }
 
     #[test]

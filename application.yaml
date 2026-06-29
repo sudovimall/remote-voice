@@ -19,6 +19,17 @@ screen_share:
       max_bitrate_bps: 1200000
     - max_viewers: 8
       max_bitrate_bps: 800000
+video_call:
+  max_width: 640
+  max_height: 360
+  max_frame_rate: 15
+  bitrate_rules:
+    - max_publishers: 1
+      max_bitrate_bps: 800000
+    - max_publishers: 4
+      max_bitrate_bps: 500000
+    - max_publishers: 8
+      max_bitrate_bps: 300000
 auth:
   enabled: false
 storage:
