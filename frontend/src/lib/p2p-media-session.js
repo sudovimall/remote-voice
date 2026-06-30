@@ -108,12 +108,15 @@ export class P2PMediaSession {
     this.onScreenStream = options.onScreenStream;
     this.onRemoteCameraStreams = options.onRemoteCameraStreams;
     this.onError = options.onError;
+    this.testHooks = options.testHooks ?? globalThis.__remoteVoiceP2PTest ?? null;
     this.peers = new Map();
     this.localSources = new Map();
     this.fallbackMembers = new Set();
     this.memberVolumes = new Map();
     this.remoteCameraStreams = new Map();
     this.audioNodes = new Map();
+    this.testHooks?.registerSession?.(this);
+    this.emitTestEvent("session_created");
   }
 
   // 根据房间成员列表创建或关闭 P2P 连接，保持每个在线成员对一条浏览器直连。
@@ -174,6 +177,9 @@ export class P2PMediaSession {
 
   // 处理服务端转发来的 P2P offer，并只为该发送成员生成 answer。
   async handleOffer(fromMemberId, sdp) {
+    this.emitTestEvent("signal_received", {
+      signal: { type: "p2p_offer", from_member_id: fromMemberId, sdp },
+    });
     const entry = this.ensurePeer(fromMemberId);
     await entry.peerConnection.setRemoteDescription(
       this.SessionDescriptionImpl({ type: "offer", sdp }),
@@ -189,6 +195,9 @@ export class P2PMediaSession {
 
   // 处理服务端转发来的 P2P answer，只应用到对应成员的 PeerConnection。
   async handleAnswer(fromMemberId, sdp) {
+    this.emitTestEvent("signal_received", {
+      signal: { type: "p2p_answer", from_member_id: fromMemberId, sdp },
+    });
     const entry = this.peers.get(fromMemberId);
     if (!entry) {
       return;
@@ -201,6 +210,9 @@ export class P2PMediaSession {
 
   // 处理服务端转发来的 P2P ICE candidate，避免进入 SFU PeerConnection。
   async handleIceCandidate(fromMemberId, candidate) {
+    this.emitTestEvent("signal_received", {
+      signal: { type: "p2p_ice_candidate", from_member_id: fromMemberId, candidate },
+    });
     const entry = this.ensurePeer(fromMemberId);
     await entry.peerConnection.addIceCandidate(this.IceCandidateImpl(candidate));
   }
@@ -214,6 +226,7 @@ export class P2PMediaSession {
 
     if (signal.route === "sfu") {
       this.fallbackMembers.add(memberId);
+      this.emitTestEvent("route_updated", { memberId, route: signal.route, reason: signal.reason });
       this.closeMember(memberId);
       return;
     }
@@ -239,6 +252,7 @@ export class P2PMediaSession {
       entry.closedByUs = true;
       entry.peerConnection.close?.();
       this.peers.delete(memberId);
+      this.emitTestEvent("peer_closed", { memberId });
     }
     this.clearRemoteForMember(memberId);
   }
@@ -286,6 +300,7 @@ export class P2PMediaSession {
       pendingVideoTracks: new Map(),
     };
     this.peers.set(memberId, entry);
+    this.emitTestEvent("peer_created", { memberId });
     this.bindPeerConnection(memberId, entry);
     this.openMetadataChannel(entry);
 
@@ -404,6 +419,7 @@ export class P2PMediaSession {
     }
 
     if (sender?.replaceTrack) {
+      tagLocalTrack(local.track, source);
       await sender.replaceTrack(local.track);
       return;
     }
@@ -412,6 +428,7 @@ export class P2PMediaSession {
       entry.senders.delete(source);
     }
 
+    tagLocalTrack(local.track, source);
     const nextSender = local.stream
       ? entry.peerConnection.addTrack(local.track, local.stream)
       : entry.peerConnection.addTrack(local.track);
@@ -475,6 +492,7 @@ export class P2PMediaSession {
     }
     if (source === "camera") {
       this.remoteCameraStreams.set(memberId, { memberId, stream });
+      this.emitTestEvent("remote_video", { memberId, source });
       event.track?.addEventListener?.("ended", () => this.clearRemoteCameraStream(memberId), {
         once: true,
       });
@@ -485,6 +503,7 @@ export class P2PMediaSession {
       return;
     }
 
+    this.emitTestEvent("remote_video", { memberId, source });
     this.onScreenStream?.(stream, memberId);
   }
 
@@ -528,6 +547,7 @@ export class P2PMediaSession {
   // 向后端报告单个成员对 P2P 失败，让服务端广播该对回退 SFU。
   reportConnectionFailed(memberId, reason) {
     this.fallbackMembers.add(memberId);
+    this.emitTestEvent("fallback_reported", { memberId, reason });
     this.sendSignal({
       type: "p2p_connection_failed",
       target_member_id: memberId,
@@ -555,14 +575,41 @@ export class P2PMediaSession {
     };
     if (typeof this.client?.send === "function") {
       this.client.send(body);
+      this.emitTestEvent("signal_sent", { signal: body });
       return;
     }
 
     void this.client?.request?.(body);
+    this.emitTestEvent("signal_sent", { signal: body });
   }
 
   // 统一上报 P2P 内部异步错误，避免未捕获 promise 影响页面运行。
   handleError(error) {
     this.onError?.(error);
+  }
+
+  // 向浏览器测试暴露 P2P 事件；正常用户环境没有 hook 时保持零副作用。
+  emitTestEvent(type, payload = {}) {
+    try {
+      this.testHooks?.record?.({
+        type,
+        ownMemberId: this.ownMemberId,
+        ...payload,
+      });
+    } catch (_error) {
+      // 测试遥测不能影响真实媒体会话。
+    }
+  }
+}
+
+// 给真实 MediaStreamTrack 附加来源标记，浏览器测试 fake PeerConnection 可据此生成 SDP。
+function tagLocalTrack(track, source) {
+  try {
+    Object.defineProperty(track, "__remoteVoiceP2PSource", {
+      configurable: true,
+      value: source,
+    });
+  } catch (_error) {
+    // 个别浏览器对象可能不可扩展，生产逻辑仍有 DataChannel 元数据兜底。
   }
 }

@@ -27,18 +27,32 @@ export function useRoomP2PSession({
       return;
     }
 
+    const testHooks = globalThis.__remoteVoiceP2PTest ?? null;
     p2pSessionRef.value = createP2PMediaSession(
       clientRef.value,
       ownMemberId.value,
       {
         audioHost: document.querySelector("#remote-audio"),
+        PeerConnectionImpl: testHooks?.PeerConnectionImpl,
+        testHooks,
         onScreenStream(stream, memberId) {
           if (!stream || currentRoom.value?.screen_share?.member_id === memberId) {
             media.remoteScreenStream.value = stream;
+            testHooks?.record?.({
+              type: "screen_stream_applied",
+              ownMemberId: ownMemberId.value,
+              memberId,
+              hasStream: Boolean(stream),
+            });
           }
         },
         onRemoteCameraStreams(entries) {
           media.remoteCameraStreams.value = entries;
+          testHooks?.record?.({
+            type: "camera_streams_applied",
+            ownMemberId: ownMemberId.value,
+            memberIds: entries.map((entry) => entry.memberId),
+          });
         },
         onError(error) {
           onError(error.message || "P2P 媒体连接发生错误。");
