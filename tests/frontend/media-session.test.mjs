@@ -290,6 +290,7 @@ function mediaHarness(options = {}) {
   const remoteCameraStreams = [];
   const screenStops = [];
   const cameraStops = [];
+  const localMediaTracks = [];
   let displayConstraints = null;
   const userMediaCalls = [];
   const session = new MediaSession(client, {
@@ -354,6 +355,9 @@ function mediaHarness(options = {}) {
     onLocalCameraStream(stream) {
       localCameraStreams.push(stream);
     },
+    onLocalMediaTrack(entry) {
+      localMediaTracks.push(entry);
+    },
     onRemoteCameraStreams(entries) {
       remoteCameraStreams.push(entries);
     },
@@ -384,6 +388,7 @@ function mediaHarness(options = {}) {
     screenStops,
     cameraStops,
     localCameraStreams,
+    localMediaTracks,
     remoteCameraStreams,
     speakingStates,
     states,
@@ -548,6 +553,33 @@ test("media session sends microphone through Web Audio gain and updates gain", a
 
   harness.session.setMuted(true);
   assert.equal(harness.destinationTrack.enabled, false);
+});
+
+test("media session exposes local tracks for p2p publishing", async () => {
+  const harness = mediaHarness();
+
+  await harness.session.start();
+  await harness.session.startCamera();
+  await harness.session.startScreenShare();
+  await harness.session.stopCamera();
+  await harness.session.stopScreenShare();
+
+  assert.deepEqual(harness.localMediaTracks.map((entry) => entry.source), [
+    "audio",
+    "camera",
+    "screen",
+    "camera",
+    "screen",
+  ]);
+  assert.equal(harness.localMediaTracks[0].track, harness.destinationTrack);
+  assert.equal(harness.localMediaTracks[1].track, harness.cameraTrack);
+  assert.equal(harness.localMediaTracks[2].track, harness.displayTrack);
+  assert.equal(harness.localMediaTracks[3].track, null);
+  assert.equal(harness.localMediaTracks[4].track, null);
+  assert.deepEqual(
+    harness.session.localMediaTracks().map((entry) => entry.source),
+    ["audio"],
+  );
 });
 
 test("media session falls back to original microphone when Web Audio is unavailable", async () => {

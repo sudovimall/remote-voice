@@ -46,6 +46,7 @@ export function useRoomMediaSession({
   localScreenStream,
   mediaSessionRef,
   microphoneGainLevel,
+  onLocalMediaTrack,
   onError,
   ownMember,
   sendRoomControl,
@@ -167,6 +168,7 @@ export function useRoomMediaSession({
     return `camera-${Date.now()}`;
   }
 
+  // 启动 SFU 媒体会话并把本地轨道变化透传给 P2P 管理器，两个链路共享浏览器权限结果。
   async function startMedia(loadClientConfig, syncScreenViewingState, MediaSession = DefaultMediaSession) {
     mediaSessionRef.value?.close();
     mediaReady.value = false;
@@ -193,6 +195,7 @@ export function useRoomMediaSession({
       onLocalCameraStream(stream) {
         localCameraStream.value = stream;
       },
+      onLocalMediaTrack,
       onRemoteCameraStreams(entries) {
         remoteCameraStreams.value = entries;
       },
@@ -220,10 +223,12 @@ export function useRoomMediaSession({
     }
   }
 
+  // 关闭当前媒体会话，保留 ref 由上层决定是否重建。
   function closeMedia() {
     mediaSessionRef.value?.close();
   }
 
+  // 重置媒体 UI 状态并释放浏览器媒体资源，用于重连和离开房间。
   function resetMediaState() {
     mediaSessionRef.value?.close();
     mediaSessionRef.value = null;

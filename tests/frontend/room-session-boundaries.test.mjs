@@ -17,8 +17,10 @@ test("useRoomSession is a composition layer instead of directly constructing tra
   assert.match(roomSession, /useRoomChatSession/);
   assert.match(roomSession, /useRoomScreenShareSession/);
   assert.match(roomSession, /useRoomMemberPreferences/);
+  assert.match(roomSession, /useRoomP2PSession/);
   assert.doesNotMatch(roomSession, /new RoomConnection\(/);
   assert.doesNotMatch(roomSession, /new MediaSession\(/);
+  assert.doesNotMatch(roomSession, /new RTCPeerConnection\(/);
 });
 
 test("room responsibilities have dedicated composable modules", () => {
@@ -27,6 +29,16 @@ test("room responsibilities have dedicated composable modules", () => {
   assert.match(readComposable("useRoomChatSession.js"), /export function useRoomChatSession/);
   assert.match(readComposable("useRoomScreenShareSession.js"), /export function useRoomScreenShareSession/);
   assert.match(readComposable("useRoomMemberPreferences.js"), /export function useRoomMemberPreferences/);
+  assert.match(readComposable("useRoomP2PSession.js"), /export function useRoomP2PSession/);
+});
+
+test("room composition layer dispatches P2P before room snapshots", () => {
+  assert.match(roomSession, /p2p\.handleP2PSignal\(signal\)/);
+  assert.match(roomSession, /nextRoomSnapshot\(currentRoom\.value, signal\)/);
+  assert.ok(
+    roomSession.indexOf("p2p.handleP2PSignal(signal)") <
+      roomSession.indexOf("nextRoomSnapshot(currentRoom.value, signal)"),
+  );
 });
 
 test("room composition layer still exposes the RoomView contract", () => {

@@ -30,6 +30,7 @@ export function useRoomMemberPreferences({
   currentRoom,
   mediaSessionRef,
   ownMemberId,
+  p2pSessionRef,
   routeRoomId,
   sendRoomControl,
 }) {
@@ -58,6 +59,7 @@ export function useRoomMemberPreferences({
     return memberVolumes.value.get(memberId);
   }
 
+  // 保存并应用单个成员音量，SFU 和 P2P 播放节点都要同步更新。
   function setMemberVolume(memberId, value) {
     if (!memberId || !currentRoom.value?.id) {
       return;
@@ -69,16 +71,20 @@ export function useRoomMemberPreferences({
     memberVolumes.value = nextVolumes;
     saveMemberVolume(window.localStorage, currentRoom.value.id, memberId, volume);
     mediaSessionRef.value?.setMemberVolume(memberId, volume);
+    p2pSessionRef.value?.setMemberVolume(memberId, volume);
   }
 
+  // 将当前房间所有成员音量应用到活跃媒体会话，重连或新建 P2P 后复用。
   function applyMemberVolumes() {
     for (const member of membersForRoom(currentRoom.value)) {
       if (member.id !== ownMemberId.value) {
         mediaSessionRef.value?.setMemberVolume(member.id, memberVolume(member.id));
+        p2pSessionRef.value?.setMemberVolume(member.id, memberVolume(member.id));
       }
     }
   }
 
+  // 保存麦克风增益偏好；P2P 复用 MediaSession 输出的增益后音频轨道。
   function setMicrophoneGain(value) {
     microphoneGainLevel.value = clampMicrophoneGain(value);
     saveMicrophoneGain(window.localStorage, microphoneGainLevel.value);

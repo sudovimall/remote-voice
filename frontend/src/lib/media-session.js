@@ -279,6 +279,7 @@ export class MediaSession {
     this.onScreenStream = options.onScreenStream;
     this.onScreenShareEnded = options.onScreenShareEnded;
     this.onLocalCameraStream = options.onLocalCameraStream;
+    this.onLocalMediaTrack = options.onLocalMediaTrack;
     this.onRemoteCameraStreams = options.onRemoteCameraStreams;
     this.onCameraEnded = options.onCameraEnded;
     this.onError = options.onError;
@@ -317,6 +318,7 @@ export class MediaSession {
     this.negotiation = Promise.resolve();
   }
 
+  // 启动本地麦克风和 SFU PeerConnection，同时把本地音频轨道暴露给 P2P 管理器。
   async start() {
     statePatch(this.onState, { device: "requesting", media: "waiting" });
 
@@ -333,6 +335,7 @@ export class MediaSession {
     this.bindPeerConnection(this.peerConnection);
 
     this.prepareOutboundStream();
+    this.publishLocalAudioTracks();
 
     for (const track of this.outboundStream.getAudioTracks()) {
       this.peerConnection.addTrack(track, this.outboundStream);
@@ -385,6 +388,7 @@ export class MediaSession {
     }
   }
 
+  // 切换本地麦克风轨道启用状态；P2P 和 SFU 共用同一条处理后的音频轨道。
   setMuted(muted) {
     for (const track of this.outboundStream?.getAudioTracks() ?? this.localStream?.getAudioTracks() ?? []) {
       track.enabled = !muted;
@@ -394,6 +398,7 @@ export class MediaSession {
     }
   }
 
+  // 构造可选的麦克风增益音频图，确保 SFU 和 P2P 使用同一份增益后音频。
   prepareOutboundStream() {
     this.outboundStream = this.localStream;
     this.microphoneGainSupported = false;
@@ -419,6 +424,7 @@ export class MediaSession {
     }
   }
 
+  // 更新麦克风增益；如果浏览器不支持 Web Audio，则只记录偏好供后续使用。
   setMicrophoneGain(gain) {
     this.microphoneGain = clampMicrophoneGain(gain);
     if (this.microphoneGainNode) {
@@ -426,6 +432,7 @@ export class MediaSession {
     }
   }
 
+  // 更新远端成员播放音量，用于 SFU 下行音频播放节点。
   setMemberVolume(memberId, volume) {
     if (!memberId) {
       return;
@@ -460,6 +467,7 @@ export class MediaSession {
     }
   }
 
+  // 请求摄像头并发布为独立视频源，同时通知 P2P 管理器同步本地 camera 轨道。
   async startCamera() {
     if (!this.peerConnection) {
       throw new Error("媒体会话尚未连接。");
@@ -491,6 +499,7 @@ export class MediaSession {
     this.cameraStream = cameraStream;
     this.cameraSender = this.peerConnection.addTrack(cameraTrack, cameraStream);
     this.onLocalCameraStream?.(cameraStream);
+    this.publishLocalMediaTrack("camera", cameraTrack, cameraStream);
     try {
       await this.applyCameraBitrate(this.cameraSender);
       await this.renegotiate();
@@ -501,6 +510,7 @@ export class MediaSession {
     }
   }
 
+  // 停止本地摄像头发布；释放 SFU sender 后同步移除 P2P camera 轨道。
   async stopCamera(options = {}) {
     const { renegotiate = true, notify = true } = options;
     const cameraStream = this.cameraStream;
@@ -520,6 +530,7 @@ export class MediaSession {
     }
     this.cameraStream = null;
     this.cameraSender = null;
+    this.publishLocalMediaTrack("camera", null, null);
     this.stoppingCamera = false;
     if (notify) {
       this.onLocalCameraStream?.(null);
@@ -579,6 +590,7 @@ export class MediaSession {
     }
   }
 
+  // 请求屏幕共享并发布为独立视频源，同时通知 P2P 管理器同步本地 screen 轨道。
   async startScreenShare() {
     if (!this.peerConnection) {
       throw new Error("媒体会话尚未连接。");
@@ -609,11 +621,13 @@ export class MediaSession {
 
     this.displayStream = displayStream;
     this.displaySender = this.peerConnection.addTrack(displayTrack, displayStream);
+    this.publishLocalMediaTrack("screen", displayTrack, displayStream);
     await this.applyScreenShareBitrate(this.displaySender);
     await this.renegotiate();
     return displayStream;
   }
 
+  // 停止屏幕共享；无论是否通知 UI，都要让 P2P 连接移除 screen 轨道。
   async stopScreenShare(options = {}) {
     const { renegotiate = true, notify = true } = options;
     const displayStream = this.displayStream;
@@ -633,6 +647,7 @@ export class MediaSession {
     }
     this.displayStream = null;
     this.displaySender = null;
+    this.publishLocalMediaTrack("screen", null, null);
     this.stoppingScreenShare = false;
     if (notify) {
       this.onScreenStream?.(null, "");
@@ -657,6 +672,7 @@ export class MediaSession {
     }
   }
 
+  // 接收服务端 SFU ICE candidate，P2P candidate 由独立管理器处理。
   async addRemoteIceCandidate(candidate) {
     if (!this.peerConnection || !candidate) {
       return;
@@ -670,10 +686,12 @@ export class MediaSession {
     }
   }
 
+  // 关闭 SFU 媒体会话和本地采集资源，并通知 P2P 移除本地音视频轨道。
   async close() {
     this.stopLatencySampling();
     this.stopSpeakingSampling();
     this.reportSpeaking(false);
+    this.publishLocalMediaTrack("audio", null, null);
     for (const track of this.localStream?.getTracks() ?? []) {
       track.stop();
     }
@@ -708,6 +726,38 @@ export class MediaSession {
     if (audioContext && audioContext.state !== "closed") {
       await audioContext.close?.();
     }
+  }
+
+  // 返回当前可发布到 P2P 的本地轨道快照，便于 P2P 管理器重建后补齐状态。
+  localMediaTracks() {
+    return [
+      ...(this.outboundStream?.getAudioTracks?.() ?? []).map((track) => ({
+        source: "audio",
+        track,
+        stream: this.outboundStream,
+      })),
+      ...(this.cameraStream?.getVideoTracks?.() ?? []).map((track) => ({
+        source: "camera",
+        track,
+        stream: this.cameraStream,
+      })),
+      ...(this.displayStream?.getVideoTracks?.() ?? []).map((track) => ({
+        source: "screen",
+        track,
+        stream: this.displayStream,
+      })),
+    ];
+  }
+
+  // 广播本地音频轨道状态，麦克风重建或关闭时 P2P 连接可同步替换 sender。
+  publishLocalAudioTracks() {
+    const [track] = this.outboundStream?.getAudioTracks?.() ?? [];
+    this.publishLocalMediaTrack("audio", track ?? null, track ? this.outboundStream : null);
+  }
+
+  // 将本地媒体源变化交给外部管理器，避免 P2P 读取 MediaSession 私有字段。
+  publishLocalMediaTrack(source, track, stream) {
+    this.onLocalMediaTrack?.({ source, track, stream });
   }
 
   startLatencySampling() {

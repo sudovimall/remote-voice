@@ -23,6 +23,7 @@ import { useRoomChatSession } from "./useRoomChatSession.js";
 import { useRoomConnectionSession } from "./useRoomConnectionSession.js";
 import { useRoomMediaSession } from "./useRoomMediaSession.js";
 import { useRoomMemberPreferences } from "./useRoomMemberPreferences.js";
+import { useRoomP2PSession } from "./useRoomP2PSession.js";
 import { useRoomScreenShareSession } from "./useRoomScreenShareSession.js";
 
 const SPEAKING_TTL_MS = 1800;
@@ -56,6 +57,7 @@ export function useRoomSession() {
   // Transport handles exposed to the boundary composables as refs.
   const clientRef = ref(null);
   const mediaSessionRef = ref(null);
+  const p2pSessionRef = ref(null);
 
   // Session bookkeeping that stays with the orchestrator.
   let roomSession = null;
@@ -91,6 +93,7 @@ export function useRoomSession() {
     currentRoom,
     mediaSessionRef,
     ownMemberId,
+    p2pSessionRef,
     routeRoomId,
     sendRoomControl: (signal) => sendRoomControl(signal),
   });
@@ -123,6 +126,7 @@ export function useRoomSession() {
     localScreenStream,
     mediaSessionRef,
     microphoneGainLevel: preferences.microphoneGainLevel,
+    onLocalMediaTrack: (entry) => p2p.handleLocalMediaTrack(entry),
     onError: (message) => showError(message),
     ownMember,
     sendRoomControl,
@@ -150,6 +154,16 @@ export function useRoomSession() {
     currentRoom,
     onError: (message) => showError(message),
     ownMemberId,
+  });
+
+  // --- Boundary: P2P media (browser-to-browser PeerConnections + route fallback) ---
+  const p2p = useRoomP2PSession({
+    clientRef,
+    currentRoom,
+    media,
+    ownMemberId,
+    p2pSessionRef,
+    onError: (message) => showError(message),
   });
 
   function clearSpeakingTimers() {
@@ -197,6 +211,7 @@ export function useRoomSession() {
     screenShare.syncScreenViewingState();
   }
 
+  // 处理 WebSocket 普通断开；SFU 和 P2P 都释放，随后用恢复凭据重连。
   function handleConnectionClose(nextClient) {
     if (clientRef.value !== nextClient || intentionalShutdown || pageHidden.value) {
       return;
@@ -205,6 +220,7 @@ export function useRoomSession() {
       return;
     }
 
+    p2p.closeP2P();
     media.resetMediaState();
     setConnection(roomSession ? "重连中" : "已断开");
     scheduleReconnect();
@@ -214,7 +230,11 @@ export function useRoomSession() {
     connectionLabel.value = message;
   }
 
+  // 按信令类型分发房间事件；P2P 信令先处理，避免进入普通房间快照逻辑。
   function handleRoomSignal(signal) {
+    if (p2p.handleP2PSignal(signal)) {
+      return;
+    }
     if (signal.type === "ice_candidate") {
       mediaSessionRef.value?.addRemoteIceCandidate(signal.candidate).catch((error) => {
         showError(error.message || "服务端 ICE candidate 处理失败。");
@@ -230,7 +250,11 @@ export function useRoomSession() {
 
     const previousRoomId = currentRoom.value?.id || signal.room_id || routeRoomId;
     currentRoom.value = nextRoomSnapshot(currentRoom.value, signal);
+    if (signal.room || ["member_joined", "member_updated", "member_left"].includes(signal.type)) {
+      p2p.syncP2PMembers(currentRoom.value);
+    }
     if (signal.type === "room_closed") {
+      p2p.closeP2P();
       mediaSessionRef.value?.close();
       preferences.clearRoomScopedSettings(previousRoomId);
       roomSession = null;
@@ -245,6 +269,10 @@ export function useRoomSession() {
     }
     if (signal.type === "member_listening_updated") {
       preferences.rememberListeningState(signal.not_listening_member_ids);
+      return;
+    }
+    if (signal.type === "member_left") {
+      p2p.closeP2PMember(signal.member_id);
       return;
     }
     if (signal.type === "member_speaking_updated") {
@@ -272,6 +300,7 @@ export function useRoomSession() {
       return;
     }
     if (signal.type === "video_call_stopped") {
+      p2p.clearRemoteCameraStream(signal.member_id);
       media.handleVideoCallStopped(signal);
       return;
     }
@@ -343,6 +372,7 @@ export function useRoomSession() {
     screenShare.syncScreenViewingState();
   }
 
+  // 建立或恢复房间连接；房间状态就绪后创建 P2P 管理器，再启动本地媒体。
   async function connectRoom(intent) {
     try {
       const nextClient = await connection.openRoomConnection(intent);
@@ -359,6 +389,7 @@ export function useRoomSession() {
       clearRoomEntryIntent(window.sessionStorage);
       roomIdLabel.value = nextClient.room.id;
       setActiveSidePanel(loadRoomPanel(window.sessionStorage, nextClient.room.id));
+      p2p.startP2PSession();
       syncRoomSideEffects(nextClient.room);
       setConnection("已连接");
       void startMedia();
@@ -389,6 +420,7 @@ export function useRoomSession() {
     }
   }
 
+  // 启动浏览器媒体采集；成功后本地轨道会通过回调同步给 P2P。
   async function startMedia() {
     await media.startMedia(loadClientConfig, (force) => screenShare.syncScreenViewingState(force));
   }
@@ -405,6 +437,7 @@ export function useRoomSession() {
     sendRoomControl(memberListeningSignal(member.id, notListening));
   }
 
+  // 主动离开房间并释放 SFU/P2P 资源，避免浏览器后台继续占用媒体设备。
   function leaveRoom() {
     intentionalShutdown = true;
     const leavingRoomId = currentRoom.value?.id || routeRoomId;
@@ -427,6 +460,7 @@ export function useRoomSession() {
     speakingMemberIds.value = new Set();
     clearSpeakingTimers();
     chat.rememberChatMessages();
+    p2p.closeP2P();
     mediaSessionRef.value?.close();
     clientRef.value?.close();
     window.location.assign("/");
@@ -489,6 +523,7 @@ export function useRoomSession() {
     }
     chat.disposeChatSession();
     clearSpeakingTimers();
+    p2p.closeP2P();
     mediaSessionRef.value?.close();
     clientRef.value?.close();
   });
