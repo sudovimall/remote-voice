@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { RoomConnection } from "../../static/room-connection.mjs";
+import { RoomConnection } from "../../frontend/src/lib/room-connection.js";
 
 class FakeClient {
   constructor() {

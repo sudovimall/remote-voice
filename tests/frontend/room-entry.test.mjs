@@ -21,7 +21,7 @@ import {
   saveNickname,
   saveRoomEntryIntent,
   saveRoomSession,
-} from "../../static/room-entry.mjs";
+} from "../../frontend/src/lib/room-entry.js";
 
 function memoryStorage() {
   const values = new Map();

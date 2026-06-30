@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { SignalingClient } from "../../static/signaling-client.mjs";
+import { SignalingClient } from "../../frontend/src/lib/signaling-client.js";
 
 class FakeWebSocket {
   static OPEN = 1;

@@ -11,7 +11,7 @@ import {
   saveMemberVolume,
   saveMicrophoneGain,
   volumePercent,
-} from "../../static/audio-volume.mjs";
+} from "../../frontend/src/lib/audio-volume.js";
 
 class MemoryStorage {
   constructor(values = {}) {

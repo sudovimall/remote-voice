@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   fetchRoomSummaries,
   normalizeRoomSummaries,
-} from "../../static/lobby-rooms.mjs";
+} from "../../frontend/src/lib/lobby-rooms.js";
 
 test("lobby room summaries keep joinable room ids and member counts", () => {
   assert.deepEqual(

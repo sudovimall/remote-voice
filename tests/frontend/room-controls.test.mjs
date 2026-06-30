@@ -13,7 +13,7 @@ import {
   memberPermissionLabel,
   memberSpeakingSignal,
   selfMutedSignal,
-} from "../../static/room-controls.mjs";
+} from "../../frontend/src/lib/room-controls.js";
 
 test("room control signals update self mute and speak permission", () => {
   assert.deepEqual(selfMutedSignal(true), {

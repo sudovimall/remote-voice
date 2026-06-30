@@ -4,7 +4,7 @@ import {
   authDisplayName,
   normalizeAuthState,
   shouldShowAdminLink,
-} from "../../static/auth-ui.mjs";
+} from "../../frontend/src/lib/auth-ui.js";
 
 test("authDisplayName prefers display_name and falls back to username", () => {
   assert.equal(authDisplayName({ display_name: "管理员", username: "admin" }), "管理员");

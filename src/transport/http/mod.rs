@@ -111,20 +111,8 @@ async fn asset(Path(asset): Path<String>) -> Response {
             include_str!("../../../static/styles.css"),
         )
             .into_response(),
-        "lobby.js" => javascript(include_str!("../../../static/lobby.js")),
         "auth-page.js" => javascript(include_str!("../../../static/auth-page.js")),
         "admin.js" => javascript(include_str!("../../../static/admin.js")),
-        "auth-ui.mjs" => javascript(include_str!("../../../static/auth-ui.mjs")),
-        "lobby-rooms.mjs" => javascript(include_str!("../../../static/lobby-rooms.mjs")),
-        "room.js" => javascript(include_str!("../../../static/room.js")),
-        "room-entry.mjs" => javascript(include_str!("../../../static/room-entry.mjs")),
-        "room-state.mjs" => javascript(include_str!("../../../static/room-state.mjs")),
-        "room-connection.mjs" => javascript(include_str!("../../../static/room-connection.mjs")),
-        "room-controls.mjs" => javascript(include_str!("../../../static/room-controls.mjs")),
-        "audio-volume.mjs" => javascript(include_str!("../../../static/audio-volume.mjs")),
-        "chat-controls.mjs" => javascript(include_str!("../../../static/chat-controls.mjs")),
-        "media-session.mjs" => javascript(include_str!("../../../static/media-session.mjs")),
-        "signaling-client.mjs" => javascript(include_str!("../../../static/signaling-client.mjs")),
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }

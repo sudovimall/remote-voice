@@ -12,7 +12,7 @@ import {
   messageMentionsCurrentMember,
   nextChatUnreadCount,
   sendChatMessageSignal,
-} from "../../static/chat-controls.mjs";
+} from "../../frontend/src/lib/chat-controls.js";
 
 test("chat message view includes time avatar and own-member marker", () => {
   const view = chatMessageView(
