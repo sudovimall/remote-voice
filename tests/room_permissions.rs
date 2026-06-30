@@ -1,5 +1,31 @@
 use voice::Error;
-use voice::domain::room::RoomStore;
+use voice::domain::room::{MediaRoute, RoomJoin, RoomStore};
+
+// 构建三人房间，便于媒体路由测试验证单个成员对不会影响其他成员对。
+fn three_member_room() -> (RoomStore, RoomJoin, RoomJoin, RoomJoin) {
+    let store = RoomStore::new(8);
+    let owner = store.create_room("房主").expect("创建房间");
+    let first = store.join_room(&owner.room.id, "一号").expect("一号加入");
+    let second = store.join_room(&owner.room.id, "二号").expect("二号加入");
+
+    (store, owner, first, second)
+}
+
+// 断言指定成员对的媒体路由，统一覆盖正向和反向读取时的期望。
+fn assert_media_route(
+    store: &RoomStore,
+    room_id: &str,
+    first_member_id: &str,
+    second_member_id: &str,
+    expected: MediaRoute,
+) {
+    assert_eq!(
+        store
+            .media_route(room_id, first_member_id, second_member_id)
+            .expect("读取媒体路由"),
+        expected
+    );
+}
 
 #[test]
 fn 房主可以关闭成员发言权限() {
@@ -255,6 +281,165 @@ fn 离线成员不能开启摄像头且断线离开会释放摄像头状态() {
         .leave_room(&owner.room.id, &leaver.member.id)
         .expect("成员离开");
     assert!(!room.video_call_publishers.contains_key(&leaver.member.id));
+}
+
+#[test]
+fn 未见过的成员对默认使用_p2p_路由() {
+    let (store, owner, first, _second) = three_member_room();
+
+    assert_media_route(
+        &store,
+        &owner.room.id,
+        &owner.member.id,
+        &first.member.id,
+        MediaRoute::P2p,
+    );
+}
+
+#[test]
+fn p2p_失败会归一化成员对并只回退这一对() {
+    let (store, owner, first, second) = three_member_room();
+
+    let update = store
+        .mark_p2p_connection_failed(&owner.room.id, &first.member.id, &owner.member.id)
+        .expect("标记 P2P 失败");
+
+    let mut expected_pair = vec![owner.member.id.clone(), first.member.id.clone()];
+    expected_pair.sort();
+    assert_eq!(update.member_ids, expected_pair);
+    assert_eq!(update.route, MediaRoute::Sfu);
+    assert_media_route(
+        &store,
+        &owner.room.id,
+        &owner.member.id,
+        &first.member.id,
+        MediaRoute::Sfu,
+    );
+    assert_media_route(
+        &store,
+        &owner.room.id,
+        &first.member.id,
+        &owner.member.id,
+        MediaRoute::Sfu,
+    );
+    assert_media_route(
+        &store,
+        &owner.room.id,
+        &owner.member.id,
+        &second.member.id,
+        MediaRoute::P2p,
+    );
+    assert_media_route(
+        &store,
+        &owner.room.id,
+        &first.member.id,
+        &second.member.id,
+        MediaRoute::P2p,
+    );
+}
+
+#[test]
+fn p2p_目标必须是同房间在线的其他成员() {
+    let (store, owner, first, _second) = three_member_room();
+    let other_room = store.create_room("其他房主").expect("创建其他房间");
+
+    let self_error = store
+        .validate_p2p_target(&owner.room.id, &owner.member.id, &owner.member.id)
+        .expect_err("不能向自己发送 P2P 信令");
+    assert!(matches!(self_error, Error::InvalidMessage(_)));
+
+    let missing_error = store
+        .validate_p2p_target(&owner.room.id, &owner.member.id, "m_missing")
+        .expect_err("不能向不存在成员发送 P2P 信令");
+    assert!(matches!(missing_error, Error::MemberNotFound));
+
+    let cross_room_error = store
+        .validate_p2p_target(&owner.room.id, &owner.member.id, &other_room.member.id)
+        .expect_err("不能跨房间发送 P2P 信令");
+    assert!(matches!(cross_room_error, Error::MemberNotFound));
+
+    store
+        .mark_member_disconnected(&owner.room.id, &first.member.id)
+        .expect("成员断线");
+    let offline_error = store
+        .validate_p2p_target(&owner.room.id, &owner.member.id, &first.member.id)
+        .expect_err("不能向离线成员发送 P2P 信令");
+    assert!(matches!(offline_error, Error::InvalidMessage(_)));
+}
+
+#[test]
+fn 可恢复断线期间保留媒体路由_过期后清理() {
+    let (store, owner, first, _second) = three_member_room();
+
+    store
+        .mark_p2p_connection_failed(&owner.room.id, &owner.member.id, &first.member.id)
+        .expect("标记 P2P 失败");
+    store
+        .mark_member_disconnected(&owner.room.id, &first.member.id)
+        .expect("成员断线");
+    assert_media_route(
+        &store,
+        &owner.room.id,
+        &owner.member.id,
+        &first.member.id,
+        MediaRoute::Sfu,
+    );
+
+    store
+        .resume_room(&owner.room.id, &first.member.id, &first.resume_token)
+        .expect("成员恢复");
+    assert_media_route(
+        &store,
+        &owner.room.id,
+        &owner.member.id,
+        &first.member.id,
+        MediaRoute::Sfu,
+    );
+
+    store
+        .mark_member_disconnected(&owner.room.id, &first.member.id)
+        .expect("成员再次断线");
+    store
+        .expire_disconnected_member(&owner.room.id, &first.member.id)
+        .expect("断线成员过期")
+        .expect("成员被移除");
+    assert_media_route(
+        &store,
+        &owner.room.id,
+        &owner.member.id,
+        &first.member.id,
+        MediaRoute::P2p,
+    );
+}
+
+#[test]
+fn 普通成员离开后只清理相关媒体路由() {
+    let (store, owner, first, second) = three_member_room();
+
+    store
+        .mark_p2p_connection_failed(&owner.room.id, &owner.member.id, &first.member.id)
+        .expect("标记第一对 P2P 失败");
+    store
+        .mark_p2p_connection_failed(&owner.room.id, &owner.member.id, &second.member.id)
+        .expect("标记第二对 P2P 失败");
+    store
+        .leave_room(&owner.room.id, &first.member.id)
+        .expect("成员离开");
+
+    assert_media_route(
+        &store,
+        &owner.room.id,
+        &owner.member.id,
+        &first.member.id,
+        MediaRoute::P2p,
+    );
+    assert_media_route(
+        &store,
+        &owner.room.id,
+        &owner.member.id,
+        &second.member.id,
+        MediaRoute::Sfu,
+    );
 }
 
 #[test]

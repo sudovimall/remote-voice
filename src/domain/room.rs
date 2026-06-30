@@ -53,12 +53,78 @@ pub struct VideoCallState {
     pub nickname: String,
 }
 
+/// 描述一对成员当前应使用的媒体路径，默认缺省值保持为 P2P。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaRoute {
+    P2p,
+    Sfu,
+}
+
+/// 记录媒体路径切换原因，便于前端按原因决定清理 P2P 资源还是重试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaRouteReason {
+    P2pFailed,
+}
+
+/// 返回一次媒体路由变化的规范化成员对和新状态，避免信令层重复排序。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaRouteUpdate {
+    pub member_ids: Vec<String>,
+    pub route: MediaRoute,
+    pub reason: MediaRouteReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MediaRouteState {
+    route: MediaRoute,
+    reason: MediaRouteReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MemberPairKey {
+    first_member_id: String,
+    second_member_id: String,
+}
+
+impl MemberPairKey {
+    fn new(first_member_id: &str, second_member_id: &str) -> Result<Self> {
+        if first_member_id == second_member_id {
+            return Err(Error::InvalidMessage(
+                "不能向自己建立 P2P 媒体路由".to_string(),
+            ));
+        }
+
+        let (first_member_id, second_member_id) = if first_member_id < second_member_id {
+            (first_member_id, second_member_id)
+        } else {
+            (second_member_id, first_member_id)
+        };
+
+        Ok(Self {
+            first_member_id: first_member_id.to_string(),
+            second_member_id: second_member_id.to_string(),
+        })
+    }
+
+    fn member_ids(&self) -> Vec<String> {
+        vec![self.first_member_id.clone(), self.second_member_id.clone()]
+    }
+
+    fn contains(&self, member_id: &str) -> bool {
+        self.first_member_id == member_id || self.second_member_id == member_id
+    }
+}
+
 impl Member {
+    /// 返回按成员 ID 排序的不听名单，让房间快照和恢复响应保持稳定。
     pub fn not_listening_member_ids(&self) -> Vec<String> {
         sorted_member_ids(&self.not_listening_member_ids)
     }
 }
 
+/// 房间快照包含前端需要恢复的状态，聊天和媒体路由作为后端私有状态跳过序列化。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Room {
     pub id: String,
@@ -71,6 +137,8 @@ pub struct Room {
     pub video_call_publishers: HashMap<String, VideoCallState>,
     #[serde(skip, default)]
     chat_messages: Vec<ChatMessage>,
+    #[serde(skip, default)]
+    media_routes: HashMap<MemberPairKey, MediaRouteState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +182,7 @@ pub struct RoomStore {
 }
 
 impl RoomStore {
+    /// 创建房间存储，集中管理房间、成员和后端私有的媒体路由状态。
     pub fn new(max_members: usize) -> Self {
         Self {
             rooms: RwLock::new(HashMap::new()),
@@ -124,11 +193,13 @@ impl RoomStore {
         }
     }
 
+    /// 调整聊天历史保留条数，测试和部署可复用同一套裁剪逻辑。
     pub fn with_chat_history_limit(mut self, chat_history_limit: usize) -> Self {
         self.chat_history_limit = chat_history_limit;
         self
     }
 
+    /// 创建新房间并把创建者设为房主，媒体路由保持空表以表示默认 P2P。
     pub fn create_room(&self, nickname: impl Into<String>) -> Result<RoomJoin> {
         let member = self.new_member(nickname, MemberRole::Owner);
         let now = now_epoch_seconds();
@@ -148,6 +219,7 @@ impl RoomStore {
             screen_share: None,
             video_call_publishers: HashMap::new(),
             chat_messages: Vec::new(),
+            media_routes: HashMap::new(),
         };
 
         rooms.insert(room_id, room.clone());
@@ -159,10 +231,12 @@ impl RoomStore {
         })
     }
 
+    /// 加入已有房间，默认以普通成员身份进入并继承房间的当前状态。
     pub fn join_room(&self, room_id: &str, nickname: impl Into<String>) -> Result<RoomJoin> {
         self.join_room_with_role(room_id, nickname, MemberRole::Member)
     }
 
+    /// 以指定身份加入房间，持久房间恢复房主身份时复用这条路径。
     pub fn join_room_with_role(
         &self,
         room_id: &str,
@@ -201,6 +275,7 @@ impl RoomStore {
         })
     }
 
+    /// 从持久化记录恢复运行时房间，用于认证房间在内存状态缺失时重新上线。
     pub fn restore_room_with_member(
         &self,
         room_id: &str,
@@ -228,6 +303,7 @@ impl RoomStore {
             screen_share: None,
             video_call_publishers: HashMap::new(),
             chat_messages: Vec::new(),
+            media_routes: HashMap::new(),
         };
 
         rooms.insert(room_id.to_string(), room.clone());
@@ -239,6 +315,7 @@ impl RoomStore {
         })
     }
 
+    /// 使用恢复凭据把断线成员恢复为在线状态，保留成员偏好和媒体路由状态。
     pub fn resume_room(
         &self,
         room_id: &str,
@@ -267,11 +344,13 @@ impl RoomStore {
         })
     }
 
+    /// 读取房间快照；私有媒体路由不会序列化给前端，避免改变现有快照协议。
     pub fn get_room(&self, room_id: &str) -> Result<Room> {
         let rooms = self.read_rooms()?;
         rooms.get(room_id).cloned().ok_or(Error::RoomNotFound)
     }
 
+    /// 列出房间摘要，按房间 ID 排序让管理界面和测试输出稳定。
     pub fn list_room_summaries(&self) -> Result<Vec<RoomSummary>> {
         let rooms = self.read_rooms()?;
         let mut summaries = rooms
@@ -285,6 +364,7 @@ impl RoomStore {
         Ok(summaries)
     }
 
+    /// 房主修改成员发言权限；权限判断留在领域层，避免信令入口各自实现。
     pub fn set_member_can_speak(
         &self,
         room_id: &str,
@@ -310,6 +390,7 @@ impl RoomStore {
         Ok(room.clone())
     }
 
+    /// 成员更新自己的静音状态，供房间广播和媒体层共同使用同一状态。
     pub fn set_self_muted(&self, room_id: &str, member_id: &str, self_muted: bool) -> Result<Room> {
         let mut rooms = self.write_rooms()?;
         let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
@@ -324,6 +405,7 @@ impl RoomStore {
         Ok(room.clone())
     }
 
+    /// 读取成员的私有收听偏好，只返回当前成员自己的不听名单。
     pub fn member_listening_state(
         &self,
         room_id: &str,
@@ -338,6 +420,7 @@ impl RoomStore {
         })
     }
 
+    /// 更新成员对另一发布者的收听偏好，并拒绝屏蔽自己这种无效状态。
     pub fn set_member_listening(
         &self,
         room_id: &str,
@@ -376,6 +459,7 @@ impl RoomStore {
         })
     }
 
+    /// 保存聊天消息并校验 mention 成员，防止客户端伪造昵称或引用未知成员。
     pub fn send_chat_message(
         &self,
         room_id: &str,
@@ -431,12 +515,14 @@ impl RoomStore {
         Ok(message)
     }
 
+    /// 返回房间聊天历史，加入房间时用于补齐最近消息。
     pub fn chat_history(&self, room_id: &str) -> Result<Vec<ChatMessage>> {
         let rooms = self.read_rooms()?;
         let room = rooms.get(room_id).ok_or(Error::RoomNotFound)?;
         Ok(room.chat_messages.clone())
     }
 
+    /// 开启屏幕共享占位，先在领域层防止多个成员同时占用共享源。
     pub fn start_screen_share(&self, room_id: &str, member_id: &str) -> Result<Room> {
         let mut rooms = self.write_rooms()?;
         let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
@@ -465,6 +551,7 @@ impl RoomStore {
         Ok(room.clone())
     }
 
+    /// 停止屏幕共享；共享者本人或房主可以释放占位，重复停止保持幂等。
     pub fn stop_screen_share(&self, room_id: &str, requester_member_id: &str) -> Result<Room> {
         let mut rooms = self.write_rooms()?;
         let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
@@ -497,7 +584,9 @@ impl RoomStore {
         let member = room.members.get(member_id).ok_or(Error::MemberNotFound)?;
 
         if !member.connected {
-            return Err(Error::InvalidMessage("离线成员不能开启摄像头。".to_string()));
+            return Err(Error::InvalidMessage(
+                "离线成员不能开启摄像头。".to_string(),
+            ));
         }
 
         room.video_call_publishers
@@ -526,6 +615,7 @@ impl RoomStore {
         Ok(room.clone())
     }
 
+    /// 标记成员为可恢复断线；此时保留 P2P 路由，等待成员在宽限期内恢复。
     pub fn mark_member_disconnected(&self, room_id: &str, member_id: &str) -> Result<Room> {
         let mut rooms = self.write_rooms()?;
         let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
@@ -542,6 +632,7 @@ impl RoomStore {
         Ok(room.clone())
     }
 
+    /// 清理超过恢复宽限期的断线成员，并移除该成员相关的私有媒体路由。
     pub fn expire_disconnected_member(
         &self,
         room_id: &str,
@@ -565,11 +656,13 @@ impl RoomStore {
         remove_listening_references(room, member_id);
         clear_screen_share_for_member(room, member_id);
         clear_video_call_for_member(room, member_id);
+        clear_media_routes_for_member(room, member_id);
         room.last_active_epoch_seconds = now_epoch_seconds();
 
         Ok(Some(room.clone()))
     }
 
+    /// 成员显式离开房间；普通成员离开时清理其偏好和媒体路由，房主离开则关房。
     pub fn leave_room(&self, room_id: &str, member_id: &str) -> Result<Room> {
         let mut rooms = self.write_rooms()?;
         let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
@@ -588,14 +681,82 @@ impl RoomStore {
         remove_listening_references(room, member_id);
         clear_screen_share_for_member(room, member_id);
         clear_video_call_for_member(room, member_id);
+        clear_media_routes_for_member(room, member_id);
         room.last_active_epoch_seconds = now_epoch_seconds();
 
         Ok(room.clone())
     }
 
+    /// 关闭房间并移除全部后端私有状态，包括该房间的媒体路由表。
     pub fn close_room(&self, room_id: &str) -> Result<Room> {
         let mut rooms = self.write_rooms()?;
         rooms.remove(room_id).ok_or(Error::RoomNotFound)
+    }
+
+    /// 校验 P2P 信令目标必须是同房间在线成员，避免客户端跨房间或自连。
+    pub fn validate_p2p_target(
+        &self,
+        room_id: &str,
+        sender_member_id: &str,
+        target_member_id: &str,
+    ) -> Result<()> {
+        let rooms = self.read_rooms()?;
+        let room = rooms.get(room_id).ok_or(Error::RoomNotFound)?;
+        validate_distinct_members(room, sender_member_id, target_member_id)?;
+        let target = room
+            .members
+            .get(target_member_id)
+            .ok_or(Error::MemberNotFound)?;
+        if !target.connected {
+            return Err(Error::InvalidMessage(
+                "目标成员已离线，不能发送 P2P 信令".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// 读取成员对当前媒体路由；没有显式记录时返回默认 P2P。
+    pub fn media_route(
+        &self,
+        room_id: &str,
+        first_member_id: &str,
+        second_member_id: &str,
+    ) -> Result<MediaRoute> {
+        let key = MemberPairKey::new(first_member_id, second_member_id)?;
+        let rooms = self.read_rooms()?;
+        let room = rooms.get(room_id).ok_or(Error::RoomNotFound)?;
+
+        Ok(room
+            .media_routes
+            .get(&key)
+            .map(|state| state.route)
+            .unwrap_or(MediaRoute::P2p))
+    }
+
+    /// 将某一对成员标记为 P2P 失败并回退 SFU，只影响这个规范化成员对。
+    pub fn mark_p2p_connection_failed(
+        &self,
+        room_id: &str,
+        first_member_id: &str,
+        second_member_id: &str,
+    ) -> Result<MediaRouteUpdate> {
+        let key = MemberPairKey::new(first_member_id, second_member_id)?;
+        let mut rooms = self.write_rooms()?;
+        let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
+        validate_distinct_members(room, first_member_id, second_member_id)?;
+
+        let route = MediaRoute::Sfu;
+        let reason = MediaRouteReason::P2pFailed;
+        room.media_routes
+            .insert(key.clone(), MediaRouteState { route, reason });
+        room.last_active_epoch_seconds = now_epoch_seconds();
+
+        Ok(MediaRouteUpdate {
+            member_ids: key.member_ids(),
+            route,
+            reason,
+        })
     }
 
     fn new_member(&self, nickname: impl Into<String>, role: MemberRole) -> Member {
@@ -655,6 +816,26 @@ fn clear_screen_share_for_member(room: &mut Room, member_id: &str) {
 
 fn clear_video_call_for_member(room: &mut Room, member_id: &str) {
     room.video_call_publishers.remove(member_id);
+}
+
+fn clear_media_routes_for_member(room: &mut Room, member_id: &str) {
+    room.media_routes
+        .retain(|pair, _state| !pair.contains(member_id));
+}
+
+fn validate_distinct_members(
+    room: &Room,
+    first_member_id: &str,
+    second_member_id: &str,
+) -> Result<()> {
+    if first_member_id == second_member_id {
+        return Err(Error::InvalidMessage("不能向自己发送 P2P 信令".to_string()));
+    }
+    if !room.members.contains_key(first_member_id) || !room.members.contains_key(second_member_id) {
+        return Err(Error::MemberNotFound);
+    }
+
+    Ok(())
 }
 
 fn sorted_member_ids(member_ids: &HashSet<String>) -> Vec<String> {

@@ -264,6 +264,12 @@ async fn read_until_type(ws: &mut TestWebSocket, expected_type: &str) -> Value {
     }
 }
 
+// 断言连接短时间内没有额外消息，用来验证定向 P2P 信令不会被广播。
+async fn assert_no_message(ws: &mut TestWebSocket, reason: &str) {
+    let message = timeout(Duration::from_millis(200), ws.next()).await;
+    assert!(message.is_err(), "{reason}: {message:?}");
+}
+
 async fn create_audio_offer() -> String {
     let mut media_engine = MediaEngine::default();
     media_engine
@@ -1252,6 +1258,267 @@ async fn websocket_webrtc_offer_携带目标成员字段会被拒绝() {
     let error = read_until_type(&mut member_ws, "error").await;
     assert_eq!(error["request_id"], "offer-target");
     assert_eq!(error["code"], "invalid_message");
+}
+
+#[tokio::test]
+async fn websocket_p2p_offer_只转发给目标成员并替换发送者() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, room_id, owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut target_ws, target_id) = connect_join(&ws_url, &room_id, "join-target", "目标").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+    let (mut third_ws, _third_id) = connect_join(&ws_url, &room_id, "join-third", "旁观者").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+    let _ = read_until_type(&mut target_ws, "member_joined").await;
+
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "type": "p2p_offer",
+                "request_id": "p2p-offer-1",
+                "target_member_id": target_id,
+                "sdp": "v=0\r\np2p-offer"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送 p2p_offer");
+
+    let offer = read_until_type(&mut target_ws, "p2p_offer").await;
+    assert_eq!(offer["from_member_id"], owner_id);
+    assert_eq!(offer["sdp"], "v=0\r\np2p-offer");
+    assert_no_message(&mut third_ws, "第三个成员不应收到 P2P offer").await;
+}
+
+#[tokio::test]
+async fn websocket_p2p_answer_只转发给目标成员并替换发送者() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, room_id, owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut member_ws, member_id) = connect_join(&ws_url, &room_id, "join-member", "成员").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+
+    member_ws
+        .send(Message::Text(
+            json!({
+                "type": "p2p_answer",
+                "request_id": "p2p-answer-1",
+                "target_member_id": owner_id,
+                "sdp": "v=0\r\np2p-answer"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送 p2p_answer");
+
+    let answer = read_until_type(&mut owner_ws, "p2p_answer").await;
+    assert_eq!(answer["from_member_id"], member_id);
+    assert_eq!(answer["sdp"], "v=0\r\np2p-answer");
+}
+
+#[tokio::test]
+async fn websocket_p2p_ice_candidate_保留浏览器_candidate_并定向转发() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, room_id, owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut member_ws, member_id) = connect_join(&ws_url, &room_id, "join-member", "成员").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "type": "p2p_ice_candidate",
+                "request_id": "p2p-ice-1",
+                "target_member_id": member_id,
+                "candidate": {
+                    "candidate": "candidate:p2p",
+                    "sdpMid": "0",
+                    "sdpMLineIndex": 0,
+                    "usernameFragment": "ufrag"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送 p2p_ice_candidate");
+
+    let ice = read_until_type(&mut member_ws, "p2p_ice_candidate").await;
+    assert_eq!(ice["from_member_id"], owner_id);
+    assert_eq!(ice["candidate"]["candidate"], "candidate:p2p");
+    assert_eq!(ice["candidate"]["sdpMid"], "0");
+    assert_eq!(ice["candidate"]["sdpMLineIndex"], 0);
+    assert_eq!(ice["candidate"]["usernameFragment"], "ufrag");
+}
+
+#[tokio::test]
+async fn websocket_p2p_connection_failed_广播媒体路由更新() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state.clone()).await;
+    let (mut owner_ws, room_id, owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut first_ws, first_id) = connect_join(&ws_url, &room_id, "join-first", "一号").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+    let (mut second_ws, second_id) = connect_join(&ws_url, &room_id, "join-second", "二号").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+    let _ = read_until_type(&mut first_ws, "member_joined").await;
+
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "type": "p2p_connection_failed",
+                "request_id": "p2p-failed-1",
+                "target_member_id": first_id,
+                "reason": "ice_failed"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送 p2p_connection_failed");
+
+    let mut expected_pair = vec![owner_id.clone(), first_id.clone()];
+    expected_pair.sort();
+    for update in [
+        read_until_type(&mut owner_ws, "media_route_updated").await,
+        read_until_type(&mut first_ws, "media_route_updated").await,
+        read_until_type(&mut second_ws, "media_route_updated").await,
+    ] {
+        assert_eq!(update["member_ids"], json!(expected_pair));
+        assert_eq!(update["route"], "sfu");
+        assert_eq!(update["reason"], "p2p_failed");
+    }
+    assert_eq!(
+        state
+            .rooms
+            .media_route(&room_id, &owner_id, &first_id)
+            .expect("读取失败成员对路由"),
+        voice::domain::room::MediaRoute::Sfu
+    );
+    assert_eq!(
+        state
+            .rooms
+            .media_route(&room_id, &owner_id, &second_id)
+            .expect("读取未失败成员对路由"),
+        voice::domain::room::MediaRoute::P2p
+    );
+}
+
+#[tokio::test]
+async fn websocket_p2p_signal_未加入房间返回错误() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut ws, _) = connect_async(&ws_url).await.expect("连接 ws");
+
+    ws.send(Message::Text(
+        json!({
+            "type": "p2p_offer",
+            "request_id": "p2p-not-joined",
+            "target_member_id": "m_target",
+            "sdp": "v=0\r\n"
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("发送未加入的 p2p_offer");
+
+    let error = read_until_type(&mut ws, "error").await;
+    assert_eq!(error["request_id"], "p2p-not-joined");
+    assert_eq!(error["code"], "invalid_message");
+    assert_eq!(error["message"], "加入房间后才能发送该消息");
+}
+
+#[tokio::test]
+async fn websocket_p2p_signal_拒绝自己或未知目标() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, _room_id, owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "type": "p2p_offer",
+                "request_id": "p2p-self",
+                "target_member_id": owner_id,
+                "sdp": "v=0\r\n"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送指向自己的 p2p_offer");
+    let self_error = read_until_type(&mut owner_ws, "error").await;
+    assert_eq!(self_error["request_id"], "p2p-self");
+    assert_eq!(self_error["code"], "invalid_message");
+
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "type": "p2p_offer",
+                "request_id": "p2p-missing",
+                "target_member_id": "m_missing",
+                "sdp": "v=0\r\n"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送指向未知成员的 p2p_offer");
+    let missing_error = read_until_type(&mut owner_ws, "error").await;
+    assert_eq!(missing_error["request_id"], "p2p-missing");
+    assert_eq!(missing_error["code"], "invalid_message");
+}
+
+#[tokio::test]
+async fn websocket_p2p_signal_拒绝离线或无信令连接目标() {
+    let state = AppState::with_disconnect_grace_period(8, Duration::from_millis(250))
+        .expect("创建应用状态");
+    let ws_url = spawn_app(state.clone()).await;
+    let (mut owner_ws, room_id, _owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut member_ws, member_id) = connect_join(&ws_url, &room_id, "join-member", "成员").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+
+    member_ws.close(None).await.expect("关闭成员 ws");
+    let _ = read_until_type(&mut owner_ws, "member_updated").await;
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "type": "p2p_offer",
+                "request_id": "p2p-offline",
+                "target_member_id": member_id,
+                "sdp": "v=0\r\n"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("向离线成员发送 p2p_offer");
+    let offline_error = read_until_type(&mut owner_ws, "error").await;
+    assert_eq!(offline_error["request_id"], "p2p-offline");
+    assert_eq!(offline_error["code"], "invalid_message");
+
+    let shadow = state
+        .rooms
+        .join_room(&room_id, "无连接成员")
+        .expect("直接加入房间但不注册 ws");
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "type": "p2p_offer",
+                "request_id": "p2p-no-sender",
+                "target_member_id": shadow.member.id,
+                "sdp": "v=0\r\n"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("向无信令连接成员发送 p2p_offer");
+    let no_sender_error = read_until_type(&mut owner_ws, "error").await;
+    assert_eq!(no_sender_error["request_id"], "p2p-no-sender");
+    assert_eq!(no_sender_error["code"], "invalid_message");
 }
 
 #[tokio::test]

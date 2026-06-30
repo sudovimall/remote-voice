@@ -1,7 +1,7 @@
 use crate::{
     Error, Result,
     auth::{CurrentUser, session::now_epoch_seconds},
-    domain::room::{ChatMention, ChatMessage, MemberRole, Room},
+    domain::room::{ChatMention, ChatMessage, MediaRoute, MediaRouteReason, MemberRole, Room},
     media::{IceCandidate, MediaEvent},
     state::AppState,
 };
@@ -103,6 +103,30 @@ pub enum ClientSignal {
         request_id: Option<String>,
         candidate: IceCandidate,
     },
+    // 成员间 P2P offer 只由后端校验并定向转发，不复用 SFU 的 webrtc_offer 语义。
+    P2pOffer {
+        request_id: String,
+        target_member_id: String,
+        sdp: String,
+    },
+    // 成员间 P2P answer 只发给目标成员，发送者身份由当前 WebSocket 会话决定。
+    P2pAnswer {
+        request_id: String,
+        target_member_id: String,
+        sdp: String,
+    },
+    // 成员间 P2P ICE candidate 保持浏览器结构，但只转发给指定目标成员。
+    P2pIceCandidate {
+        request_id: String,
+        target_member_id: String,
+        candidate: IceCandidate,
+    },
+    // P2P 建连失败只把这一对成员切回 SFU，不能影响房间里的其他成员对。
+    P2pConnectionFailed {
+        request_id: String,
+        target_member_id: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -183,6 +207,27 @@ pub enum ServerSignal {
     IceCandidate {
         candidate: IceCandidate,
     },
+    // 成员间 P2P offer 下行只暴露真实发送者，避免客户端伪造来源。
+    P2pOffer {
+        from_member_id: String,
+        sdp: String,
+    },
+    // 成员间 P2P answer 下行只发给目标成员，不广播给整个房间。
+    P2pAnswer {
+        from_member_id: String,
+        sdp: String,
+    },
+    // 成员间 P2P ICE candidate 下行保留浏览器 candidate 字段。
+    P2pIceCandidate {
+        from_member_id: String,
+        candidate: IceCandidate,
+    },
+    // 媒体路由变化按规范化成员对广播，前端据此关闭对应 P2P 链路。
+    MediaRouteUpdated {
+        member_ids: Vec<String>,
+        route: MediaRoute,
+        reason: MediaRouteReason,
+    },
     Error {
         request_id: Option<String>,
         code: &'static str,
@@ -192,7 +237,7 @@ pub enum ServerSignal {
 
 #[derive(Debug)]
 pub struct SignalHub {
-    // 这里只保存房间事件通道，不承载媒体包，也不再做成员间 WebRTC 信令转发。
+    // 这里只保存房间事件通道，不承载媒体包；P2P 也只转发信令，不接触媒体帧。
     rooms: RwLock<RoomSignalSenders>,
 }
 
@@ -239,6 +284,54 @@ impl SignalHub {
     pub fn clear_room(&self, room_id: &str) -> Result<()> {
         self.write_rooms()?.remove(room_id);
         Ok(())
+    }
+
+    /// 确认目标成员仍有活跃信令连接，避免 P2P 失败上报写入不可投递的成员对。
+    pub fn ensure_member_registered(&self, room_id: &str, member_id: &str) -> Result<()> {
+        let mut rooms = self.write_rooms()?;
+        let Some(members) = rooms.get_mut(room_id) else {
+            return Err(Error::InvalidMessage("目标成员信令连接不可用".to_string()));
+        };
+
+        let registered = members
+            .get(member_id)
+            .is_some_and(|sender| !sender.is_closed());
+        if registered {
+            return Ok(());
+        }
+
+        members.remove(member_id);
+        if members.is_empty() {
+            rooms.remove(room_id);
+        }
+        Err(Error::InvalidMessage("目标成员信令连接不可用".to_string()))
+    }
+
+    /// 向房间内指定成员定向发送信令，用于 P2P offer/answer/ICE 这类非广播消息。
+    pub fn send_to_member(
+        &self,
+        room_id: &str,
+        member_id: &str,
+        signal: ServerSignal,
+    ) -> Result<()> {
+        let mut rooms = self.write_rooms()?;
+        let Some(members) = rooms.get_mut(room_id) else {
+            return Err(Error::InvalidMessage("目标成员信令连接不可用".to_string()));
+        };
+
+        let Some(sender) = members.get(member_id) else {
+            return Err(Error::InvalidMessage("目标成员信令连接不可用".to_string()));
+        };
+
+        if sender.try_send(signal).is_ok() {
+            return Ok(());
+        }
+
+        members.remove(member_id);
+        if members.is_empty() {
+            rooms.remove(room_id);
+        }
+        Err(Error::InvalidMessage("目标成员信令连接不可用".to_string()))
     }
 
     pub fn broadcast(
@@ -316,8 +409,7 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                     continue;
                 };
 
-                // `deny_unknown_fields` 让旧的成员间 P2P 信令字段（例如 target_member_id）
-                // 直接被拒绝，避免客户端绕过后端媒体层。
+                // `deny_unknown_fields` 继续保护 SFU webrtc_* 消息；成员间协商只能走新的 p2p_* 类型。
                 let signal = match serde_json::from_str::<ClientSignal>(&text) {
                     Ok(signal) => signal,
                     Err(error) => {
@@ -906,6 +998,129 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             let _ = send_error(&mut sender, request_id, error).await;
                         }
                     }
+                    ClientSignal::P2pOffer { request_id, target_member_id, sdp } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                            let _ = send_not_joined(&mut sender, Some(request_id)).await;
+                            continue;
+                        };
+
+                        // P2P offer 只校验并定向转发给目标成员，SFU 媒体层不参与浏览器间协商。
+                        let result = state
+                            .rooms
+                            .validate_p2p_target(room_id, member_id, &target_member_id)
+                            .and_then(|()| {
+                                state.signals.send_to_member(
+                                    room_id,
+                                    &target_member_id,
+                                    ServerSignal::P2pOffer {
+                                        from_member_id: member_id.to_string(),
+                                        sdp,
+                                    },
+                                )
+                            });
+                        if let Err(error) = result {
+                            let _ = send_error(
+                                &mut sender,
+                                Some(request_id),
+                                p2p_signal_error(error),
+                            ).await;
+                        }
+                    }
+                    ClientSignal::P2pAnswer { request_id, target_member_id, sdp } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                            let _ = send_not_joined(&mut sender, Some(request_id)).await;
+                            continue;
+                        };
+
+                        // P2P answer 只回到发起 offer 的成员，避免泄露给房间内其他连接。
+                        let result = state
+                            .rooms
+                            .validate_p2p_target(room_id, member_id, &target_member_id)
+                            .and_then(|()| {
+                                state.signals.send_to_member(
+                                    room_id,
+                                    &target_member_id,
+                                    ServerSignal::P2pAnswer {
+                                        from_member_id: member_id.to_string(),
+                                        sdp,
+                                    },
+                                )
+                            });
+                        if let Err(error) = result {
+                            let _ = send_error(
+                                &mut sender,
+                                Some(request_id),
+                                p2p_signal_error(error),
+                            ).await;
+                        }
+                    }
+                    ClientSignal::P2pIceCandidate { request_id, target_member_id, candidate } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                            let _ = send_not_joined(&mut sender, Some(request_id)).await;
+                            continue;
+                        };
+
+                        // P2P ICE candidate 复用浏览器结构，但只进入目标成员的信令队列。
+                        let result = state
+                            .rooms
+                            .validate_p2p_target(room_id, member_id, &target_member_id)
+                            .and_then(|()| {
+                                state.signals.send_to_member(
+                                    room_id,
+                                    &target_member_id,
+                                    ServerSignal::P2pIceCandidate {
+                                        from_member_id: member_id.to_string(),
+                                        candidate,
+                                    },
+                                )
+                            });
+                        if let Err(error) = result {
+                            let _ = send_error(
+                                &mut sender,
+                                Some(request_id),
+                                p2p_signal_error(error),
+                            ).await;
+                        }
+                    }
+                    ClientSignal::P2pConnectionFailed { request_id, target_member_id, reason: _reason } => {
+                        let Some((room_id, member_id)) = joined_pair(&joined_room_id, &joined_member_id) else {
+                            let _ = send_not_joined(&mut sender, Some(request_id)).await;
+                            continue;
+                        };
+
+                        // P2P 失败只切换这一对成员的路由，并广播规范化成员对给前端清理连接。
+                        let result = state
+                            .rooms
+                            .validate_p2p_target(room_id, member_id, &target_member_id)
+                            .and_then(|()| state.signals.ensure_member_registered(room_id, &target_member_id))
+                            .and_then(|()| {
+                                state.rooms.mark_p2p_connection_failed(
+                                    room_id,
+                                    member_id,
+                                    &target_member_id,
+                                )
+                            });
+                        match result {
+                            Ok(update) => {
+                                let _ = state.signals.broadcast(
+                                    room_id,
+                                    ServerSignal::MediaRouteUpdated {
+                                        member_ids: update.member_ids,
+                                        route: update.route,
+                                        reason: update.reason,
+                                    },
+                                    None,
+                                );
+                            }
+                            Err(error) => {
+                                let _ = send_error(
+                                    &mut sender,
+                                    Some(request_id),
+                                    p2p_signal_error(error),
+                                ).await;
+                            }
+                        }
+                    }
                 }
             }
             outgoing = async {
@@ -1273,6 +1488,16 @@ fn renegotiation_signal_for_event(
     }
 }
 
+fn p2p_signal_error(error: Error) -> Error {
+    match error {
+        // P2P 目标校验对客户端只暴露“当前信令无效”，避免泄漏跨房间成员存在性。
+        Error::MemberNotFound => {
+            Error::InvalidMessage("目标成员不存在或不在当前房间，不能发送 P2P 信令".to_string())
+        }
+        other => other,
+    }
+}
+
 async fn send_not_joined(
     sender: &mut SplitSink<WebSocket, Message>,
     request_id: Option<String>,
@@ -1325,6 +1550,7 @@ mod tests {
     };
     use crate::{
         Error,
+        domain::room::{MediaRoute, MediaRouteReason},
         media::{IceCandidate, MediaEvent},
     };
     use tokio::sync::mpsc::error::TryRecvError;
@@ -1385,6 +1611,28 @@ mod tests {
                 candidate
             } if request_id.as_deref() == Some("ice-1")
                 && candidate.candidate == "candidate:abc"
+                && candidate.sdp_mid.as_deref() == Some("0")
+                && candidate.sdp_mline_index == Some(0)
+                && candidate.username_fragment.as_deref() == Some("ufrag")
+        ));
+    }
+
+    #[test]
+    fn 客户端_p2p_ice_candidate_按浏览器结构解析() {
+        let signal: ClientSignal = serde_json::from_str(
+            r#"{"type":"p2p_ice_candidate","request_id":"p2p-ice-1","target_member_id":"m_target","candidate":{"candidate":"candidate:p2p","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"ufrag"}}"#,
+        )
+        .expect("解析 P2P ICE candidate");
+
+        assert!(matches!(
+            signal,
+            ClientSignal::P2pIceCandidate {
+                request_id,
+                target_member_id,
+                candidate
+            } if request_id == "p2p-ice-1"
+                && target_member_id == "m_target"
+                && candidate.candidate == "candidate:p2p"
                 && candidate.sdp_mid.as_deref() == Some("0")
                 && candidate.sdp_mline_index == Some(0)
                 && candidate.username_fragment.as_deref() == Some("ufrag")
@@ -1461,6 +1709,34 @@ mod tests {
         assert_eq!(json["candidate"]["sdpMid"], "0");
         assert_eq!(json["candidate"]["sdpMLineIndex"], 0);
         assert_eq!(json["candidate"]["usernameFragment"], "ufrag");
+    }
+
+    #[test]
+    fn 服务端_p2p_offer_序列化为真实发送者() {
+        let json = serde_json::to_value(ServerSignal::P2pOffer {
+            from_member_id: "m_sender".to_string(),
+            sdp: "v=0\r\n".to_string(),
+        })
+        .expect("序列化 P2P offer");
+
+        assert_eq!(json["type"], "p2p_offer");
+        assert_eq!(json["from_member_id"], "m_sender");
+        assert_eq!(json["sdp"], "v=0\r\n");
+    }
+
+    #[test]
+    fn 服务端_media_route_updated_序列化为蛇形状态() {
+        let json = serde_json::to_value(ServerSignal::MediaRouteUpdated {
+            member_ids: vec!["m_a".to_string(), "m_b".to_string()],
+            route: MediaRoute::Sfu,
+            reason: MediaRouteReason::P2pFailed,
+        })
+        .expect("序列化媒体路由更新");
+
+        assert_eq!(json["type"], "media_route_updated");
+        assert_eq!(json["member_ids"], serde_json::json!(["m_a", "m_b"]));
+        assert_eq!(json["route"], "sfu");
+        assert_eq!(json["reason"], "p2p_failed");
     }
 
     #[test]
@@ -1544,6 +1820,75 @@ mod tests {
         assert!(matches!(
             member_c.try_recv(),
             Ok(ServerSignal::RoomClosed { room_id }) if room_id == "room-1"
+        ));
+    }
+
+    #[test]
+    fn 信令中心_send_to_member_只发送给目标成员() {
+        let hub = SignalHub::new();
+        let mut member_a = hub.register("room-1", "a").expect("注册成员 A");
+        let mut member_b = hub.register("room-1", "b").expect("注册成员 B");
+
+        hub.send_to_member(
+            "room-1",
+            "b",
+            ServerSignal::P2pOffer {
+                from_member_id: "a".to_string(),
+                sdp: "v=0\r\n".to_string(),
+            },
+        )
+        .expect("定向发送 P2P offer");
+
+        assert!(matches!(member_a.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(
+            member_b.try_recv(),
+            Ok(ServerSignal::P2pOffer { from_member_id, sdp })
+                if from_member_id == "a" && sdp == "v=0\r\n"
+        ));
+    }
+
+    #[test]
+    fn 信令中心_send_to_member_目标队列失败后移除成员() {
+        let hub = SignalHub::new();
+        let _member = hub.register("room-1", "target").expect("注册目标成员");
+
+        for index in 0..SIGNAL_QUEUE_CAPACITY {
+            hub.send_to_member(
+                "room-1",
+                "target",
+                ServerSignal::IceCandidate {
+                    candidate: test_candidate(&format!("candidate-{index}")),
+                },
+            )
+            .expect("填满目标队列前发送成功");
+        }
+
+        let error = hub
+            .send_to_member(
+                "room-1",
+                "target",
+                ServerSignal::IceCandidate {
+                    candidate: test_candidate("overflow"),
+                },
+            )
+            .expect_err("队列满时定向发送失败");
+        assert!(matches!(error, Error::InvalidMessage(_)));
+
+        let mut replacement = hub
+            .register("room-1", "target")
+            .expect("队列失败后成员已从信令中心移除，可以重新注册");
+        hub.send_to_member(
+            "room-1",
+            "target",
+            ServerSignal::IceCandidate {
+                candidate: test_candidate("after-remove"),
+            },
+        )
+        .expect("重新注册后可以定向发送");
+
+        assert!(matches!(
+            replacement.try_recv(),
+            Ok(ServerSignal::IceCandidate { candidate }) if candidate.candidate == "after-remove"
         ));
     }
 
