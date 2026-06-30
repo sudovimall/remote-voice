@@ -86,8 +86,12 @@ test("video call signals start and stop camera publishing", () => {
 
 test("websocket url tracks the current page protocol", () => {
   assert.equal(
-    websocketUrl({ href: "http://127.0.0.1:8080/rooms/ABC123", protocol: "http:" }),
-    "ws://127.0.0.1:8080/ws",
+    websocketUrl({ href: "http://127.0.0.1:18080/rooms/ABC123", protocol: "http:" }),
+    "ws://127.0.0.1:18080/ws",
+  );
+  assert.equal(
+    websocketUrl({ href: "http://127.0.0.1:5173/rooms/ABC123", protocol: "http:" }),
+    "ws://127.0.0.1:5173/ws",
   );
   assert.equal(
     websocketUrl({ href: "https://voice.example/rooms/ABC123", protocol: "https:" }),

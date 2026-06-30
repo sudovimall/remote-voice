@@ -31,6 +31,6 @@ COPY application.yaml ./application.yaml
 # unprivileged identity avoids coupling the runtime to base image accounts.
 USER 10001:10001
 
-EXPOSE 8080
+EXPOSE 18080
 
 CMD ["voice"]

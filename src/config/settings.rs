@@ -409,7 +409,7 @@ pub fn init_config() -> Result<Settings> {
         Ok(path) => std::fs::read_to_string(path)?,
         Err(_) => std::fs::read_to_string("application.yaml").unwrap_or_else(|_| {
             r#"
-            port: 8080
+            port: 18080
             room:
               max_members: 8
               chat_history_limit: 100

@@ -25,13 +25,13 @@ cargo run
 默认访问：
 
 ```text
-http://127.0.0.1:8080
+http://127.0.0.1:18080
 ```
 
 配置文件为 `application.yaml`：
 
 ```yaml
-port: 8080
+port: 18080
 room:
   max_members: 8
   disconnect_grace_seconds: 30
@@ -41,6 +41,25 @@ media:
 ```
 
 修改 `auth.enabled`、管理员密码哈希、session cookie 或 SQLite 路径后需要重启后端才会生效。关闭认证不会删除已有 SQLite 用户、session、邀请码或持久房间数据，再次开启认证时会继续使用同一个数据库。
+
+Vue 开发态联调时先启动 Rust 后端，再启动 Vite：
+
+```bash
+cargo run
+npm run dev:frontend
+```
+
+随后访问：
+
+```text
+http://127.0.0.1:5173/
+```
+
+Vite 会把 `/api` 和 `/ws` 代理到 `http://127.0.0.1:18080`。如果后端监听了其他地址，可以用 `REMOTE_VOICE_BACKEND_ORIGIN` 覆盖：
+
+```bash
+REMOTE_VOICE_BACKEND_ORIGIN=http://127.0.0.1:19090 npm run dev:frontend
+```
 
 如果服务部署在云厂商公网 IP 到实例私网 IP 的 NAT 后面，还要配置对外发布的公网 IP：
 
@@ -57,7 +76,7 @@ media:
 
 Docker 部署由两个服务组成：
 
-- `voice`：Rust 服务，使用 host network，监听宿主机 `8080`。
+- `voice`：Rust 服务，使用 host network，监听宿主机 `18080`。
 - `nginx`：HTTPS 入口和 WebSocket 反向代理。
 
 `voice` 使用 host network 是为了让 WebRTC 后端发布宿主机可达的 ICE 地址和 UDP 媒体 socket。不要把它改回普通 Docker bridge 网络，否则局域网其他设备可能只能拿到容器内网 candidate，页面和 WebSocket 正常但媒体协商失败。
@@ -85,7 +104,7 @@ docker compose up --build -d
 | --- | --- | --- | --- |
 | HTTP 跳转 HTTPS | `80` | `80` | TCP |
 | HTTPS 页面和 WSS | `10000` | `443` | TCP |
-| Rust 服务内部入口 | `8080` | host network | TCP |
+| Rust 服务内部入口 | `18080` | host network | TCP |
 | WebRTC 媒体端口范围 | `40000-40100` | host network | UDP |
 
 访问示例：
@@ -95,7 +114,7 @@ https://127.0.0.1:10000
 https://<宿主机局域网 IP>:10000
 ```
 
-Nginx 会把普通页面请求和 `/ws` WebSocket 请求转发到宿主机 `8080` 上的 Rust 服务。
+Nginx 会把普通页面请求和 `/ws` WebSocket 请求转发到宿主机 `18080` 上的 Rust 服务。
 
 ### 3. 防火墙和媒体 UDP 端口
 
