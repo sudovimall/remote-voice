@@ -75,7 +75,9 @@ impl RoomLifecycleService {
         resume_token: &str,
     ) -> Result<RoomJoin> {
         let join = self.rooms.resume_room(room_id, member_id, resume_token)?;
-        self.authenticated_rooms.touch_if_persistent(room_id)?;
+        // 恢复成员已经把运行时状态标为在线；持久房间活跃时间刷新失败不能阻断信令注册，
+        // 否则会留下“在线但无 WebSocket”的成员，破坏断线恢复兼容性。
+        let _ = self.authenticated_rooms.touch_if_persistent(room_id);
         Ok(join)
     }
 
