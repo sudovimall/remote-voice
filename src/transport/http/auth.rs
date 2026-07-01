@@ -1,10 +1,6 @@
 use crate::{
     Error, Result,
-    auth::{
-        CurrentUser,
-        model::{AuthenticatedSession, PersistentRoomView},
-        session::now_epoch_seconds,
-    },
+    auth::{CurrentUser, model::AuthenticatedSession, session::now_epoch_seconds},
     config::settings::SessionSecureSetting,
     state::AppState,
 };
@@ -179,14 +175,10 @@ async fn list_users(State(state): State<AppState>, headers: HeaderMap) -> Result
 
 async fn list_admin_rooms(State(state): State<AppState>, headers: HeaderMap) -> Result<Response> {
     let user = api_user(&state, &headers)?;
-    let service = auth_service(&state)?;
-    service.require_admin(&user)?;
-    let rooms = service
-        .store()
-        .list_open_persistent_rooms()?
-        .into_iter()
-        .map(PersistentRoomView::from)
-        .collect::<Vec<_>>();
+    let rooms = state
+        .services
+        .authenticated_rooms
+        .list_open_for_admin(&user)?;
     Ok(Json(rooms).into_response())
 }
 
@@ -196,11 +188,10 @@ async fn close_admin_room(
     Path(room_id): Path<String>,
 ) -> Result<Response> {
     let user = api_user(&state, &headers)?;
-    let service = auth_service(&state)?;
-    service.require_admin(&user)?;
-    service
-        .store()
-        .close_persistent_room(&room_id, now_epoch_seconds())?;
+    state
+        .services
+        .authenticated_rooms
+        .close_as_admin(&user, &room_id)?;
 
     if state.rooms.close_room(&room_id).is_ok() {
         let _ = state.signals.broadcast(

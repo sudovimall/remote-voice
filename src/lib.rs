@@ -4,6 +4,7 @@ pub mod config;
 pub mod domain;
 pub mod error;
 pub mod media;
+pub mod service;
 pub mod state;
 pub mod storage;
 pub mod transport;

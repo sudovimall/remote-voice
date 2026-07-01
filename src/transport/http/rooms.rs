@@ -1,5 +1,5 @@
 use crate::{
-    Error, Result,
+    Result,
     domain::room::{Room, RoomSummary},
     state::AppState,
 };
@@ -32,10 +32,9 @@ async fn list_rooms(
     headers: HeaderMap,
 ) -> Result<Json<Vec<RoomSummary>>> {
     if state.auth.is_enabled() {
-        super::auth::api_user(&state, &headers)?;
+        let _user = super::auth::api_user(&state, &headers)?;
         let mut summaries = state.rooms.list_room_summaries()?;
-        let service = state.auth.service().ok_or(Error::AuthDisabled)?;
-        for persistent in service.store().list_open_persistent_rooms()? {
+        for persistent in state.services.authenticated_rooms.list_open()? {
             if summaries
                 .iter()
                 .any(|summary| summary.id == persistent.room_id)

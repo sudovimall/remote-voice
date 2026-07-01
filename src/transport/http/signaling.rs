@@ -1,8 +1,9 @@
 use crate::{
     Error, Result,
-    auth::{CurrentUser, session::now_epoch_seconds},
-    domain::room::{ChatMention, ChatMessage, MediaRoute, MediaRouteReason, MemberRole, Room},
+    auth::CurrentUser,
+    domain::room::{ChatMention, ChatMessage, MediaRoute, MediaRouteReason, Room},
     media::{IceCandidate, MediaEvent},
+    service::media_route::P2pForwardKind,
     state::AppState,
 };
 use axum::{
@@ -433,7 +434,11 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             continue;
                         }
 
-                        let join = match state.rooms.create_room(nickname) {
+                        let join = match state
+                            .services
+                            .room_lifecycle
+                            .create_room(nickname, current_user.as_ref())
+                        {
                             Ok(join) => join,
                             Err(error) => {
                                 let _ = send_error(&mut sender, Some(request_id), error).await;
@@ -443,23 +448,13 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
 
                         let room_id = join.room.id.clone();
                         let member_id = join.member.id.clone();
-                        if let Some(user) = &current_user {
-                            if let Some(service) = state.auth.service() {
-                                if let Err(error) = service.store().create_persistent_room(
-                                    &room_id,
-                                    user.id,
-                                    now_epoch_seconds(),
-                                ) {
-                                    let _ = state.rooms.leave_room(&room_id, &member_id);
-                                    let _ = send_error(&mut sender, Some(request_id), error).await;
-                                    continue;
-                                }
-                            }
-                        }
                         let room_receiver = match state.signals.register(&room_id, &member_id) {
                             Ok(receiver) => receiver,
                             Err(error) => {
-                                let _ = state.rooms.leave_room(&room_id, &member_id);
+                                state
+                                    .services
+                                    .room_lifecycle
+                                    .rollback_join_after_register_failure(&room_id, &member_id);
                                 close_persistent_room_for_owner_if_enabled(
                                     &state,
                                     &room_id,
@@ -493,12 +488,11 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             continue;
                         }
 
-                        let join = match join_room_for_current_user(
-                            &state,
-                            current_user.as_ref(),
-                            &room_id,
-                            nickname,
-                        ) {
+                        let join = match state
+                            .services
+                            .room_lifecycle
+                            .join_room(&room_id, nickname, current_user.as_ref())
+                        {
                             Ok(join) => join,
                             Err(error) => {
                                 let _ = send_error(&mut sender, Some(request_id), error).await;
@@ -510,11 +504,10 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                         let room_receiver = match state.signals.register(&room_id, &member_id) {
                             Ok(receiver) => receiver,
                             Err(error) => {
-                                if let Ok(room) = state.rooms.leave_room(&room_id, &member_id) {
-                                    if room.members.is_empty() {
-                                        let _ = state.rooms.close_room(&room_id);
-                                    }
-                                }
+                                state
+                                    .services
+                                    .room_lifecycle
+                                    .rollback_join_after_register_failure(&room_id, &member_id);
                                 let _ = send_error(&mut sender, Some(request_id), error).await;
                                 continue;
                             }
@@ -530,7 +523,7 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             member_id: member_id.clone(),
                             resume_token: join.resume_token,
                             not_listening_member_ids: join.member.not_listening_member_ids(),
-                            chat_messages: state.rooms.chat_history(&room_id).unwrap_or_default(),
+                            chat_messages: state.services.room_lifecycle.chat_history(&room_id),
                         }).await;
 
                         let _ = state.signals.broadcast(
@@ -552,7 +545,11 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             continue;
                         }
 
-                        let join = match state.rooms.resume_room(&room_id, &member_id, &resume_token) {
+                        let join = match state
+                            .services
+                            .room_lifecycle
+                            .resume_room(&room_id, &member_id, &resume_token)
+                        {
                             Ok(join) => join,
                             Err(error) => {
                                 let _ = send_error(&mut sender, Some(request_id), error).await;
@@ -578,7 +575,7 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             member_id: member_id.clone(),
                             resume_token: join.resume_token,
                             not_listening_member_ids: join.member.not_listening_member_ids(),
-                            chat_messages: state.rooms.chat_history(&room_id).unwrap_or_default(),
+                            chat_messages: state.services.room_lifecycle.chat_history(&room_id),
                         }).await;
 
                         let _ = state.signals.broadcast(
@@ -605,21 +602,21 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             continue;
                         };
 
-                        match state.rooms.set_self_muted(room_id, member_id, self_muted) {
-                            Ok(room) => {
+                        match state.services.member_controls.set_self_muted(room_id, member_id, self_muted) {
+                            Ok(outcome) => {
                                 let _ = state.signals.broadcast(
                                     room_id,
                                     ServerSignal::MemberUpdated {
-                                        room,
-                                        member_id: member_id.to_string(),
+                                        room: outcome.room,
+                                        member_id: outcome.member_id.clone(),
                                     },
                                     None,
                                 );
-                                if self_muted {
+                                if outcome.force_speaking_false {
                                     let _ = state.signals.broadcast(
                                         room_id,
                                         ServerSignal::MemberSpeakingUpdated {
-                                            member_id: member_id.to_string(),
+                                            member_id: outcome.member_id,
                                             speaking: false,
                                         },
                                         None,
@@ -637,26 +634,26 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             continue;
                         };
 
-                        match state.rooms.set_member_can_speak(room_id, actor_member_id, &member_id, can_speak) {
-                            Ok(room) => {
-                                // 房间层是权限真源；媒体层只消费当前值决定是否转发上行 RTP。
-                                let _ = state
-                                    .media
-                                    .set_member_can_speak(room_id, &member_id, can_speak)
-                                    .await;
+                        match state
+                            .services
+                            .member_controls
+                            .set_member_can_speak(room_id, actor_member_id, &member_id, can_speak)
+                            .await
+                        {
+                            Ok(outcome) => {
                                 let _ = state.signals.broadcast(
                                     room_id,
                                     ServerSignal::MemberUpdated {
-                                        room,
-                                        member_id: member_id.clone(),
+                                        room: outcome.room,
+                                        member_id: outcome.member_id.clone(),
                                     },
                                     None,
                                 );
-                                if !can_speak {
+                                if outcome.force_speaking_false {
                                     let _ = state.signals.broadcast(
                                         room_id,
                                         ServerSignal::MemberSpeakingUpdated {
-                                            member_id,
+                                            member_id: outcome.member_id,
                                             speaking: false,
                                         },
                                         None,
@@ -675,30 +672,28 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                         };
 
                         match state
-                            .rooms
-                            .set_member_listening(room_id, listener_member_id, &member_id, listening)
+                            .services
+                            .member_controls
+                            .set_member_listening(
+                                room_id,
+                                listener_member_id,
+                                &member_id,
+                                listening,
+                                request_id.clone(),
+                            )
+                            .await
                         {
-                            Ok(listening_state) => {
-                                match state
-                                    .media
-                                    .set_member_listening(room_id, listener_member_id, &member_id, listening)
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        let _ = send_json(
-                                            &mut sender,
-                                            &ServerSignal::MemberListeningUpdated {
-                                                request_id,
-                                                not_listening_member_ids: listening_state
-                                                    .not_listening_member_ids,
-                                            },
-                                        )
-                                        .await;
-                                    }
-                                    Err(error) => {
-                                        let _ = send_error(&mut sender, request_id, error).await;
-                                    }
-                                }
+                            Ok(outcome) => {
+                                let _ = send_json(
+                                    &mut sender,
+                                    &ServerSignal::MemberListeningUpdated {
+                                        request_id: outcome.request_id,
+                                        not_listening_member_ids: outcome
+                                            .state
+                                            .not_listening_member_ids,
+                                    },
+                                )
+                                .await;
                             }
                             Err(error) => {
                                 let _ = send_error(&mut sender, request_id, error).await;
@@ -712,11 +707,9 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                         };
 
                         let speaking = state
-                            .rooms
-                            .get_room(room_id)
-                            .ok()
-                            .and_then(|room| room.members.get(member_id).cloned())
-                            .is_some_and(|member| speaking && member.can_speak && !member.self_muted);
+                            .services
+                            .member_controls
+                            .normalized_speaking(room_id, member_id, speaking);
                         let _ = state.signals.broadcast(
                             room_id,
                             ServerSignal::MemberSpeakingUpdated {
@@ -731,16 +724,18 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             let _ = send_not_joined(&mut sender, request_id).await;
                             continue;
                         };
-                        if !server_ms.is_finite() || server_ms < 0.0 {
-                            let _ = send_error(
-                                &mut sender,
-                                request_id,
-                                Error::InvalidMessage("成员延迟必须是非负毫秒数".to_string()),
-                            )
-                            .await;
-                            continue;
-                        }
-
+                        let server_ms = match state.services.member_controls.validate_latency(server_ms) {
+                            Ok(server_ms) => server_ms,
+                            Err(error) => {
+                                let _ = send_error(
+                                    &mut sender,
+                                    request_id,
+                                    error,
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
                         let _ = state.signals.broadcast(
                             room_id,
                             ServerSignal::MemberLatencyUpdated {
@@ -756,7 +751,12 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             continue;
                         };
 
-                        match state.media.set_screen_viewing(room_id, member_id, viewing).await {
+                        match state
+                            .services
+                            .media_routes
+                            .set_screen_viewing(room_id, member_id, viewing)
+                            .await
+                        {
                             Ok(viewer_count) => {
                                 broadcast_screen_viewer_count(
                                     &state,
@@ -776,19 +776,25 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             continue;
                         };
 
-                        match state.rooms.send_chat_message(room_id, member_id, &content, mentions) {
-                            Ok(message) => {
+                        match state.services.chat.send_message(
+                            room_id,
+                            member_id,
+                            &content,
+                            mentions,
+                            request_id.clone(),
+                        ) {
+                            Ok(outcome) => {
                                 let _ = send_json(
                                     &mut sender,
                                     &ServerSignal::ChatMessageSent {
-                                        request_id,
-                                        message: message.clone(),
+                                        request_id: outcome.request_id,
+                                        message: outcome.message.clone(),
                                     },
                                 )
                                 .await;
                                 let _ = state.signals.broadcast(
                                     room_id,
-                                    ServerSignal::ChatMessage { message },
+                                    ServerSignal::ChatMessage { message: outcome.message },
                                     Some(member_id),
                                 );
                             }
@@ -803,17 +809,14 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             continue;
                         };
 
-                        match state.rooms.start_screen_share(room_id, member_id) {
-                            Ok(room) => {
-                                if let Some(screen_share) = room.screen_share {
-                                    if let Err(error) = state
-                                        .media
-                                        .set_screen_share_owner(room_id, Some(&screen_share.member_id))
-                                        .await
-                                    {
-                                        let _ = send_error(&mut sender, request_id, error).await;
-                                        continue;
-                                    }
+                        match state
+                            .services
+                            .media_routes
+                            .start_screen_share(room_id, member_id)
+                            .await
+                        {
+                            Ok(outcome) => {
+                                if let Some(screen_share) = outcome.screen_share {
                                     let _ = state.signals.broadcast(
                                         room_id,
                                         ServerSignal::ScreenShareStarted {
@@ -822,9 +825,8 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                                         },
                                         None,
                                     );
-                                    let viewer_count = state.media.screen_viewer_count(room_id).await;
-                                    if viewer_count > 0 {
-                                        broadcast_screen_viewer_count(&state, room_id, viewer_count).await;
+                                    if outcome.viewer_count > 0 {
+                                        broadcast_screen_viewer_count(&state, room_id, outcome.viewer_count).await;
                                     }
                                 }
                             }
@@ -839,15 +841,14 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             continue;
                         };
 
-                        let stopped_member_id = state
-                            .rooms
-                            .get_room(room_id)
-                            .ok()
-                            .and_then(|room| room.screen_share.map(|screen_share| screen_share.member_id));
-                        match state.rooms.stop_screen_share(room_id, member_id) {
-                            Ok(_room) => {
-                                if let Some(stopped_member_id) = stopped_member_id {
-                                    let _ = state.media.set_screen_share_owner(room_id, None).await;
+                        match state
+                            .services
+                            .media_routes
+                            .stop_screen_share(room_id, member_id)
+                            .await
+                        {
+                            Ok(outcome) => {
+                                if let Some(stopped_member_id) = outcome.stopped_member_id {
                                     let _ = state.signals.broadcast(
                                         room_id,
                                         ServerSignal::ScreenShareStopped {
@@ -869,37 +870,29 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             continue;
                         };
 
-                        match state.rooms.start_video_call(room_id, member_id) {
-                            Ok(room) => {
-                                let publisher = room.video_call_publishers.get(member_id).cloned();
-                                match state
-                                    .media
-                                    .set_video_call_publisher(room_id, member_id, true)
-                                    .await
-                                {
-                                    Ok(publisher_count) => {
-                                        if let Some(publisher) = publisher {
-                                            let _ = state.signals.broadcast(
-                                                room_id,
-                                                ServerSignal::VideoCallStarted {
-                                                    member_id: publisher.member_id,
-                                                    nickname: publisher.nickname,
-                                                },
-                                                None,
-                                            );
-                                        }
-                                        broadcast_video_call_publisher_count(
-                                            &state,
-                                            room_id,
-                                            publisher_count,
-                                        )
-                                        .await;
-                                    }
-                                    Err(error) => {
-                                        let _ = state.rooms.stop_video_call(room_id, member_id);
-                                        let _ = send_error(&mut sender, request_id, error).await;
-                                    }
+                        match state
+                            .services
+                            .media_routes
+                            .start_video_call(room_id, member_id)
+                            .await
+                        {
+                            Ok(outcome) => {
+                                if let Some(publisher) = outcome.publisher {
+                                    let _ = state.signals.broadcast(
+                                        room_id,
+                                        ServerSignal::VideoCallStarted {
+                                            member_id: publisher.member_id,
+                                            nickname: publisher.nickname,
+                                        },
+                                        None,
+                                    );
                                 }
+                                broadcast_video_call_publisher_count(
+                                    &state,
+                                    room_id,
+                                    outcome.publisher_count,
+                                )
+                                .await;
                             }
                             Err(error) => {
                                 let _ = send_error(&mut sender, request_id, error).await;
@@ -912,38 +905,27 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             continue;
                         };
 
-                        let was_publishing = state
-                            .rooms
-                            .get_room(room_id)
-                            .ok()
-                            .is_some_and(|room| room.video_call_publishers.contains_key(member_id));
-                        match state.rooms.stop_video_call(room_id, member_id) {
-                            Ok(_room) => {
-                                match state
-                                    .media
-                                    .set_video_call_publisher(room_id, member_id, false)
-                                    .await
-                                {
-                                    Ok(publisher_count) => {
-                                        if was_publishing {
-                                            let _ = state.signals.broadcast(
-                                                room_id,
-                                                ServerSignal::VideoCallStopped {
-                                                    member_id: member_id.to_string(),
-                                                },
-                                                None,
-                                            );
-                                            broadcast_video_call_publisher_count(
-                                                &state,
-                                                room_id,
-                                                publisher_count,
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                    Err(error) => {
-                                        let _ = send_error(&mut sender, request_id, error).await;
-                                    }
+                        match state
+                            .services
+                            .media_routes
+                            .stop_video_call(room_id, member_id)
+                            .await
+                        {
+                            Ok(outcome) => {
+                                if outcome.stopped {
+                                    let _ = state.signals.broadcast(
+                                        room_id,
+                                        ServerSignal::VideoCallStopped {
+                                            member_id: member_id.to_string(),
+                                        },
+                                        None,
+                                    );
+                                    broadcast_video_call_publisher_count(
+                                        &state,
+                                        room_id,
+                                        outcome.publisher_count,
+                                    )
+                                    .await;
                                 }
                             }
                             Err(error) => {
@@ -958,7 +940,12 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                         };
 
                         // SFU 模式下 offer 只交给后端媒体层；answer 和本地 ICE 再回给同一个 socket。
-                        match state.media.handle_offer(room_id, member_id, sdp).await {
+                        match state
+                            .services
+                            .media_routes
+                            .handle_sfu_offer(room_id, member_id, sdp)
+                            .await
+                        {
                             Ok(answer) => {
                                 local_ice_candidates = Some(answer.local_ice_candidates);
                                 let _ = send_json(
@@ -991,8 +978,9 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
 
                         // 这是浏览器发给后端 PeerConnection 的远端 candidate，不会广播给其他成员。
                         if let Err(error) = state
-                            .media
-                            .add_ice_candidate(room_id, member_id, candidate)
+                            .services
+                            .media_routes
+                            .add_sfu_ice_candidate(room_id, member_id, candidate)
                             .await
                         {
                             let _ = send_error(&mut sender, request_id, error).await;
@@ -1006,15 +994,24 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
 
                         // P2P offer 只校验并定向转发给目标成员，SFU 媒体层不参与浏览器间协商。
                         let result = state
-                            .rooms
-                            .validate_p2p_target(room_id, member_id, &target_member_id)
-                            .and_then(|()| {
+                            .services
+                            .media_routes
+                            .forward_p2p_signal(
+                                room_id,
+                                member_id,
+                                &target_member_id,
+                                P2pForwardKind::Offer { sdp },
+                            )
+                            .and_then(|outcome| {
                                 state.signals.send_to_member(
                                     room_id,
-                                    &target_member_id,
+                                    &outcome.target_member_id,
                                     ServerSignal::P2pOffer {
-                                        from_member_id: member_id.to_string(),
-                                        sdp,
+                                        from_member_id: outcome.from_member_id,
+                                        sdp: match outcome.kind {
+                                            P2pForwardKind::Offer { sdp } => sdp,
+                                            _ => unreachable!("P2P offer outcome kind"),
+                                        },
                                     },
                                 )
                             });
@@ -1022,7 +1019,7 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             let _ = send_error(
                                 &mut sender,
                                 Some(request_id),
-                                p2p_signal_error(error),
+                                error,
                             ).await;
                         }
                     }
@@ -1034,15 +1031,24 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
 
                         // P2P answer 只回到发起 offer 的成员，避免泄露给房间内其他连接。
                         let result = state
-                            .rooms
-                            .validate_p2p_target(room_id, member_id, &target_member_id)
-                            .and_then(|()| {
+                            .services
+                            .media_routes
+                            .forward_p2p_signal(
+                                room_id,
+                                member_id,
+                                &target_member_id,
+                                P2pForwardKind::Answer { sdp },
+                            )
+                            .and_then(|outcome| {
                                 state.signals.send_to_member(
                                     room_id,
-                                    &target_member_id,
+                                    &outcome.target_member_id,
                                     ServerSignal::P2pAnswer {
-                                        from_member_id: member_id.to_string(),
-                                        sdp,
+                                        from_member_id: outcome.from_member_id,
+                                        sdp: match outcome.kind {
+                                            P2pForwardKind::Answer { sdp } => sdp,
+                                            _ => unreachable!("P2P answer outcome kind"),
+                                        },
                                     },
                                 )
                             });
@@ -1050,7 +1056,7 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             let _ = send_error(
                                 &mut sender,
                                 Some(request_id),
-                                p2p_signal_error(error),
+                                error,
                             ).await;
                         }
                     }
@@ -1062,15 +1068,24 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
 
                         // P2P ICE candidate 复用浏览器结构，但只进入目标成员的信令队列。
                         let result = state
-                            .rooms
-                            .validate_p2p_target(room_id, member_id, &target_member_id)
-                            .and_then(|()| {
+                            .services
+                            .media_routes
+                            .forward_p2p_signal(
+                                room_id,
+                                member_id,
+                                &target_member_id,
+                                P2pForwardKind::IceCandidate { candidate },
+                            )
+                            .and_then(|outcome| {
                                 state.signals.send_to_member(
                                     room_id,
-                                    &target_member_id,
+                                    &outcome.target_member_id,
                                     ServerSignal::P2pIceCandidate {
-                                        from_member_id: member_id.to_string(),
-                                        candidate,
+                                        from_member_id: outcome.from_member_id,
+                                        candidate: match outcome.kind {
+                                            P2pForwardKind::IceCandidate { candidate } => candidate,
+                                            _ => unreachable!("P2P candidate outcome kind"),
+                                        },
                                     },
                                 )
                             });
@@ -1078,7 +1093,7 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                             let _ = send_error(
                                 &mut sender,
                                 Some(request_id),
-                                p2p_signal_error(error),
+                                error,
                             ).await;
                         }
                     }
@@ -1090,11 +1105,16 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
 
                         // P2P 失败只切换这一对成员的路由，并广播规范化成员对给前端清理连接。
                         let result = state
-                            .rooms
-                            .validate_p2p_target(room_id, member_id, &target_member_id)
+                            .services
+                            .media_routes
+                            .validate_p2p_target(
+                                room_id,
+                                member_id,
+                                &target_member_id,
+                            )
                             .and_then(|()| state.signals.ensure_member_registered(room_id, &target_member_id))
                             .and_then(|()| {
-                                state.rooms.mark_p2p_connection_failed(
+                                state.services.media_routes.report_p2p_failure(
                                     room_id,
                                     member_id,
                                     &target_member_id,
@@ -1116,7 +1136,7 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                                 let _ = send_error(
                                     &mut sender,
                                     Some(request_id),
-                                    p2p_signal_error(error),
+                                    error,
                                 ).await;
                             }
                         }
@@ -1347,71 +1367,18 @@ fn close_persistent_room_for_owner_if_enabled(
     room_id: &str,
     current_user: Option<&CurrentUser>,
 ) {
-    let Some(service) = state.auth.service() else {
-        return;
-    };
-    let Some(current_user) = current_user else {
+    if state.auth.is_enabled() && current_user.is_none() {
         error!(room_id, "认证开启但房主连接缺少用户身份，跳过持久房间关闭");
         return;
-    };
-
-    match service.store().find_persistent_room(room_id) {
-        Ok(Some(persistent)) if persistent.owner_user_id == current_user.id => {
-            if let Err(error) = service
-                .store()
-                .close_persistent_room(room_id, now_epoch_seconds())
-            {
-                error!(room_id, %error, "关闭持久房间失败");
-            }
-        }
-        Ok(_) => {}
-        Err(error) => {
-            error!(room_id, %error, "查询持久房间失败");
-        }
-    }
-}
-
-fn join_room_for_current_user(
-    state: &AppState,
-    current_user: Option<&CurrentUser>,
-    room_id: &str,
-    nickname: String,
-) -> Result<crate::domain::room::RoomJoin> {
-    let Some(user) = current_user else {
-        return state.rooms.join_room(room_id, nickname);
-    };
-    if !state.auth.is_enabled() {
-        return state.rooms.join_room(room_id, nickname);
     }
 
-    let service = state.auth.service().ok_or(Error::AuthDisabled)?;
-    let Some(persistent) = service.store().find_persistent_room(room_id)? else {
-        return state.rooms.join_room(room_id, nickname);
-    };
-
-    if persistent.closed_at_epoch_seconds.is_some() {
-        return Err(Error::RoomClosed);
-    }
-
-    let role = if persistent.owner_user_id == user.id {
-        MemberRole::Owner
-    } else {
-        MemberRole::Member
-    };
-    let join = match state
-        .rooms
-        .join_room_with_role(room_id, nickname.clone(), role.clone())
+    if let Err(error) = state
+        .services
+        .authenticated_rooms
+        .close_as_owner_if_owned(room_id, current_user)
     {
-        Ok(join) => join,
-        Err(Error::RoomNotFound) => state
-            .rooms
-            .restore_room_with_member(room_id, nickname, role)?,
-        Err(error) => return Err(error),
-    };
-    service
-        .store()
-        .touch_persistent_room(room_id, now_epoch_seconds())?;
-    Ok(join)
+        error!(room_id, %error, "关闭持久房间失败");
+    }
 }
 
 async fn broadcast_screen_viewer_count(state: &AppState, room_id: &str, viewer_count: usize) {
@@ -1485,16 +1452,6 @@ fn renegotiation_signal_for_event(
             })
         }
         _ => None,
-    }
-}
-
-fn p2p_signal_error(error: Error) -> Error {
-    match error {
-        // P2P 目标校验对客户端只暴露“当前信令无效”，避免泄漏跨房间成员存在性。
-        Error::MemberNotFound => {
-            Error::InvalidMessage("目标成员不存在或不在当前房间，不能发送 P2P 信令".to_string())
-        }
-        other => other,
     }
 }
 
