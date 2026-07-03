@@ -384,6 +384,7 @@ export function useRoomSession() {
     media.syncEffectiveSelfMuted();
     media.renderVoiceState();
     media.syncVideoCallPublishers(room);
+    p2p.syncRemoteCameraPublishers(room);
     screenShare.syncScreenViewingState();
   }
 

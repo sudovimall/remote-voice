@@ -1439,21 +1439,34 @@ fn renegotiation_signal_for_event(
     joined_room_id: Option<&str>,
     joined_member_id: Option<&str>,
 ) -> Option<ServerSignal> {
+    let joined_member_id = joined_member_id?;
     match event {
-        MediaEvent::InboundAudioTrack { room_id, member_id }
-            if joined_room_id == Some(room_id.as_str())
-                && joined_member_id.is_some()
-                && joined_member_id != Some(member_id.as_str()) =>
+        MediaEvent::InboundAudioTrack {
+            room_id,
+            member_id,
+            subscriber_member_ids,
+        } if joined_room_id == Some(room_id.as_str())
+            && subscriber_member_ids
+                .iter()
+                .any(|member_id| member_id == joined_member_id) =>
         {
             Some(ServerSignal::RenegotiationNeeded {
                 member_id: member_id.clone(),
             })
         }
-        MediaEvent::InboundScreenVideoTrack { room_id, member_id }
-        | MediaEvent::InboundCameraVideoTrack { room_id, member_id }
-            if joined_room_id == Some(room_id.as_str())
-                && joined_member_id.is_some()
-                && joined_member_id != Some(member_id.as_str()) =>
+        MediaEvent::InboundScreenVideoTrack {
+            room_id,
+            member_id,
+            subscriber_member_ids,
+        }
+        | MediaEvent::InboundCameraVideoTrack {
+            room_id,
+            member_id,
+            subscriber_member_ids,
+        } if joined_room_id == Some(room_id.as_str())
+            && subscriber_member_ids
+                .iter()
+                .any(|member_id| member_id == joined_member_id) =>
         {
             Some(ServerSignal::RenegotiationNeeded {
                 member_id: member_id.clone(),
@@ -1746,6 +1759,7 @@ mod tests {
         let event = MediaEvent::InboundAudioTrack {
             room_id: "room-1".to_string(),
             member_id: "publisher-1".to_string(),
+            subscriber_member_ids: vec!["listener-1".to_string()],
         };
 
         assert!(matches!(
@@ -1757,6 +1771,9 @@ mod tests {
         );
         assert!(
             renegotiation_signal_for_event(&event, Some("room-2"), Some("listener-1")).is_none()
+        );
+        assert!(
+            renegotiation_signal_for_event(&event, Some("room-1"), Some("listener-2")).is_none()
         );
         assert!(renegotiation_signal_for_event(&event, None, None).is_none());
     }

@@ -47,7 +47,7 @@ export function useRoomP2PSession({
           }
         },
         onRemoteCameraStreams(entries) {
-          media.remoteCameraStreams.value = entries;
+          media.p2pRemoteCameraStreams.value = entries;
           testHooks?.record?.({
             type: "camera_streams_applied",
             ownMemberId: ownMemberId.value,
@@ -106,6 +106,19 @@ export function useRoomP2PSession({
     p2pSessionRef.value?.clearRemoteCameraStream(memberId);
   }
 
+  // 用房间发布者快照清理 P2P 摄像头流，断线恢复或全量快照不会保留旧 tile。
+  function syncRemoteCameraPublishers(room = currentRoom.value) {
+    const publishers = room?.video_call_publishers ?? {};
+    for (const entry of media.p2pRemoteCameraStreams.value) {
+      if (!publishers[entry.memberId]) {
+        p2pSessionRef.value?.clearRemoteCameraStream(entry.memberId);
+      }
+    }
+    media.p2pRemoteCameraStreams.value = media.p2pRemoteCameraStreams.value.filter(
+      (entry) => publishers[entry.memberId],
+    );
+  }
+
   // 成员离开或路由回退时关闭单个成员的 P2P 连接，不影响其他成员对。
   function closeP2PMember(memberId) {
     p2pSessionRef.value?.closeMember(memberId);
@@ -115,6 +128,7 @@ export function useRoomP2PSession({
   function closeP2P() {
     p2pSessionRef.value?.close();
     p2pSessionRef.value = null;
+    media.p2pRemoteCameraStreams.value = [];
   }
 
   return {
@@ -124,6 +138,7 @@ export function useRoomP2PSession({
     handleLocalMediaTrack,
     handleP2PSignal,
     startP2PSession,
+    syncRemoteCameraPublishers,
     syncP2PMembers,
   };
 }

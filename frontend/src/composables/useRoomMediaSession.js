@@ -41,6 +41,22 @@ function voiceLabel(group, state) {
   return labels[group]?.[state] ?? state;
 }
 
+// 合并 SFU 与 P2P 摄像头流；同一成员优先显示 P2P，回退后由 P2P 清理让 SFU 接管。
+function mergeRemoteCameraStreams(sfuEntries = [], p2pEntries = []) {
+  const byMember = new Map();
+  for (const entry of sfuEntries) {
+    if (entry?.memberId) {
+      byMember.set(entry.memberId, entry);
+    }
+  }
+  for (const entry of p2pEntries) {
+    if (entry?.memberId) {
+      byMember.set(entry.memberId, entry);
+    }
+  }
+  return Array.from(byMember.values());
+}
+
 // 管理房间内 SFU 媒体会话和本地媒体状态，集中处理权限、静音和视频发布副作用。
 export function useRoomMediaSession({
   applyMemberVolumes,
@@ -64,7 +80,11 @@ export function useRoomMediaSession({
   const mediaReady = ref(false);
   const remoteScreenStream = ref(null);
   const localCameraStream = ref(null);
-  const remoteCameraStreams = ref([]);
+  const sfuRemoteCameraStreams = ref([]);
+  const p2pRemoteCameraStreams = ref([]);
+  const remoteCameraStreams = computed(() =>
+    mergeRemoteCameraStreams(sfuRemoteCameraStreams.value, p2pRemoteCameraStreams.value),
+  );
   const cameraState = ref("idle");
   const cameraBusy = ref(false);
 
@@ -192,7 +212,8 @@ export function useRoomMediaSession({
     localScreenStream.value = null;
     remoteScreenStream.value = null;
     localCameraStream.value = null;
-    remoteCameraStreams.value = [];
+    sfuRemoteCameraStreams.value = [];
+    p2pRemoteCameraStreams.value = [];
     cameraState.value = "idle";
     cameraBusy.value = false;
     const clientConfig = await loadClientConfig();
@@ -219,7 +240,7 @@ export function useRoomMediaSession({
       onLocalMediaTrack,
       // 用整体替换方式刷新远端摄像头流，保证 Vue 响应式列表能稳定更新。
       onRemoteCameraStreams(entries) {
-        remoteCameraStreams.value = entries;
+        sfuRemoteCameraStreams.value = entries;
       },
       // 本地摄像头轨道结束时通知服务端清除发布者状态。
       onCameraEnded() {
@@ -258,7 +279,8 @@ export function useRoomMediaSession({
     mediaSessionRef.value = null;
     mediaReady.value = false;
     localCameraStream.value = null;
-    remoteCameraStreams.value = [];
+    sfuRemoteCameraStreams.value = [];
+    p2pRemoteCameraStreams.value = [];
     cameraState.value = "idle";
     cameraBusy.value = false;
     renderVoiceState({ media: "waiting", downlink: "waiting" });
@@ -342,7 +364,7 @@ export function useRoomMediaSession({
   function syncVideoCallPublishers(room) {
     const publishers = room?.video_call_publishers ?? {};
     applyVideoCallPublisherCount(Object.keys(publishers).length);
-    for (const entry of remoteCameraStreams.value) {
+    for (const entry of sfuRemoteCameraStreams.value) {
       if (!publishers[entry.memberId]) {
         mediaSessionRef.value?.clearRemoteCameraStream?.(entry.memberId);
       }
@@ -371,6 +393,7 @@ export function useRoomMediaSession({
     permissionNote,
     remoteScreenStream,
     remoteCameraStreams,
+    p2pRemoteCameraStreams,
     rememberMemberLatency,
     rememberLatencySnapshot,
     renderVoiceState,
