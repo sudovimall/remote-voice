@@ -1,6 +1,6 @@
 use crate::{
     Error, Result,
-    domain::room::{MediaRouteUpdate, RoomStore, ScreenShareState, VideoCallState},
+    domain::room::{MediaRoute, MediaRouteUpdate, RoomStore, ScreenShareState, VideoCallState},
     media::{IceCandidate, MediaAnswer, MediaController},
 };
 use std::sync::Arc;
@@ -186,6 +186,16 @@ impl MediaRouteService {
         self.rooms
             .validate_p2p_target(room_id, sender_member_id, target_member_id)
             .map_err(p2p_signal_error)?;
+        if self
+            .rooms
+            .media_route(room_id, sender_member_id, target_member_id)
+            .map_err(p2p_signal_error)?
+            == MediaRoute::Sfu
+        {
+            return Err(Error::InvalidMessage(
+                "成员对已回退 SFU，不能继续发送 P2P 信令".to_string(),
+            ));
+        }
         Ok(P2pForwardOutcome {
             target_member_id: target_member_id.to_string(),
             from_member_id: sender_member_id.to_string(),

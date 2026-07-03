@@ -347,6 +347,47 @@ test("p2p route update closes only the affected member pair", async () => {
   assert.equal(harness.peerConnections[1].closed, false);
 });
 
+test("p2p route fallback ignores late offer and ICE for the affected member", async () => {
+  const harness = p2pHarness({ ownMemberId: "m_a" });
+  harness.session.syncMembers([
+    { id: "m_a", connected: true },
+    { id: "m_b", connected: true },
+  ]);
+  await flush();
+  const peerConnection = harness.peerConnections[0];
+
+  harness.session.applyMediaRouteUpdated({
+    type: "media_route_updated",
+    member_ids: ["m_a", "m_b"],
+    route: "sfu",
+    reason: "p2p_failed",
+  });
+  await harness.session.handleOffer("m_b", "late-offer");
+  await harness.session.handleIceCandidate("m_b", { candidate: "late-candidate" });
+
+  assert.equal(harness.peerConnections.length, 1);
+  assert.equal(peerConnection.closed, true);
+  assert.equal(peerConnection.remoteDescriptions.length, 0);
+  assert.equal(peerConnection.candidates.length, 0);
+  assert.equal(harness.sent.some((signal) => signal.type === "p2p_answer"), false);
+});
+
+test("p2p not-listening state mutes remote audio without losing member volume", async () => {
+  const harness = p2pHarness({ ownMemberId: "m_a" });
+  const remoteTrack = track("audio-remote", "audio");
+  const remoteStream = stream("remote-audio-stream", [remoteTrack]);
+
+  harness.session.setMemberVolume("m_b", 0.7);
+  harness.session.setMemberListening("m_b", false);
+  await harness.session.playRemoteStream(remoteStream, "m_b");
+
+  assert.equal(harness.audioElements.length, 1);
+  assert.equal(harness.audioElements[0].volume, 0);
+
+  harness.session.setMemberListening("m_b", true);
+  assert.equal(harness.audioElements[0].volume, 0.7);
+});
+
 test("p2p local camera and screen tracks are added to existing peers", async () => {
   const harness = p2pHarness({ ownMemberId: "m_a" });
   harness.session.syncMembers([

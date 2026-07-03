@@ -113,6 +113,7 @@ export class P2PMediaSession {
     this.localSources = new Map();
     this.fallbackMembers = new Set();
     this.memberVolumes = new Map();
+    this.notListeningMembers = new Set();
     this.remoteCameraStreams = new Map();
     this.audioNodes = new Map();
     this.testHooks?.registerSession?.(this);
@@ -180,6 +181,9 @@ export class P2PMediaSession {
     this.emitTestEvent("signal_received", {
       signal: { type: "p2p_offer", from_member_id: fromMemberId, sdp },
     });
+    if (this.ignoreFallbackSignal(fromMemberId, "p2p_offer")) {
+      return;
+    }
     const entry = this.ensurePeer(fromMemberId);
     await entry.peerConnection.setRemoteDescription(
       this.SessionDescriptionImpl({ type: "offer", sdp }),
@@ -198,6 +202,9 @@ export class P2PMediaSession {
     this.emitTestEvent("signal_received", {
       signal: { type: "p2p_answer", from_member_id: fromMemberId, sdp },
     });
+    if (this.ignoreFallbackSignal(fromMemberId, "p2p_answer")) {
+      return;
+    }
     const entry = this.peers.get(fromMemberId);
     if (!entry) {
       return;
@@ -213,6 +220,9 @@ export class P2PMediaSession {
     this.emitTestEvent("signal_received", {
       signal: { type: "p2p_ice_candidate", from_member_id: fromMemberId, candidate },
     });
+    if (this.ignoreFallbackSignal(fromMemberId, "p2p_ice_candidate")) {
+      return;
+    }
     const entry = this.ensurePeer(fromMemberId);
     await entry.peerConnection.addIceCandidate(this.IceCandidateImpl(candidate));
   }
@@ -238,11 +248,20 @@ export class P2PMediaSession {
   setMemberVolume(memberId, volume) {
     const nextVolume = clampPlaybackVolume(volume);
     this.memberVolumes.set(memberId, nextVolume);
-    for (const entry of this.audioNodes.values()) {
-      if (entry.memberId === memberId) {
-        entry.audio.volume = nextVolume;
-      }
+    this.applyMemberPlaybackVolume(memberId);
+  }
+
+  // 更新当前用户对某成员的 P2P 收听状态，不听时只静音播放，不丢失原始音量偏好。
+  setMemberListening(memberId, listening) {
+    if (!memberId) {
+      return;
     }
+    if (listening) {
+      this.notListeningMembers.delete(memberId);
+    } else {
+      this.notListeningMembers.add(memberId);
+    }
+    this.applyMemberPlaybackVolume(memberId);
   }
 
   // 清理某个成员的 P2P 连接和远端媒体，用于成员离开或回退 SFU。
@@ -309,6 +328,15 @@ export class P2PMediaSession {
     }
 
     return entry;
+  }
+
+  // 对已经回退到 SFU 的成员丢弃迟到 P2P 信令，避免重新创建直连 PeerConnection。
+  ignoreFallbackSignal(memberId, signalType) {
+    if (!this.fallbackMembers.has(memberId)) {
+      return false;
+    }
+    this.emitTestEvent("signal_ignored", { memberId, signalType, reason: "fallback_sfu" });
+    return true;
   }
 
   // 绑定单条 P2P PeerConnection 的 ICE、远端 track、失败状态和元数据通道事件。
@@ -524,12 +552,29 @@ export class P2PMediaSession {
     if (!existing) {
       audio.autoplay = true;
       audio.srcObject = stream;
-      audio.volume = clampPlaybackVolume(this.memberVolumes.get(memberId) ?? 1);
+      audio.volume = this.memberPlaybackVolume(memberId);
       this.audioHost?.append(audio);
       this.audioNodes.set(key, { audio, memberId });
     }
 
     await audio.play?.();
+  }
+
+  // 计算成员的实际播放音量，“不听”优先级高于用户保存的音量滑块。
+  memberPlaybackVolume(memberId) {
+    if (this.notListeningMembers.has(memberId)) {
+      return 0;
+    }
+    return clampPlaybackVolume(this.memberVolumes.get(memberId) ?? 1);
+  }
+
+  // 将某成员当前有效音量写入已有音频节点，偏好变化无需重建媒体流。
+  applyMemberPlaybackVolume(memberId) {
+    for (const entry of this.audioNodes.values()) {
+      if (entry.memberId === memberId) {
+        entry.audio.volume = this.memberPlaybackVolume(memberId);
+      }
+    }
   }
 
   // 监听 P2P 失败状态并只上报一次，避免重复触发 SFU 回退。

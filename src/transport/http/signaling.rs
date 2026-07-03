@@ -564,6 +564,14 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                                 continue;
                             }
                         };
+                        if let Err(error) = state
+                            .services
+                            .member_controls
+                            .sync_room_media_policies(&join.room)
+                            .await
+                        {
+                            error!(room_id, member_id, %error, "恢复成员媒体策略同步失败");
+                        }
 
                         joined_room_id = Some(room_id.clone());
                         joined_member_id = Some(member_id.clone());

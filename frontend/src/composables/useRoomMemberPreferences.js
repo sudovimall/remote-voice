@@ -20,12 +20,14 @@ import { membersForRoom } from "../lib/room-state.js";
 
 export const VOICE_PANE_COLLAPSED_KEY = "remote-voice.voice-pane-collapsed";
 
+// 过滤本房间仍存在且不是自己的发布者，避免恢复不存在成员的不听偏好。
 function existingPublisherIds(room, memberIds, ownMemberId) {
   return Array.from(new Set(memberIds)).filter(
     (memberId) => memberId && memberId !== ownMemberId && room?.members?.[memberId],
   );
 }
 
+// 管理成员音量、麦克风增益和“不听”偏好，并把这些偏好同步到 SFU/P2P 播放层。
 export function useRoomMemberPreferences({
   currentRoom,
   mediaSessionRef,
@@ -39,6 +41,7 @@ export function useRoomMemberPreferences({
   const memberVolumes = ref(new Map());
   const voicePaneCollapsed = ref(window.localStorage.getItem(VOICE_PANE_COLLAPSED_KEY) === "1");
 
+  // 保存成员面板折叠状态，刷新页面后保持用户对语音区域密度的选择。
   function setVoicePaneCollapsed(collapsed, persist = true) {
     voicePaneCollapsed.value = collapsed;
     if (persist) {
@@ -46,6 +49,7 @@ export function useRoomMemberPreferences({
     }
   }
 
+  // 懒加载成员音量偏好，避免进入房间时一次性读取所有历史成员设置。
   function memberVolume(memberId) {
     if (!memberId || !currentRoom.value?.id) {
       return 1;
@@ -74,12 +78,26 @@ export function useRoomMemberPreferences({
     p2pSessionRef.value?.setMemberVolume(memberId, volume);
   }
 
+  // 将“不听”名单同步到 P2P 播放层，保留原始音量偏好以便恢复收听时还原。
+  function applyP2PListeningState(memberIds = notListeningMemberIds.value) {
+    const blockedMemberIds = memberIds instanceof Set ? memberIds : new Set(memberIds);
+    for (const member of membersForRoom(currentRoom.value)) {
+      if (member.id !== ownMemberId.value) {
+        p2pSessionRef.value?.setMemberListening?.(member.id, !blockedMemberIds.has(member.id));
+      }
+    }
+  }
+
   // 将当前房间所有成员音量应用到活跃媒体会话，重连或新建 P2P 后复用。
   function applyMemberVolumes() {
     for (const member of membersForRoom(currentRoom.value)) {
       if (member.id !== ownMemberId.value) {
         mediaSessionRef.value?.setMemberVolume(member.id, memberVolume(member.id));
         p2pSessionRef.value?.setMemberVolume(member.id, memberVolume(member.id));
+        p2pSessionRef.value?.setMemberListening?.(
+          member.id,
+          !notListeningMemberIds.value.has(member.id),
+        );
       }
     }
   }
@@ -91,14 +109,17 @@ export function useRoomMemberPreferences({
     mediaSessionRef.value?.setMicrophoneGain(microphoneGainLevel.value);
   }
 
+  // 记录当前用户不收听的成员名单，并立即同步 P2P 音频以避免直连绕过偏好。
   function rememberListeningState(memberIds = [], persist = true) {
     const values = Array.from(new Set(memberIds.filter(Boolean)));
     notListeningMemberIds.value = new Set(values);
     if (persist && currentRoom.value?.id) {
       saveRoomNotListening(window.localStorage, currentRoom.value.id, values);
     }
+    applyP2PListeningState(notListeningMemberIds.value);
   }
 
+  // 合并服务端和本地存储的不听名单，并把本地独有偏好补发给服务端持久化到房间状态。
   function applyStoredListeningState(room, serverMemberIds = [], memberListeningSignal) {
     const storedMemberIds = existingPublisherIds(
       room,
@@ -115,6 +136,7 @@ export function useRoomMemberPreferences({
     }
   }
 
+  // 清理离开房间后不应继续复用的会话级偏好，避免下一次进入沿用旧房间状态。
   function clearRoomScopedSettings(roomId = currentRoom.value?.id || routeRoomId) {
     if (!roomId) {
       return;
@@ -126,6 +148,7 @@ export function useRoomMemberPreferences({
     clearMemberVolumesForRoom(window.localStorage, roomId);
   }
 
+  // 清空内存音量缓存，进入新房间时重新按房间和成员读取本地存储。
   function resetMemberVolumes() {
     memberVolumes.value = new Map();
   }

@@ -95,6 +95,27 @@ impl MemberControlService {
         Ok(MemberListeningOutcome { request_id, state })
     }
 
+    /// 根据房间快照恢复所有成员音频策略，断线恢复后补回被 close_member 清理的媒体缓存。
+    pub async fn sync_room_media_policies(&self, room: &Room) -> Result<()> {
+        for member in room.members.values() {
+            let not_listening_member_ids = member
+                .not_listening_member_ids()
+                .into_iter()
+                .filter(|publisher_member_id| room.members.contains_key(publisher_member_id))
+                .collect::<Vec<_>>();
+            self.media
+                .sync_member_audio_policy(
+                    &room.id,
+                    &member.id,
+                    member.can_speak,
+                    &not_listening_member_ids,
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
     /// 根据成员权限和静音状态归一化发言广播，防止客户端伪造正在说话。
     pub fn normalized_speaking(&self, room_id: &str, member_id: &str, speaking: bool) -> bool {
         self.rooms

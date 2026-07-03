@@ -1139,6 +1139,117 @@ async fn websocket_房主普通断开后可以在宽限期内恢复() {
 }
 
 #[tokio::test]
+async fn websocket_恢复成员时同步房间媒体策略回_sfu() {
+    let state = AppState::with_disconnect_grace_period(8, Duration::from_millis(250))
+        .expect("创建应用状态");
+    let ws_url = spawn_app(state.clone()).await;
+    let (mut owner_ws, room_id, owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut member_ws, _) = connect_async(&ws_url).await.expect("连接成员 ws");
+
+    member_ws
+        .send(Message::Text(
+            json!({
+                "type": "join_room",
+                "request_id": "join-member",
+                "room_id": room_id,
+                "nickname": "队友",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送 join_room");
+    let joined = read_until_type(&mut member_ws, "joined_room").await;
+    let member_id = joined["member_id"].as_str().expect("成员 ID").to_string();
+    let resume_token = joined["resume_token"]
+        .as_str()
+        .expect("恢复凭据")
+        .to_string();
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "type": "set_member_can_speak",
+                "request_id": "mute-member",
+                "member_id": member_id.clone(),
+                "can_speak": false,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送禁言");
+    let permission_update = read_until_type(&mut owner_ws, "member_updated").await;
+    assert_eq!(
+        permission_update["room"]["members"][&member_id]["can_speak"],
+        false
+    );
+    let _ = read_until_type(&mut owner_ws, "member_speaking_updated").await;
+
+    member_ws
+        .send(Message::Text(
+            json!({
+                "type": "set_member_listening",
+                "request_id": "not-listen-owner",
+                "member_id": owner_id.clone(),
+                "listening": false,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送不听房主");
+    let listening_update = read_until_type(&mut member_ws, "member_listening_updated").await;
+    assert_eq!(
+        listening_update["not_listening_member_ids"],
+        json!([owner_id])
+    );
+
+    member_ws.close(None).await.expect("关闭成员 ws");
+    let disconnected = read_until_type(&mut owner_ws, "member_updated").await;
+    assert_eq!(disconnected["member_id"], member_id);
+    assert_eq!(
+        disconnected["room"]["members"][&member_id]["connected"],
+        false
+    );
+
+    let (mut resumed_ws, _) = connect_async(&ws_url).await.expect("连接恢复 ws");
+    resumed_ws
+        .send(Message::Text(
+            json!({
+                "type": "resume_room",
+                "request_id": "resume-member",
+                "room_id": room_id.clone(),
+                "member_id": member_id.clone(),
+                "resume_token": resume_token,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送 resume_room");
+    let resumed = read_until_type(&mut resumed_ws, "joined_room").await;
+    assert_eq!(resumed["room"]["members"][&member_id]["can_speak"], false);
+    assert_eq!(resumed["not_listening_member_ids"], json!([owner_id]));
+
+    state
+        .media
+        .handle_offer(&room_id, &member_id, create_audio_offer().await)
+        .await
+        .expect("恢复成员建立媒体会话");
+    let snapshot = state
+        .media
+        .session_snapshot(&room_id, &member_id)
+        .await
+        .expect("恢复成员媒体会话存在");
+    assert!(!snapshot.can_speak);
+    assert_eq!(snapshot.not_listening_member_ids, vec![owner_id]);
+
+    resumed_ws.close(None).await.expect("关闭恢复 ws");
+}
+
+#[tokio::test]
 async fn websocket_房主显式离开时立即关闭房间() {
     let state = AppState::new(8).expect("创建应用状态");
     let ws_url = spawn_app(state.clone()).await;
@@ -1403,6 +1514,74 @@ async fn websocket_p2p_connection_failed_广播媒体路由更新() {
             .expect("读取未失败成员对路由"),
         voice::domain::room::MediaRoute::P2p
     );
+}
+
+#[tokio::test]
+async fn websocket_p2p_signal_成员对回退_sfu_后返回错误且不转发() {
+    let state = AppState::new(8).expect("创建应用状态");
+    let ws_url = spawn_app(state).await;
+    let (mut owner_ws, room_id, owner_id) = connect_create(&ws_url, "create-owner", "房主").await;
+    let (mut member_ws, member_id) = connect_join(&ws_url, &room_id, "join-member", "成员").await;
+    let _ = read_until_type(&mut owner_ws, "member_joined").await;
+
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "type": "p2p_connection_failed",
+                "request_id": "p2p-failed-sfu",
+                "target_member_id": member_id.clone(),
+                "reason": "ice_failed"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送 p2p_connection_failed");
+
+    let mut expected_pair = vec![owner_id, member_id.clone()];
+    expected_pair.sort();
+    for update in [
+        read_until_type(&mut owner_ws, "media_route_updated").await,
+        read_until_type(&mut member_ws, "media_route_updated").await,
+    ] {
+        assert_eq!(update["member_ids"], json!(expected_pair));
+        assert_eq!(update["route"], "sfu");
+    }
+
+    for signal in [
+        json!({
+            "type": "p2p_offer",
+            "request_id": "p2p-offer-after-sfu",
+            "target_member_id": member_id.clone(),
+            "sdp": "v=0\r\nlate-offer"
+        }),
+        json!({
+            "type": "p2p_answer",
+            "request_id": "p2p-answer-after-sfu",
+            "target_member_id": member_id.clone(),
+            "sdp": "v=0\r\nlate-answer"
+        }),
+        json!({
+            "type": "p2p_ice_candidate",
+            "request_id": "p2p-ice-after-sfu",
+            "target_member_id": member_id.clone(),
+            "candidate": {
+                "candidate": "candidate:late",
+                "sdpMid": "0",
+                "sdpMLineIndex": 0
+            }
+        }),
+    ] {
+        owner_ws
+            .send(Message::Text(signal.to_string().into()))
+            .await
+            .expect("发送回退后的 P2P 信令");
+        let error = read_until_type(&mut owner_ws, "error").await;
+        assert_eq!(error["request_id"], signal["request_id"]);
+        assert_eq!(error["code"], "invalid_message");
+        assert!(error["message"].as_str().expect("错误消息").contains("SFU"));
+        assert_no_message(&mut member_ws, "SFU 回退后目标不应收到 P2P 信令").await;
+    }
 }
 
 #[tokio::test]

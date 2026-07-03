@@ -257,6 +257,7 @@ export function useRoomSession() {
     currentRoom.value = nextRoomSnapshot(currentRoom.value, signal);
     if (signal.room || ["member_joined", "member_updated", "member_left"].includes(signal.type)) {
       p2p.syncP2PMembers(currentRoom.value);
+      syncRoomSideEffects(currentRoom.value);
     }
     if (signal.type === "room_closed") {
       p2p.closeP2P();
@@ -365,6 +366,7 @@ export function useRoomSession() {
     return clientConfigPromise;
   }
 
+  // 根据最新房间快照同步本地副作用，确保成员更新后音量、静音和视频状态立即校正。
   function syncRoomSideEffects(room) {
     const validNotListening = existingPublisherIds(
       room,
@@ -373,6 +375,7 @@ export function useRoomSession() {
     );
     preferences.rememberListeningState(validNotListening);
     preferences.applyMemberVolumes();
+    media.syncEffectiveSelfMuted();
     media.renderVoiceState();
     media.syncVideoCallPublishers(room);
     screenShare.syncScreenViewingState();

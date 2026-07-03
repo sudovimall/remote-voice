@@ -11,10 +11,12 @@ import {
   stopVideoCallSignal,
 } from "../lib/room-state.js";
 
+// 创建可注入的媒体会话实例，让生产环境使用真实 WebRTC，测试环境替换为假实现。
 export function createMediaSession(client, options, MediaSession = DefaultMediaSession) {
   return new MediaSession(client, options);
 }
 
+// 将内部状态枚举转换为用户可读文案，避免模板层散落状态判断。
 function voiceLabel(group, state) {
   const labels = {
     device: {
@@ -39,6 +41,7 @@ function voiceLabel(group, state) {
   return labels[group]?.[state] ?? state;
 }
 
+// 管理房间内 SFU 媒体会话和本地媒体状态，集中处理权限、静音和视频发布副作用。
 export function useRoomMediaSession({
   applyMemberVolumes,
   clientRef,
@@ -108,6 +111,7 @@ export function useRoomMediaSession({
     return "麦克风权限待确认。";
   });
 
+  // 合并媒体层延迟快照并上报本机到服务端的延迟，成员列表展示复用这份状态。
   function rememberLatencySnapshot(snapshot) {
     const nextMembers = { ...latencySnapshot.value.members };
     for (const [memberId, memberLatency] of Object.entries(snapshot?.members ?? {})) {
@@ -125,6 +129,7 @@ export function useRoomMediaSession({
     }
   }
 
+  // 记录其他成员广播来的延迟值，保持成员列表中的质量指标随信令更新。
   function rememberMemberLatency(memberId, serverMs, ownMemberId) {
     if (!memberId || !Number.isFinite(serverMs)) {
       return;
@@ -148,6 +153,7 @@ export function useRoomMediaSession({
     }
   }
 
+  // 发送发言状态前再次套用本地权限，防止禁言或自我静音时显示正在说话。
   function sendMemberSpeaking(speaking) {
     let nextSpeaking = speaking;
     if (!ownMember.value?.can_speak || ownMember.value?.self_muted) {
@@ -156,11 +162,22 @@ export function useRoomMediaSession({
     sendRoomControl(memberSpeakingSignal(nextSpeaking));
   }
 
+  // 合并媒体状态补丁，媒体层多处异步回调都通过这里刷新 UI 标签。
   function renderVoiceState(patch = {}) {
     voiceState.value = {
       ...voiceState.value,
       ...patch,
     };
+  }
+
+  // 计算实际上行静音；房主禁言必须像自我静音一样禁用本地轨道，覆盖 SFU 和 P2P。
+  function effectiveSelfMuted(selfMuted = ownMember.value?.self_muted) {
+    return Boolean(selfMuted || ownMember.value?.can_speak === false);
+  }
+
+  // 将有效静音状态应用到当前媒体会话，启动、重连和权限广播都复用同一规则。
+  function syncEffectiveSelfMuted(selfMuted = ownMember.value?.self_muted) {
+    mediaSessionRef.value?.setMuted(effectiveSelfMuted(selfMuted));
   }
 
   // 为摄像头控制生成独立请求号，便于服务端错误能定位到本次操作。
@@ -186,22 +203,28 @@ export function useRoomMediaSession({
       onState: renderVoiceState,
       onLatency: rememberLatencySnapshot,
       onSpeaking: sendMemberSpeaking,
+      // 接收远端屏幕共享流后只更新展示状态，停止逻辑由服务端广播驱动。
       onScreenStream(stream) {
         remoteScreenStream.value = stream;
       },
+      // 本地屏幕轨道自然结束时通知服务端释放房间共享状态。
       onScreenShareEnded() {
         sendRoomControl(stopScreenShareSignal(startScreenShareRequestId()));
       },
+      // 保存本地摄像头流用于自预览，实际成员状态仍以服务端广播为准。
       onLocalCameraStream(stream) {
         localCameraStream.value = stream;
       },
       onLocalMediaTrack,
+      // 用整体替换方式刷新远端摄像头流，保证 Vue 响应式列表能稳定更新。
       onRemoteCameraStreams(entries) {
         remoteCameraStreams.value = entries;
       },
+      // 本地摄像头轨道结束时通知服务端清除发布者状态。
       onCameraEnded() {
         sendRoomControl(stopVideoCallSignal(startVideoCallRequestId()));
       },
+      // 媒体内部错误转为房间错误提示，避免未捕获异常打断页面状态。
       onError(error) {
         onError(error.message || "媒体连接发生错误。");
       },
@@ -211,7 +234,7 @@ export function useRoomMediaSession({
 
     try {
       await mediaSessionRef.value.start();
-      mediaSessionRef.value.setMuted(Boolean(ownMember.value?.self_muted));
+      syncEffectiveSelfMuted();
       mediaSessionRef.value.setMicrophoneGain(microphoneGainLevel.value);
       applyMemberVolumes();
       mediaReady.value = true;
@@ -240,9 +263,10 @@ export function useRoomMediaSession({
     renderVoiceState({ media: "waiting", downlink: "waiting" });
   }
 
+  // 切换自我静音并立即更新本地轨道；禁言状态下即使取消自我静音也不能打开上行。
   function toggleSelfMuted() {
     const nextMuted = !ownMember.value?.self_muted;
-    mediaSessionRef.value?.setMuted(nextMuted);
+    syncEffectiveSelfMuted(nextMuted);
     sendRoomControl(selfMutedSignal(nextMuted));
   }
 
@@ -351,6 +375,7 @@ export function useRoomMediaSession({
     renderVoiceState,
     resetMediaState,
     startMedia,
+    syncEffectiveSelfMuted,
     syncVideoCallPublishers,
     toggleCamera,
     toggleSelfMuted,

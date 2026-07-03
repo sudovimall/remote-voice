@@ -48,6 +48,7 @@ const MEDIA_EVENT_QUEUE_CAPACITY: usize = 256;
 const DEFAULT_DOWNLINK_SLOT_COUNT: usize = 7;
 const VIDEO_KEYFRAME_REQUEST_DELAYS_MS: [u64; 3] = [0, 500, 1500];
 
+/// 管理服务端 SFU PeerConnection、音视频轨道转发和成员级媒体策略。
 pub struct MediaController {
     api: API,
     downlink_slot_count: usize,
@@ -107,8 +108,11 @@ struct OutboundTrack {
     fanout_track: Arc<TrackLocalStaticRTP>,
 }
 
+/// 媒体会话只读快照，供测试和诊断确认轨道数量、转发关系和发言权限。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaSessionSnapshot {
+    pub can_speak: bool,
+    pub not_listening_member_ids: Vec<String>,
     pub inbound_track_count: usize,
     pub audio_track_count: usize,
     pub video_track_count: usize,
@@ -874,6 +878,59 @@ impl MediaController {
         }
     }
 
+    /// 从房间快照替换式恢复成员音频策略，断线重连后重建媒体层缓存。
+    pub async fn sync_member_audio_policy(
+        &self,
+        room_id: &str,
+        member_id: &str,
+        can_speak: bool,
+        not_listening_member_ids: &[String],
+    ) -> Result<()> {
+        self.set_member_can_speak(room_id, member_id, can_speak)
+            .await?;
+
+        let listener_key = (room_id.to_string(), member_id.to_string());
+        let next_blocked = not_listening_member_ids
+            .iter()
+            .filter(|publisher_member_id| {
+                !publisher_member_id.is_empty() && publisher_member_id.as_str() != member_id
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
+        let previous_blocked = {
+            let mut policies = self.member_not_listening.lock().await;
+            if next_blocked.is_empty() {
+                policies.remove(&listener_key).unwrap_or_default()
+            } else {
+                policies
+                    .insert(listener_key.clone(), next_blocked.clone())
+                    .unwrap_or_default()
+            }
+        };
+
+        for publisher_member_id in previous_blocked.difference(&next_blocked) {
+            attach_existing_publisher_audio_to_subscriber(
+                Arc::clone(&self.sessions),
+                Arc::clone(&self.member_not_listening),
+                room_id,
+                member_id,
+                publisher_member_id,
+            )
+            .await?;
+        }
+        for publisher_member_id in &next_blocked {
+            detach_publisher_audio_from_subscriber(
+                Arc::clone(&self.sessions),
+                room_id,
+                member_id,
+                publisher_member_id,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     /// 同步房间层的发言权限；没有媒体会话时缓存到该成员后续的 offer。
     pub async fn set_member_can_speak(
         &self,
@@ -901,8 +958,20 @@ impl MediaController {
         member_id: &str,
     ) -> Option<MediaSessionSnapshot> {
         let key = (room_id.to_string(), member_id.to_string());
+        let mut not_listening_member_ids = self
+            .member_not_listening
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        not_listening_member_ids.sort();
         let sessions = self.sessions.lock().await;
-        sessions.get(&key).map(MediaSession::snapshot)
+        sessions
+            .get(&key)
+            .map(|session| session.snapshot(not_listening_member_ids))
     }
 
     #[cfg(test)]
@@ -1188,7 +1257,7 @@ fn new_camera_video_downlink_slot_track(
 }
 
 impl MediaSession {
-    fn snapshot(&self) -> MediaSessionSnapshot {
+    fn snapshot(&self, not_listening_member_ids: Vec<String>) -> MediaSessionSnapshot {
         let tracks = self
             .inbound_tracks
             .values()
@@ -1201,6 +1270,8 @@ impl MediaSession {
             .collect::<Vec<_>>();
 
         MediaSessionSnapshot {
+            can_speak: self.can_speak,
+            not_listening_member_ids,
             inbound_track_count: tracks.len(),
             audio_track_count: tracks.iter().filter(|track| track.kind == "audio").count(),
             video_track_count: tracks
@@ -2684,6 +2755,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn 恢复音频策略会替换不听名单并同步已有下行_track() {
+        let media = MediaController::new().expect("创建媒体控制器");
+        for member_id in ["publisher-1", "publisher-2", "listener-1"] {
+            media
+                .handle_offer("room-1", member_id, create_audio_offer().await)
+                .await
+                .expect("建立媒体会话");
+        }
+        media
+            .attach_audio_to_subscribers_for_test("room-1", "publisher-1")
+            .await
+            .expect("挂发布者 1 音轨");
+        media
+            .attach_audio_to_subscribers_for_test("room-1", "publisher-2")
+            .await
+            .expect("挂发布者 2 音轨");
+
+        media
+            .sync_member_audio_policy("room-1", "listener-1", true, &["publisher-1".to_string()])
+            .await
+            .expect("恢复不听发布者 1");
+        let mut publishers = media
+            .session_snapshot("room-1", "listener-1")
+            .await
+            .expect("听众会话存在")
+            .outbound_tracks
+            .iter()
+            .map(|track| track.publisher_member_id.clone())
+            .collect::<Vec<_>>();
+        publishers.sort_unstable();
+        assert_eq!(publishers, vec!["publisher-2".to_string()]);
+
+        media
+            .sync_member_audio_policy("room-1", "listener-1", true, &["publisher-2".to_string()])
+            .await
+            .expect("替换为不听发布者 2");
+        let mut publishers = media
+            .session_snapshot("room-1", "listener-1")
+            .await
+            .expect("听众会话存在")
+            .outbound_tracks
+            .iter()
+            .map(|track| track.publisher_member_id.clone())
+            .collect::<Vec<_>>();
+        publishers.sort_unstable();
+        assert_eq!(publishers, vec!["publisher-1".to_string()]);
+
+        media
+            .sync_member_audio_policy("room-1", "listener-1", true, &[])
+            .await
+            .expect("清空不听名单");
+        assert_eq!(
+            media
+                .session_snapshot("room-1", "listener-1")
+                .await
+                .expect("听众会话存在")
+                .outbound_track_count,
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn 听众停止并恢复接收已存在发布者音轨() {
         let media = MediaController::new().expect("创建媒体控制器");
         for member_id in ["publisher-1", "listener-1"] {
@@ -3378,6 +3511,40 @@ mod tests {
 
         listener.close().await.expect("关闭听众 PeerConnection");
         publisher.close().await.expect("关闭发布者 PeerConnection");
+    }
+
+    #[tokio::test]
+    async fn 恢复音频策略会缓存后续媒体会话的禁言状态() {
+        let media = MediaController::new().expect("创建媒体控制器");
+
+        media
+            .sync_member_audio_policy("room-1", "publisher-1", false, &[])
+            .await
+            .expect("恢复禁言策略");
+        media
+            .handle_offer("room-1", "publisher-1", create_audio_offer().await)
+            .await
+            .expect("建立发布者媒体会话");
+
+        assert!(
+            !media
+                .session_snapshot("room-1", "publisher-1")
+                .await
+                .expect("发布者会话存在")
+                .can_speak
+        );
+
+        media
+            .sync_member_audio_policy("room-1", "publisher-1", true, &[])
+            .await
+            .expect("恢复可发言策略");
+        assert!(
+            media
+                .session_snapshot("room-1", "publisher-1")
+                .await
+                .expect("发布者会话存在")
+                .can_speak
+        );
     }
 
     #[tokio::test]
