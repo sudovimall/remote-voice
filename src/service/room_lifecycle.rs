@@ -24,7 +24,10 @@ impl RoomLifecycleService {
 
     /// 创建运行时房间，并在认证开启时写入持久房间归属。
     pub fn create_room(&self, nickname: String, user: Option<&CurrentUser>) -> Result<RoomJoin> {
-        let join = self.rooms.create_room(nickname)?;
+        let join = match user {
+            Some(user) => self.rooms.create_room_for_user(nickname, user.id)?,
+            None => self.rooms.create_room(nickname)?,
+        };
         if let Some(user) = user {
             if let Err(error) = self
                 .authenticated_rooms
@@ -50,18 +53,26 @@ impl RoomLifecycleService {
         };
         let join = match role {
             Some(role) => {
-                match self
-                    .rooms
-                    .join_room_with_role(room_id, nickname.clone(), role.clone())
-                {
+                let Some(user) = user else {
+                    return Err(crate::Error::Unauthenticated);
+                };
+                match self.rooms.join_room_with_role_for_user(
+                    room_id,
+                    nickname.clone(),
+                    role.clone(),
+                    user.id,
+                ) {
                     Ok(join) => join,
                     Err(crate::Error::RoomNotFound) => self
                         .rooms
-                        .restore_room_with_member(room_id, nickname, role)?,
+                        .restore_room_with_member_for_user(room_id, nickname, role, user.id)?,
                     Err(error) => return Err(error),
                 }
             }
-            None => self.rooms.join_room(room_id, nickname)?,
+            None => match user {
+                Some(user) => self.rooms.join_room_for_user(room_id, nickname, user.id)?,
+                None => self.rooms.join_room(room_id, nickname)?,
+            },
         };
         self.authenticated_rooms.touch_if_persistent(room_id)?;
         Ok(join)
@@ -73,8 +84,14 @@ impl RoomLifecycleService {
         room_id: &str,
         member_id: &str,
         resume_token: &str,
+        user: Option<&CurrentUser>,
     ) -> Result<RoomJoin> {
-        let join = self.rooms.resume_room(room_id, member_id, resume_token)?;
+        let join = self.rooms.resume_room_for_user(
+            room_id,
+            member_id,
+            resume_token,
+            user.map(|user| user.id),
+        )?;
         // 恢复成员已经把运行时状态标为在线；持久房间活跃时间刷新失败不能阻断信令注册，
         // 否则会留下“在线但无 WebSocket”的成员，破坏断线恢复兼容性。
         let _ = self.authenticated_rooms.touch_if_persistent(room_id);

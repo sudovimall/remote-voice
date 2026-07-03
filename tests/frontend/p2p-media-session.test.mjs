@@ -372,6 +372,37 @@ test("p2p route fallback ignores late offer and ICE for the affected member", as
   assert.equal(harness.sent.some((signal) => signal.type === "p2p_answer"), false);
 });
 
+test("p2p route fallback clears the affected member screen stream", async () => {
+  const harness = p2pHarness({ ownMemberId: "m_a" });
+  harness.session.syncMembers([
+    { id: "m_a", connected: true },
+    { id: "m_b", connected: true },
+  ]);
+  await flush();
+  const peerConnection = harness.peerConnections[0];
+  const screenTrack = track("remote-screen-track", "video");
+
+  peerConnection.dataChannels[0].emitMessage({
+    type: "media_metadata",
+    tracks: [{ track_id: "remote-screen-track", source: "screen" }],
+  });
+  peerConnection.emitTrack({
+    track: screenTrack,
+    streams: [stream("remote-screen-stream", [screenTrack])],
+  });
+
+  harness.session.applyMediaRouteUpdated({
+    type: "media_route_updated",
+    member_ids: ["m_a", "m_b"],
+    route: "sfu",
+    reason: "p2p_failed",
+  });
+
+  assert.equal(harness.screenStreams.at(-2).memberId, "m_b");
+  assert.equal(harness.screenStreams.at(-2).stream.id, "generated-remote-screen-track");
+  assert.deepEqual(harness.screenStreams.at(-1), { stream: null, memberId: "m_b" });
+});
+
 test("p2p not-listening state mutes remote audio without losing member volume", async () => {
   const harness = p2pHarness({ ownMemberId: "m_a" });
   const remoteTrack = track("audio-remote", "audio");

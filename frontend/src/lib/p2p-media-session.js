@@ -115,6 +115,7 @@ export class P2PMediaSession {
     this.memberVolumes = new Map();
     this.notListeningMembers = new Set();
     this.remoteCameraStreams = new Map();
+    this.remoteScreenStreams = new Map();
     this.audioNodes = new Map();
     this.testHooks?.registerSession?.(this);
     this.emitTestEvent("session_created");
@@ -295,6 +296,7 @@ export class P2PMediaSession {
     }
     this.audioNodes.clear();
     this.remoteCameraStreams.clear();
+    this.remoteScreenStreams.clear();
     this.onRemoteCameraStreams?.(this.remoteCameraStreamEntries());
     this.onScreenStream?.(null, "");
   }
@@ -531,8 +533,28 @@ export class P2PMediaSession {
       return;
     }
 
+    this.remoteScreenStreams.set(memberId, { memberId, stream });
     this.emitTestEvent("remote_video", { memberId, source });
+    event.track?.addEventListener?.("ended", () => this.clearRemoteScreenStream(memberId, stream), {
+      once: true,
+    });
+    event.track?.addEventListener?.("mute", () => this.clearRemoteScreenStream(memberId, stream), {
+      once: true,
+    });
     this.onScreenStream?.(stream, memberId);
+  }
+
+  // 清理指定成员的远端屏幕流；同一成员重建屏幕轨道时旧事件不能清掉新画面。
+  clearRemoteScreenStream(memberId, stream = null) {
+    if (!memberId || !this.remoteScreenStreams.has(memberId)) {
+      return;
+    }
+    const existing = this.remoteScreenStreams.get(memberId);
+    if (stream && existing?.stream !== stream) {
+      return;
+    }
+    this.remoteScreenStreams.delete(memberId);
+    this.onScreenStream?.(null, memberId);
   }
 
   // 返回稳定的远端摄像头数组，供 Vue 响应式状态整体替换。
@@ -604,6 +626,7 @@ export class P2PMediaSession {
   // 清理某个对端成员产生的 P2P 音视频节点。
   clearRemoteForMember(memberId) {
     this.clearRemoteCameraStream(memberId);
+    this.clearRemoteScreenStream(memberId);
     for (const [key, entry] of Array.from(this.audioNodes.entries())) {
       if (entry.memberId === memberId) {
         entry.audio.remove?.();

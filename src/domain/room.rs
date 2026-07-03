@@ -30,6 +30,8 @@ pub struct Member {
     pub self_muted: bool,
     pub connected: bool,
     #[serde(skip, default)]
+    auth_user_id: Option<i64>,
+    #[serde(skip, default)]
     not_listening_member_ids: HashSet<String>,
     #[serde(skip)]
     resume_token: String,
@@ -201,7 +203,24 @@ impl RoomStore {
 
     /// 创建新房间并把创建者设为房主，媒体路由保持空表以表示默认 P2P。
     pub fn create_room(&self, nickname: impl Into<String>) -> Result<RoomJoin> {
-        let member = self.new_member(nickname, MemberRole::Owner);
+        self.create_room_with_auth_user(nickname, None)
+    }
+
+    /// 为已认证用户创建新房间，并把运行时成员绑定到该用户，恢复时防止跨账号接管。
+    pub fn create_room_for_user(
+        &self,
+        nickname: impl Into<String>,
+        auth_user_id: i64,
+    ) -> Result<RoomJoin> {
+        self.create_room_with_auth_user(nickname, Some(auth_user_id))
+    }
+
+    fn create_room_with_auth_user(
+        &self,
+        nickname: impl Into<String>,
+        auth_user_id: Option<i64>,
+    ) -> Result<RoomJoin> {
+        let member = self.new_member(nickname, MemberRole::Owner, auth_user_id);
         let now = now_epoch_seconds();
         let mut rooms = self.write_rooms()?;
         let room_id = loop {
@@ -233,7 +252,22 @@ impl RoomStore {
 
     /// 加入已有房间，默认以普通成员身份进入并继承房间的当前状态。
     pub fn join_room(&self, room_id: &str, nickname: impl Into<String>) -> Result<RoomJoin> {
-        self.join_room_with_role(room_id, nickname, MemberRole::Member)
+        self.join_room_with_role_and_auth_user(room_id, nickname, MemberRole::Member, None)
+    }
+
+    /// 已认证用户加入已有房间时绑定运行时成员，后续恢复必须使用同一登录用户。
+    pub fn join_room_for_user(
+        &self,
+        room_id: &str,
+        nickname: impl Into<String>,
+        auth_user_id: i64,
+    ) -> Result<RoomJoin> {
+        self.join_room_with_role_and_auth_user(
+            room_id,
+            nickname,
+            MemberRole::Member,
+            Some(auth_user_id),
+        )
     }
 
     /// 以指定身份加入房间，持久房间恢复房主身份时复用这条路径。
@@ -242,6 +276,27 @@ impl RoomStore {
         room_id: &str,
         nickname: impl Into<String>,
         role: MemberRole,
+    ) -> Result<RoomJoin> {
+        self.join_room_with_role_and_auth_user(room_id, nickname, role, None)
+    }
+
+    /// 以指定身份加入房间并绑定认证用户，持久房间恢复房主身份时防止其他账号恢复该成员。
+    pub fn join_room_with_role_for_user(
+        &self,
+        room_id: &str,
+        nickname: impl Into<String>,
+        role: MemberRole,
+        auth_user_id: i64,
+    ) -> Result<RoomJoin> {
+        self.join_room_with_role_and_auth_user(room_id, nickname, role, Some(auth_user_id))
+    }
+
+    fn join_room_with_role_and_auth_user(
+        &self,
+        room_id: &str,
+        nickname: impl Into<String>,
+        role: MemberRole,
+        auth_user_id: Option<i64>,
     ) -> Result<RoomJoin> {
         let nickname = nickname.into();
         let mut rooms = self.write_rooms()?;
@@ -252,7 +307,7 @@ impl RoomStore {
         }
 
         let member = loop {
-            let candidate = self.new_member(nickname.clone(), role.clone());
+            let candidate = self.new_member(nickname.clone(), role.clone(), auth_user_id);
             if !room.members.contains_key(&candidate.id) {
                 break candidate;
             }
@@ -282,12 +337,33 @@ impl RoomStore {
         nickname: impl Into<String>,
         role: MemberRole,
     ) -> Result<RoomJoin> {
+        self.restore_room_with_member_and_auth_user(room_id, nickname, role, None)
+    }
+
+    /// 从持久化记录恢复运行时房间并绑定认证用户，避免恢复后成员身份被其他账号复用。
+    pub fn restore_room_with_member_for_user(
+        &self,
+        room_id: &str,
+        nickname: impl Into<String>,
+        role: MemberRole,
+        auth_user_id: i64,
+    ) -> Result<RoomJoin> {
+        self.restore_room_with_member_and_auth_user(room_id, nickname, role, Some(auth_user_id))
+    }
+
+    fn restore_room_with_member_and_auth_user(
+        &self,
+        room_id: &str,
+        nickname: impl Into<String>,
+        role: MemberRole,
+        auth_user_id: Option<i64>,
+    ) -> Result<RoomJoin> {
         let mut rooms = self.write_rooms()?;
         if rooms.contains_key(room_id) {
             return Err(Error::InvalidMessage("房间已经在运行中".to_string()));
         }
 
-        let member = self.new_member(nickname, role.clone());
+        let member = self.new_member(nickname, role.clone(), auth_user_id);
         let now = now_epoch_seconds();
         let owner_member_id = if role == MemberRole::Owner {
             member.id.clone()
@@ -322,6 +398,17 @@ impl RoomStore {
         member_id: &str,
         resume_token: &str,
     ) -> Result<RoomJoin> {
+        self.resume_room_for_user(room_id, member_id, resume_token, None)
+    }
+
+    /// 使用恢复凭据和认证用户恢复成员；已绑定用户的成员只能由同一账号恢复。
+    pub fn resume_room_for_user(
+        &self,
+        room_id: &str,
+        member_id: &str,
+        resume_token: &str,
+        auth_user_id: Option<i64>,
+    ) -> Result<RoomJoin> {
         let mut rooms = self.write_rooms()?;
         let room = rooms.get_mut(room_id).ok_or(Error::RoomNotFound)?;
         let member = room
@@ -330,6 +417,12 @@ impl RoomStore {
             .ok_or(Error::MemberNotFound)?;
 
         if member.resume_token != resume_token {
+            return Err(Error::InvalidResumeToken);
+        }
+        if member
+            .auth_user_id
+            .is_some_and(|bound_user_id| Some(bound_user_id) != auth_user_id)
+        {
             return Err(Error::InvalidResumeToken);
         }
 
@@ -759,7 +852,12 @@ impl RoomStore {
         })
     }
 
-    fn new_member(&self, nickname: impl Into<String>, role: MemberRole) -> Member {
+    fn new_member(
+        &self,
+        nickname: impl Into<String>,
+        role: MemberRole,
+        auth_user_id: Option<i64>,
+    ) -> Member {
         Member {
             id: new_member_id(),
             nickname: nickname.into(),
@@ -767,6 +865,7 @@ impl RoomStore {
             can_speak: true,
             self_muted: false,
             connected: true,
+            auth_user_id,
             not_listening_member_ids: HashSet::new(),
             resume_token: new_resume_token(),
         }

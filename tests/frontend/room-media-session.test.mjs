@@ -88,6 +88,7 @@ test("room media session mutes local track when can_speak is false", async () =>
 
     await media.startMedia(async () => ({}), () => {}, FakeMediaSession);
 
+    assert.equal(createdSession.options.initialMuted, true);
     assert.deepEqual(createdSession.mutedStates, [true]);
     assert.equal(createdSession.track.enabled, false);
     assert.equal(localTracks[0].track.enabled, false);

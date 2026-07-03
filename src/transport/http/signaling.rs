@@ -548,7 +548,7 @@ async fn handle_socket(state: AppState, socket: WebSocket, current_user: Option<
                         let join = match state
                             .services
                             .room_lifecycle
-                            .resume_room(&room_id, &member_id, &resume_token)
+                            .resume_room(&room_id, &member_id, &resume_token, current_user.as_ref())
                         {
                             Ok(join) => join,
                             Err(error) => {

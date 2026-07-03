@@ -88,8 +88,14 @@ export function useRoomSession() {
     return "成员";
   });
 
+  // 展示当前房间的可见错误，连接、媒体和聊天边界统一写入这里。
   function showError(message) {
     errorMessage.value = message;
+  }
+
+  // 恢复成功后清除旧的可恢复错误，避免重连后的页面继续显示过期失败原因。
+  function clearError() {
+    errorMessage.value = "";
   }
 
   // --- Boundary: member preferences (volumes, gain, listening, cleanup) ---
@@ -401,6 +407,7 @@ export function useRoomSession() {
       p2p.startP2PSession();
       syncRoomSideEffects(nextClient.room);
       setConnection("已连接");
+      clearError();
       void startMedia();
 
       if (intent.mode === "create") {
@@ -432,6 +439,9 @@ export function useRoomSession() {
   // 启动浏览器媒体采集；成功后本地轨道会通过回调同步给 P2P。
   async function startMedia() {
     await media.startMedia(loadClientConfig, (force) => screenShare.syncScreenViewingState(force));
+    if (media.mediaReady.value) {
+      clearError();
+    }
   }
 
   function toggleMemberPermission(member) {

@@ -285,6 +285,7 @@ export class MediaSession {
     this.onError = options.onError;
     this.screenShareConfig = normalizeScreenShareConfig(options.screenShare);
     this.videoCallConfig = normalizeVideoCallConfig(options.videoCall);
+    this.initialMuted = Boolean(options.initialMuted);
     this.latencyIntervalMs = options.latencyIntervalMs ?? DEFAULT_LATENCY_INTERVAL_MS;
     this.speakingIntervalMs = options.speakingIntervalMs ?? DEFAULT_SPEAKING_INTERVAL_MS;
     this.setIntervalImpl =
@@ -335,6 +336,7 @@ export class MediaSession {
     this.bindPeerConnection(this.peerConnection);
 
     this.prepareOutboundStream();
+    this.setMuted(this.initialMuted);
     this.publishLocalAudioTracks();
 
     for (const track of this.outboundStream.getAudioTracks()) {
@@ -354,6 +356,7 @@ export class MediaSession {
       this.startSpeakingSampling();
     } catch (error) {
       statePatch(this.onState, { media: "failed" });
+      await this.close();
       this.onError?.(error);
       throw error;
     }

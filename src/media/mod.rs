@@ -61,6 +61,8 @@ pub struct MediaController {
     screen_share_owners: Arc<Mutex<HashMap<String, String>>>,
     screen_share_viewers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     video_call_publishers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    #[cfg(test)]
+    fail_next_screen_share_owner: Arc<std::sync::atomic::AtomicBool>,
     event_sender: broadcast::Sender<MediaEvent>,
 }
 
@@ -240,6 +242,8 @@ impl MediaController {
             screen_share_owners: Arc::new(Mutex::new(HashMap::new())),
             screen_share_viewers: Arc::new(Mutex::new(HashMap::new())),
             video_call_publishers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            fail_next_screen_share_owner: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             event_sender: broadcast::channel(MEDIA_EVENT_QUEUE_CAPACITY).0,
         })
     }
@@ -641,6 +645,8 @@ impl MediaController {
             .await?;
         self.clear_video_call_publisher_if_matches(room_id, member_id)
             .await?;
+        detach_publisher_audio_from_subscribers(Arc::clone(&self.sessions), room_id, member_id)
+            .await?;
         let session = {
             let mut sessions = self.sessions.lock().await;
             sessions.remove(&key)
@@ -664,17 +670,39 @@ impl MediaController {
     ) -> Result<()> {
         match member_id {
             Some(member_id) => {
-                self.screen_share_owners
+                #[cfg(test)]
+                if self
+                    .fail_next_screen_share_owner
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(Error::Internal(
+                        "测试注入屏幕共享 owner 同步失败".to_string(),
+                    ));
+                }
+                let previous_owner = self
+                    .screen_share_owners
                     .lock()
                     .await
                     .insert(room_id.to_string(), member_id.to_string());
-                attach_existing_screen_video_to_subscribers_for_publisher(
+                let result = attach_existing_screen_video_to_subscribers_for_publisher(
                     Arc::clone(&self.sessions),
                     Arc::clone(&self.screen_share_viewers),
                     room_id,
                     member_id,
                 )
-                .await
+                .await;
+                if result.is_err() {
+                    let mut owners = self.screen_share_owners.lock().await;
+                    match previous_owner {
+                        Some(previous_owner) => {
+                            owners.insert(room_id.to_string(), previous_owner);
+                        }
+                        None => {
+                            owners.remove(room_id);
+                        }
+                    }
+                }
+                result
             }
             None => {
                 let previous = self.screen_share_owners.lock().await.remove(room_id);
@@ -837,6 +865,13 @@ impl MediaController {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    /// 注入下一次屏幕共享 owner 同步失败，供服务层回滚测试稳定覆盖。
+    #[cfg(test)]
+    pub(crate) fn fail_next_screen_share_owner_for_test(&self) {
+        self.fail_next_screen_share_owner
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 同步当前听众对某个发布者的下行接收偏好。
@@ -1562,6 +1597,7 @@ async fn attach_audio_to_subscriber(
                 let occupied_slots = subscriber
                     .outbound_tracks
                     .values()
+                    .filter(|track| track.kind == MediaTrackKind::Audio)
                     .map(|track| track.downlink_slot_index)
                     .collect::<std::collections::HashSet<_>>();
                 (0..subscriber.downlink_senders.len())
@@ -1643,6 +1679,39 @@ async fn detach_publisher_audio_from_subscriber(
             .replace_track(Some(empty_slot as Arc<dyn TrackLocal + Send + Sync>))
             .await
             .map_err(|err| Error::Internal(format!("移除下行音频槽位失败: {err}")))?;
+    }
+
+    Ok(())
+}
+
+// 发布者关闭媒体会话时，从所有听众下行槽移除该发布者音频，避免槽位被旧 fanout 占住。
+async fn detach_publisher_audio_from_subscribers(
+    sessions: Arc<Mutex<SessionMap>>,
+    room_id: &str,
+    publisher_member_id: &str,
+) -> Result<()> {
+    let listener_member_ids = {
+        let sessions = sessions.lock().await;
+        sessions
+            .keys()
+            .filter_map(|(session_room_id, member_id)| {
+                if session_room_id == room_id && member_id != publisher_member_id {
+                    Some(member_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for listener_member_id in listener_member_ids {
+        detach_publisher_audio_from_subscriber(
+            Arc::clone(&sessions),
+            room_id,
+            &listener_member_id,
+            publisher_member_id,
+        )
+        .await?;
     }
 
     Ok(())
@@ -2481,7 +2550,7 @@ async fn remove_inbound_video_tracks(
 
 #[cfg(test)]
 mod tests {
-    use super::{IceCandidate, MediaController};
+    use super::{IceCandidate, MediaController, MediaTrackKind};
     use crate::Error;
     use std::{sync::Arc, time::Duration};
     use tokio::{
@@ -2714,6 +2783,95 @@ mod tests {
                 .outbound_tracks
                 .iter()
                 .any(|track| track.publisher_member_id == "publisher-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn 视频下行不会占用音频槽位() {
+        let media = MediaController::new_with_downlink_slot_count(1).expect("创建媒体控制器");
+        for member_id in ["screen-publisher", "audio-publisher", "listener-1"] {
+            media
+                .handle_offer("room-1", member_id, create_audio_video_offer(1).await)
+                .await
+                .expect("建立带视频槽位的媒体会话");
+        }
+        media
+            .set_screen_viewing("room-1", "listener-1", true)
+            .await
+            .expect("听众观看屏幕");
+        media
+            .store_test_video_inbound_track(
+                "room-1",
+                "screen-publisher",
+                MediaTrackKind::ScreenShareVideo,
+            )
+            .await
+            .expect("登记屏幕共享上行");
+        media
+            .set_screen_share_owner("room-1", Some("screen-publisher"))
+            .await
+            .expect("开启屏幕共享");
+
+        media
+            .attach_audio_to_subscribers_for_test("room-1", "audio-publisher")
+            .await
+            .expect("视频下行不应占用唯一音频槽");
+
+        let snapshot = media
+            .session_snapshot("room-1", "listener-1")
+            .await
+            .expect("听众会话存在");
+        assert_eq!(snapshot.outbound_track_count, 2);
+        assert_eq!(
+            snapshot
+                .outbound_tracks
+                .iter()
+                .filter(|track| track.kind == "audio")
+                .count(),
+            1
+        );
+        assert_eq!(snapshot.outbound_video_track_count, 1);
+    }
+
+    #[tokio::test]
+    async fn 发布者关闭后释放所有听众的音频槽位() {
+        let media = MediaController::new_with_downlink_slot_count(1).expect("创建媒体控制器");
+        for member_id in ["publisher-1", "publisher-2", "listener-1"] {
+            media
+                .handle_offer("room-1", member_id, create_audio_offer().await)
+                .await
+                .expect("建立媒体会话");
+        }
+        media
+            .attach_audio_to_subscribers_for_test("room-1", "publisher-1")
+            .await
+            .expect("发布者 1 占用唯一音频槽");
+
+        media
+            .close_member("room-1", "publisher-1")
+            .await
+            .expect("关闭发布者 1");
+        assert_eq!(
+            media
+                .session_snapshot("room-1", "listener-1")
+                .await
+                .expect("听众会话存在")
+                .outbound_track_count,
+            0
+        );
+
+        media
+            .attach_audio_to_subscribers_for_test("room-1", "publisher-2")
+            .await
+            .expect("发布者 2 复用释放后的音频槽");
+        let snapshot = media
+            .session_snapshot("room-1", "listener-1")
+            .await
+            .expect("听众会话存在");
+        assert_eq!(snapshot.outbound_track_count, 1);
+        assert_eq!(
+            snapshot.outbound_tracks[0].publisher_member_id,
+            "publisher-2"
         );
     }
 

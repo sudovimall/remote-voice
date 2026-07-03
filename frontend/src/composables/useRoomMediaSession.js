@@ -199,6 +199,7 @@ export function useRoomMediaSession({
     mediaSessionRef.value = createMediaSession(clientRef.value, {
       screenShare: clientConfig?.screen_share,
       videoCall: clientConfig?.video_call,
+      initialMuted: effectiveSelfMuted(),
       audioHost: document.querySelector("#remote-audio"),
       onState: renderVoiceState,
       onLatency: rememberLatencySnapshot,

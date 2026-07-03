@@ -154,6 +154,40 @@ async fn connect_create_with_cookie(
     (ws, room_id, member_id)
 }
 
+async fn connect_create_with_cookie_resume(
+    ws_url: &str,
+    cookie: &str,
+    request_id: &str,
+    nickname: &str,
+) -> (TestWebSocket, String, String, String) {
+    let mut request = ws_url.into_client_request().expect("构造 ws 请求");
+    request
+        .headers_mut()
+        .insert("cookie", cookie.parse().expect("cookie header"));
+    let (mut ws, _) = connect_async(request).await.expect("连接 ws");
+
+    ws.send(Message::Text(
+        json!({
+            "type": "create_room",
+            "request_id": request_id,
+            "nickname": nickname,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("发送 create_room");
+
+    let joined = read_until_type(&mut ws, "joined_room").await;
+    let room_id = joined["room"]["id"].as_str().expect("房间 ID").to_string();
+    let member_id = joined["member_id"].as_str().expect("成员 ID").to_string();
+    let resume_token = joined["resume_token"]
+        .as_str()
+        .expect("恢复凭据")
+        .to_string();
+    (ws, room_id, member_id, resume_token)
+}
+
 async fn connect_join_with_cookie(
     ws_url: &str,
     cookie: &str,
@@ -363,6 +397,75 @@ async fn websocket_认证房主普通断开不会立即关闭持久房间() {
             .members[&_owner_id]
             .connected
     );
+}
+
+#[tokio::test]
+async fn websocket_认证模式拒绝其他用户恢复房主成员() {
+    let (state, service) = auth_state_with_grace(Duration::from_millis(250));
+    let admin = service
+        .login_at("admin", "secret", now_epoch_seconds())
+        .expect("管理员登录");
+    let invite = service
+        .create_invite_at(&admin.user, 24, now_epoch_seconds())
+        .expect("创建邀请码");
+    let attacker = service
+        .register_with_invite_at(
+            &invite.code,
+            "attacker",
+            "password",
+            "攻击者",
+            now_epoch_seconds(),
+        )
+        .expect("注册其他用户");
+    let ws_url = spawn_app(state.clone()).await;
+    let admin_cookie = format!("remote_voice_session={}", admin.token);
+    let attacker_cookie = format!("remote_voice_session={}", attacker.token);
+    let (mut owner_ws, room_id, owner_id, resume_token) =
+        connect_create_with_cookie_resume(&ws_url, &admin_cookie, "create-auth", "管理员").await;
+
+    owner_ws.close(None).await.expect("关闭房主 ws");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let connected = state
+                .rooms
+                .get_room(&room_id)
+                .expect("房间仍在恢复宽限期")
+                .members
+                .get(&owner_id)
+                .expect("房主成员存在")
+                .connected;
+            if !connected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("等待房主断线状态");
+
+    let mut request = ws_url.into_client_request().expect("构造 ws 请求");
+    request
+        .headers_mut()
+        .insert("cookie", attacker_cookie.parse().expect("cookie header"));
+    let (mut attacker_ws, _) = connect_async(request).await.expect("连接攻击者 ws");
+    attacker_ws
+        .send(Message::Text(
+            json!({
+                "type": "resume_room",
+                "request_id": "resume-other-user",
+                "room_id": room_id,
+                "member_id": owner_id,
+                "resume_token": resume_token,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("发送跨用户 resume_room");
+
+    let error = read_until_type(&mut attacker_ws, "error").await;
+    assert_eq!(error["request_id"], "resume-other-user");
+    assert_eq!(error["code"], "invalid_resume_token");
 }
 
 #[tokio::test]

@@ -56,11 +56,24 @@ impl MediaRouteService {
         room_id: &str,
         member_id: &str,
     ) -> Result<ScreenShareOutcome> {
+        let previous_share = self
+            .rooms
+            .get_room(room_id)
+            .ok()
+            .and_then(|room| room.screen_share);
         let room = self.rooms.start_screen_share(room_id, member_id)?;
         if let Some(screen_share) = &room.screen_share {
-            self.media
+            if let Err(error) = self
+                .media
                 .set_screen_share_owner(room_id, Some(&screen_share.member_id))
-                .await?;
+                .await
+            {
+                if previous_share.is_none() {
+                    let _ = self.rooms.stop_screen_share(room_id, member_id);
+                    let _ = self.media.set_screen_share_owner(room_id, None).await;
+                }
+                return Err(error);
+            }
         }
         let viewer_count = self.media.screen_viewer_count(room_id).await;
         Ok(ScreenShareOutcome {
@@ -238,5 +251,35 @@ pub fn p2p_signal_error(error: Error) -> Error {
             Error::InvalidMessage("目标成员不存在或不在当前房间，不能发送 P2P 信令".to_string())
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MediaRouteService;
+    use crate::{domain::room::RoomStore, media::MediaController};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn 屏幕共享媒体同步失败会回滚新占用() {
+        let rooms = Arc::new(RoomStore::new(4));
+        let media = Arc::new(MediaController::new().expect("创建媒体控制器"));
+        let service = MediaRouteService::new(Arc::clone(&rooms), Arc::clone(&media));
+        let owner = rooms.create_room("房主").expect("创建房间");
+        media.fail_next_screen_share_owner_for_test();
+
+        let error = service
+            .start_screen_share(&owner.room.id, &owner.member.id)
+            .await
+            .expect_err("媒体同步失败应返回错误");
+
+        assert!(matches!(error, crate::Error::Internal(_)));
+        assert!(
+            rooms
+                .get_room(&owner.room.id)
+                .expect("房间仍存在")
+                .screen_share
+                .is_none()
+        );
     }
 }

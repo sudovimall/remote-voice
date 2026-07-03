@@ -330,6 +330,7 @@ function mediaHarness(options = {}) {
     SessionDescriptionImpl: (description) => description,
     IceCandidateImpl: (candidate) => candidate,
     MediaStreamImpl: FakeMediaStream,
+    initialMuted: options.initialMuted,
     createAudioElement: () => new FakeAudio(),
     AudioContextImpl: options.AudioContextImpl === undefined ? FakeAudioContext : options.AudioContextImpl,
     setIntervalImpl: options.setIntervalImpl,
@@ -427,6 +428,13 @@ test("media session does not report microphone denied when negotiation fails aft
   assert.equal(harness.states.some((state) => state.device === "authorized"), true);
   assert.equal(harness.states.some((state) => state.device === "denied"), false);
   assert.deepEqual(harness.states.at(-1), { media: "failed" });
+  assert.equal(harness.track.stopped, true);
+  assert.equal(harness.peerConnections[0].closed, true);
+  assert.deepEqual(harness.localMediaTracks.at(-1), {
+    source: "audio",
+    track: null,
+    stream: null,
+  });
 });
 
 test("media session reserves remote audio slots for multi-member rooms", async () => {
@@ -475,6 +483,15 @@ test("media session serializes renegotiation and toggles local mute", async () =
   harness.session.setMuted(true);
   assert.equal(peerConnection.offerCount, 3);
   assert.equal(peerConnection.addedTracks[0][0].enabled, false);
+});
+
+test("media session applies initial mute before publishing local audio", async () => {
+  const harness = mediaHarness({ initialMuted: true });
+
+  await harness.session.start();
+
+  assert.equal(harness.peerConnections[0].addedTracks[0][0].enabled, false);
+  assert.equal(harness.localMediaTracks[0].track.enabled, false);
 });
 
 test("renegotiation restores connected state when the peer connection stays connected", async () => {
