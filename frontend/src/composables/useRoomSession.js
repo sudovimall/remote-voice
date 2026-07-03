@@ -6,6 +6,7 @@ import {
 } from "../lib/room-controls.js";
 import {
   clearRoomEntryIntent,
+  clearRoomPanel,
   clearRoomSession,
   directRoomEntry,
   loadRoomEntryIntent,
@@ -80,6 +81,9 @@ export function useRoomSession() {
     }
     if (activeSidePanel.value === "chat") {
       return "聊天";
+    }
+    if (activeSidePanel.value === "video") {
+      return "视频";
     }
     return "成员";
   });
@@ -202,9 +206,10 @@ export function useRoomSession() {
     speakingMemberIds.value = nextSpeaking;
   }
 
+  // 切换房间主区域 tab，并把本地选择绑定到当前恢复凭据，防止新会话误恢复视频页。
   function setActiveSidePanel(panel) {
     activeSidePanel.value = panel;
-    saveRoomPanel(window.sessionStorage, currentRoom.value?.id, panel);
+    saveRoomPanel(window.sessionStorage, currentRoom.value?.id, panel, roomSession);
     if (panel === "chat") {
       chat.activateChatPanel();
     }
@@ -326,6 +331,7 @@ export function useRoomSession() {
     });
   }
 
+  // WebSocket 意外断开后用同一恢复凭据重连，避免刷新/断线时被当作新成员加入。
   function scheduleReconnect() {
     if (reconnectTimer || intentionalShutdown || pageHidden.value || !roomSession) {
       return;
@@ -333,10 +339,10 @@ export function useRoomSession() {
 
     reconnectTimer = window.setTimeout(() => {
       reconnectTimer = null;
+      const session = roomSession;
       connectRoom({
-        mode: "join",
-        roomId: roomSession.roomId,
-        nickname: roomSession.nickname,
+        mode: "resume",
+        session,
       });
     }, 1000);
   }
@@ -388,7 +394,7 @@ export function useRoomSession() {
       chat.rememberChatMessages(nextClient.chat_messages);
       clearRoomEntryIntent(window.sessionStorage);
       roomIdLabel.value = nextClient.room.id;
-      setActiveSidePanel(loadRoomPanel(window.sessionStorage, nextClient.room.id));
+      setActiveSidePanel(loadRoomPanel(window.sessionStorage, nextClient.room.id, roomSession));
       p2p.startP2PSession();
       syncRoomSideEffects(nextClient.room);
       setConnection("已连接");
@@ -453,6 +459,7 @@ export function useRoomSession() {
     if (leavingEndsRoom) {
       preferences.clearRoomScopedSettings(leavingRoomId);
     } else {
+      clearRoomPanel(window.sessionStorage, leavingRoomId);
       clearRoomSession(window.sessionStorage);
     }
     roomSession = null;
@@ -474,6 +481,7 @@ export function useRoomSession() {
     }
   }
 
+  // 根据路由和本地恢复凭据进入房间；只有恢复同一会话时才允许恢复视频 tab。
   function bootRoom() {
     document.body.dataset.page = "voice-room";
     preferences.setVoicePaneCollapsed(preferences.voicePaneCollapsed.value, false);
@@ -492,9 +500,8 @@ export function useRoomSession() {
     } else if (session) {
       roomSession = session;
       void connectRoom({
-        mode: "join",
-        roomId: session.roomId,
-        nickname: session.nickname,
+        mode: "resume",
+        session,
       });
     } else {
       const directEntry = directRoomEntry(window.localStorage, routeRoomId);

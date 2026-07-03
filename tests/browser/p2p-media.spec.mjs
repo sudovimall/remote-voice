@@ -224,6 +224,43 @@ function installP2PHarness() {
   };
 }
 
+// 记录媒体权限请求；音频保持真实 fake-device 流程，视频请求直接失败以暴露自动开摄像头行为。
+function installMediaRequestProbe() {
+  if (window.__remoteVoiceMediaProbe) {
+    return;
+  }
+
+  const mediaDevices = navigator.mediaDevices;
+  const originalGetUserMedia = mediaDevices?.getUserMedia?.bind(mediaDevices);
+  window.__remoteVoiceMediaProbe = {
+    audioRequests: 0,
+    videoRequests: 0,
+    constraints: [],
+  };
+
+  if (!mediaDevices || !originalGetUserMedia) {
+    return;
+  }
+
+  mediaDevices.getUserMedia = async (constraints) => {
+    const hasAudio = Boolean(constraints?.audio);
+    const hasVideo = Boolean(constraints?.video);
+    window.__remoteVoiceMediaProbe.constraints.push({
+      audio: hasAudio,
+      video: hasVideo,
+    });
+    if (hasAudio) {
+      window.__remoteVoiceMediaProbe.audioRequests += 1;
+    }
+    if (hasVideo) {
+      window.__remoteVoiceMediaProbe.videoRequests += 1;
+      throw new DOMException("Camera access is blocked by the browser test.", "NotAllowedError");
+    }
+
+    return originalGetUserMedia(constraints);
+  };
+}
+
 // 收集页面控制台和运行时错误，避免浏览器级测试只验证 DOM 而漏掉前端异常。
 function collectBrowserErrors(page, errors) {
   page.on("console", (message) => {
@@ -351,6 +388,58 @@ async function waitForNoActivePeer(page, memberId) {
   await expect.poll(() => activePeerIds(page)).not.toContain(memberId);
 }
 
+// 验证视频 tab 的默认值、刷新恢复和“不自动请求摄像头权限”的入口语义。
+test("video tab defaults to members and restores without requesting camera", async ({ page, context }) => {
+  await context.addInitScript(installMediaRequestProbe);
+  const browserErrors = [];
+  collectBrowserErrors(page, browserErrors);
+
+  await login(page);
+  await createRoom(page, "视频入口房主");
+  await expect(page.locator("#room-connection")).toHaveText("已连接");
+  await expect(page.locator("#media-state")).toHaveText("已连接", { timeout: 15_000 });
+  await expect(page.locator("#side-panel")).toHaveAttribute("data-active-panel", "members");
+  await expect(page.locator("#members-tab")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#video-tab")).toHaveAttribute("aria-selected", "false");
+  await expect(page.locator("#members-title")).toHaveText("成员");
+  await expect(page.locator("#video-call-panel")).toBeHidden();
+  await expect
+    .poll(() => page.evaluate(() => window.__remoteVoiceMediaProbe?.audioRequests ?? 0))
+    .toBeGreaterThanOrEqual(1);
+  await expect
+    .poll(() => page.evaluate(() => window.__remoteVoiceMediaProbe?.videoRequests ?? -1))
+    .toBe(0);
+
+  await page.locator("#video-tab").click();
+  await expect(page.locator("#side-panel")).toHaveAttribute("data-active-panel", "video");
+  await expect(page.locator("#video-tab")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#members-title")).toHaveText("视频");
+  await expect(page.locator("#video-call-panel")).toBeVisible();
+  await expect(page.locator("#camera-state")).toHaveText("摄像头未开启");
+  await expect(page.locator("#video-grid-panel video")).toHaveCount(0);
+  await expect
+    .poll(() => page.evaluate(() => window.__remoteVoiceMediaProbe?.videoRequests ?? -1))
+    .toBe(0);
+
+  await page.reload();
+  await expect(page.locator("#room-connection")).toHaveText("已连接");
+  await expect(page.locator("#media-state")).toHaveText("已连接", { timeout: 15_000 });
+  await expect(page.locator("#side-panel")).toHaveAttribute("data-active-panel", "video");
+  await expect(page.locator("#video-tab")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#members-title")).toHaveText("视频");
+  await expect(page.locator("#video-call-panel")).toBeVisible();
+  await expect(page.locator("#camera-state")).toHaveText("摄像头未开启");
+  await expect(page.locator("#video-grid-panel video")).toHaveCount(0);
+  await expect
+    .poll(() => page.evaluate(() => window.__remoteVoiceMediaProbe?.audioRequests ?? 0))
+    .toBeGreaterThanOrEqual(1);
+  await expect
+    .poll(() => page.evaluate(() => window.__remoteVoiceMediaProbe?.videoRequests ?? -1))
+    .toBe(0);
+
+  expect(browserErrors).toEqual([]);
+});
+
 // 验证两人 P2P 视频进入 UI，同时验证单个成员对失败后只该 pair 回退 SFU。
 test("p2p media reaches browser UI and one failed pair falls back to SFU", async ({ page, context }) => {
   await context.addInitScript(installP2PHarness);
@@ -378,12 +467,14 @@ test("p2p media reaches browser UI and one failed pair falls back to SFU", async
     entry.type === "signal_sent" && entry.signal?.type === "p2p_ice_candidate",
   );
 
+  await page.locator("#video-tab").click();
   await expect(page.locator("#toggle-camera")).toBeEnabled();
   await page.locator("#toggle-camera").click();
   await expect(page.locator("#camera-state")).toHaveText("摄像头已开启");
   await waitForP2PEvent(memberPage, (entry) =>
     entry.type === "remote_video" && entry.memberId === ownerId && entry.source === "camera",
   );
+  await memberPage.locator("#video-tab").click();
   await expect
     .poll(() => memberPage.locator("#video-grid-panel video").count())
     .toBeGreaterThanOrEqual(1);
@@ -432,8 +523,8 @@ test("p2p media reaches browser UI and one failed pair falls back to SFU", async
   expect(browserErrors).toEqual([]);
 });
 
-// 验证刷新、普通成员离开和房主关闭房间时都会释放对应 P2P 资源。
-test("p2p peers are cleaned up across refresh, member leave, and owner close", async ({
+// 验证刷新会恢复同一成员身份，普通成员离开和房主关闭房间时才释放对应 P2P 资源。
+test("p2p peers survive refresh resume and clean up on leave and owner close", async ({
   page,
   context,
   browser,
@@ -461,14 +552,22 @@ test("p2p peers are cleaned up across refresh, member leave, and owner close", a
   await expect(memberPage.locator("#room-connection")).toHaveText("已连接");
   await expect(memberPage.locator("#media-state")).toHaveText("已连接", { timeout: 15_000 });
   const refreshedMemberId = await ownMemberId(memberPage);
-  await waitForP2PEvent(page, (entry) => entry.type === "peer_closed" && entry.memberId === firstMemberId);
-  await waitForNoActivePeer(page, firstMemberId);
+  expect(refreshedMemberId).toBe(firstMemberId);
   await waitForActivePeer(page, refreshedMemberId);
   await waitForActivePeer(memberPage, ownerId);
 
+  await memberPage.locator("#video-tab").click();
+  await expect(memberPage.locator("#side-panel")).toHaveAttribute("data-active-panel", "video");
   await memberPage.locator("#leave-room").click();
   await expect(memberPage).toHaveURL(/\/$/);
   await expect(memberPage.getByRole("heading", { name: "进入语音房间" })).toBeVisible();
+  await expect
+    .poll(() =>
+      memberPage.evaluate((targetRoomId) => {
+        return window.sessionStorage.getItem(`remote-voice.room-panel.${targetRoomId}`);
+      }, roomId),
+    )
+    .toBeNull();
   await waitForP2PEvent(page, (entry) => entry.type === "peer_closed" && entry.memberId === refreshedMemberId);
   await waitForNoActivePeer(page, refreshedMemberId);
 

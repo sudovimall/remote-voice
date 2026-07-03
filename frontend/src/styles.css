@@ -493,6 +493,20 @@ button:disabled {
   gap: 8px;
 }
 
+.video-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.camera-state {
+  color: var(--muted);
+  font-size: 0.86rem;
+  font-weight: 850;
+}
+
 .member-list,
 .chat-messages {
   min-height: 0;
@@ -707,6 +721,7 @@ button:disabled {
 .stage-content > .member-list,
 .stage-content > .room-overview-panel,
 .stage-content > .chat-panel,
+.stage-content > .video-call-panel,
 .stage-content > .screen-panel {
   grid-area: 1 / 1;
   min-height: 0;
@@ -714,8 +729,6 @@ button:disabled {
 
 .room-overview-panel {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  gap: 12px;
   min-height: 0;
 }
 
@@ -724,11 +737,19 @@ button:disabled {
   overflow: auto;
 }
 
+.video-call-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  min-height: 0;
+}
+
 .video-grid-panel {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
+  align-content: start;
   gap: 10px;
-  max-height: min(42vh, 420px);
+  min-height: 0;
   overflow: auto;
 }
 
@@ -983,17 +1004,6 @@ button:disabled {
 
 .quiet-button-wide {
   flex: 1;
-}
-
-.camera-control {
-  display: grid;
-  gap: 8px;
-}
-
-.camera-control span {
-  color: var(--muted);
-  font-size: 0.82rem;
-  font-weight: 800;
 }
 
 .screen-popout {

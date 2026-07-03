@@ -3,7 +3,7 @@ export const ENTRY_INTENT_KEY = "remote-voice.room-entry-intent";
 export const ROOM_SESSION_KEY = "remote-voice.room-session";
 const ROOM_PANEL_KEY_PREFIX = "remote-voice.room-panel.";
 const ROOM_NOT_LISTENING_KEY_PREFIX = "remote-voice.room-not-listening.";
-const ROOM_PANELS = new Set(["members", "chat", "screen"]);
+const ROOM_PANELS = new Set(["members", "chat", "video", "screen"]);
 
 function trimmed(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -66,6 +66,60 @@ function normalizeRoomSession(session) {
 
 function normalizedPanel(panel) {
   return ROOM_PANELS.has(panel) ? panel : "members";
+}
+
+// 提取可用于 UI 偏好校验的恢复身份，避免把昵称等可变字段纳入匹配。
+function normalizedPanelSession(session) {
+  const roomId = normalizedRoomId(session?.roomId);
+  const memberId = trimmed(session?.memberId);
+  const resumeToken = trimmed(session?.resumeToken);
+  if (!roomId || !memberId || !resumeToken) {
+    return null;
+  }
+
+  return {
+    roomId,
+    memberId,
+    resumeToken,
+  };
+}
+
+// 判断存储的 tab 偏好是否属于当前房间和同一个本地恢复会话。
+function matchingPanelSession(storedSession, currentSession, roomId) {
+  const stored = normalizedPanelSession(storedSession);
+  const current = normalizedPanelSession(currentSession);
+  const normalizedRoom = normalizedRoomId(roomId);
+  return Boolean(
+    stored &&
+      current &&
+      stored.roomId === normalizedRoom &&
+      current.roomId === normalizedRoom &&
+      stored.memberId === current.memberId &&
+      stored.resumeToken === current.resumeToken,
+  );
+}
+
+// 兼容旧的字符串偏好，但旧 video 偏好缺少会话身份，必须回退到成员页。
+function normalizedPanelPreference(rawValue, roomId, currentSession) {
+  if (typeof rawValue !== "string") {
+    return "members";
+  }
+
+  try {
+    const parsed = JSON.parse(rawValue);
+    const panel = normalizedPanel(parsed?.panel);
+    const storedRoomId = normalizedRoomId(parsed?.roomId);
+    if (storedRoomId && storedRoomId !== normalizedRoomId(roomId)) {
+      return "members";
+    }
+    if (panel === "video" && !matchingPanelSession(parsed?.session, currentSession, roomId)) {
+      return "members";
+    }
+    return panel;
+  } catch (_error) {
+    const panel = normalizedPanel(rawValue);
+    return panel === "video" ? "members" : panel;
+  }
 }
 
 function roomPanelKey(roomId) {
@@ -241,7 +295,8 @@ export function clearRoomNotListening(storage, roomId) {
   }
 }
 
-export function saveRoomPanel(storage, roomId, panel) {
+// 保存房间主区域 tab 偏好；video tab 额外记录恢复凭据，避免新本地会话误恢复摄像头入口。
+export function saveRoomPanel(storage, roomId, panel, session = null) {
   const key = roomPanelKey(roomId);
   const value = normalizedPanel(panel);
   if (!key) {
@@ -249,13 +304,21 @@ export function saveRoomPanel(storage, roomId, panel) {
   }
 
   try {
-    storage.setItem(key, value);
+    storage.setItem(
+      key,
+      JSON.stringify({
+        panel: value,
+        roomId: normalizedRoomId(roomId),
+        session: normalizedPanelSession(session),
+      }),
+    );
   } catch (_error) {
     // Panel persistence is only a convenience for refresh/resume.
   }
   return value;
 }
 
+// 清理指定房间的 tab 偏好；主动离房后不应把旧 video tab 带入下一次进入。
 export function clearRoomPanel(storage, roomId) {
   const key = roomPanelKey(roomId);
   if (!key) {
@@ -269,14 +332,15 @@ export function clearRoomPanel(storage, roomId) {
   }
 }
 
-export function loadRoomPanel(storage, roomId) {
+// 读取房间 tab 偏好；video tab 只有在房间和本地恢复凭据都匹配时才恢复。
+export function loadRoomPanel(storage, roomId, session = null) {
   const key = roomPanelKey(roomId);
   if (!key) {
     return "members";
   }
 
   try {
-    return normalizedPanel(storage.getItem(key));
+    return normalizedPanelPreference(storage.getItem(key), roomId, session);
   } catch (_error) {
     return "members";
   }

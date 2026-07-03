@@ -41,6 +41,12 @@ function memoryStorage() {
   };
 }
 
+const ownerSession = {
+  roomId: "ABC123",
+  memberId: "m_owner",
+  resumeToken: "r_owner",
+};
+
 test("nickname storage keeps a trimmed lobby nickname", () => {
   const storage = memoryStorage();
 
@@ -153,16 +159,56 @@ test("room session ignores invalid resume credentials and can be cleared", () =>
   assert.equal(storage.value(ROOM_SESSION_KEY), undefined);
 });
 
-test("room panel storage restores a screen view only for the matching room", () => {
+test("room panel storage restores screen and video views only for the matching room", () => {
   const storage = memoryStorage();
 
   assert.equal(loadRoomPanel(storage, "ABC123"), "members");
   assert.equal(saveRoomPanel(storage, " abc123 ", "screen"), "screen");
   assert.equal(loadRoomPanel(storage, "ABC123"), "screen");
+  assert.equal(saveRoomPanel(storage, " abc123 ", "video", ownerSession), "video");
+  assert.equal(loadRoomPanel(storage, "ABC123", ownerSession), "video");
   assert.equal(loadRoomPanel(storage, "OTHER"), "members");
 
   assert.equal(saveRoomPanel(storage, "ABC123", "invalid"), "members");
   assert.equal(loadRoomPanel(storage, "ABC123"), "members");
+});
+
+test("room panel storage restores video only for the same local room session", () => {
+  const storage = memoryStorage();
+  saveRoomPanel(storage, " abc123 ", "video", ownerSession);
+
+  assert.equal(loadRoomPanel(storage, "ABC123"), "members");
+  assert.equal(
+    loadRoomPanel(storage, "ABC123", {
+      ...ownerSession,
+      memberId: "m_other",
+    }),
+    "members",
+  );
+  assert.equal(
+    loadRoomPanel(storage, "ABC123", {
+      ...ownerSession,
+      resumeToken: "r_other",
+    }),
+    "members",
+  );
+  assert.equal(
+    loadRoomPanel(storage, "OTHER", {
+      ...ownerSession,
+      roomId: "OTHER",
+    }),
+    "members",
+  );
+});
+
+test("legacy video panel storage does not restore without session binding", () => {
+  const storage = memoryStorage();
+  storage.setItem("remote-voice.room-panel.ABC123", "video");
+
+  assert.equal(loadRoomPanel(storage, "ABC123", ownerSession), "members");
+
+  storage.setItem("remote-voice.room-panel.ABC123", "screen");
+  assert.equal(loadRoomPanel(storage, "ABC123"), "screen");
 });
 
 test("room scoped listening preferences are saved and cleared by room", () => {

@@ -9,6 +9,7 @@ const emit = defineEmits(["select"]);
 const tabs = [
   { id: "members-tab", panel: "members", label: "成员" },
   { id: "chat-tab", panel: "chat", label: "聊天" },
+  { id: "video-tab", panel: "video", label: "视频" },
   { id: "screen-tab", panel: "screen", label: "共享" },
 ];
 </script>

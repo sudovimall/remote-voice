@@ -7,7 +7,7 @@ import MembersPanel from "./room/MembersPanel.vue";
 import RoomTabs from "./room/RoomTabs.vue";
 import RoomTopbar from "./room/RoomTopbar.vue";
 import ScreenSharePanel from "./room/ScreenSharePanel.vue";
-import VideoGridPanel from "./room/VideoGridPanel.vue";
+import VideoCallPanel from "./room/VideoCallPanel.vue";
 import VoicePanel from "./room/VoicePanel.vue";
 
 const room = reactive(useRoomSession());
@@ -106,14 +106,6 @@ function fullscreenScreenShare() {
         <div class="stage-content">
           <ChatNotifications :mention-reminder="room.mentionReminder" :toast="room.chatToast" />
           <div v-show="room.activeSidePanel === 'members'" class="room-overview-panel">
-            <VideoGridPanel
-              :local-camera-stream="room.localCameraStream"
-              :members="room.members"
-              :own-member-id="room.ownMemberId"
-              :remote-camera-streams="room.remoteCameraStreams"
-              :speaking-member-ids="room.speakingMemberIds"
-              :video-call-publishers="room.currentRoom?.video_call_publishers ?? {}"
-            />
             <MembersPanel
               :current-room="room.currentRoom"
               :get-member-volume="room.memberVolume"
@@ -140,6 +132,21 @@ function fullscreenScreenShare() {
             :set-mention-picker-index="room.setMentionPickerIndex"
             :submit-message="room.submitChatMessage"
           />
+          <VideoCallPanel
+            :active="room.activeSidePanel === 'video'"
+            :camera-busy="room.cameraBusy"
+            :camera-state-label="room.cameraStateLabel"
+            :camera-toggle-label="room.cameraToggleLabel"
+            :can-use-camera="room.canUseCamera"
+            :local-camera-stream="room.localCameraStream"
+            :media-ready="room.mediaReady"
+            :members="room.members"
+            :own-member-id="room.ownMemberId"
+            :remote-camera-streams="room.remoteCameraStreams"
+            :speaking-member-ids="room.speakingMemberIds"
+            :video-call-publishers="room.currentRoom?.video_call_publishers ?? {}"
+            @toggle-camera="room.toggleCamera"
+          />
           <ScreenSharePanel
             ref="screenPanel"
             :active="room.activeSidePanel === 'screen'"
@@ -160,10 +167,6 @@ function fullscreenScreenShare() {
         :media-ready="room.mediaReady"
         :media-state-label="room.mediaStateLabel"
         :mic-state-label="room.micStateLabel"
-        :camera-busy="room.cameraBusy"
-        :camera-state-label="room.cameraStateLabel"
-        :camera-toggle-label="room.cameraToggleLabel"
-        :can-use-camera="room.canUseCamera"
         :microphone-gain-level="room.microphoneGainLevel"
         :microphone-gain-percent="room.microphoneGainPercent"
         :microphone-gain-supported="room.microphoneGainSupported"
@@ -171,7 +174,6 @@ function fullscreenScreenShare() {
         :permission-note="room.permissionNote"
         @leave="room.leaveRoom"
         @set-microphone-gain="room.setMicrophoneGain"
-        @toggle-camera="room.toggleCamera"
         @toggle-mute="room.toggleSelfMuted"
       />
     </section>
