@@ -1,11 +1,16 @@
 # remote-voice
+更新时间：2026-07-04 04:34:04 CST
+更新概述：同步当前认证、持久房间、P2P 优先媒体、屏幕共享和摄像头视频能力说明。
 
-`remote-voice` 是一个浏览器语音房 MVP：
+`remote-voice` 是一个浏览器远程语音和共享桌面互联应用：
 
-- Rust 提供房间、WebSocket 信令和服务端 WebRTC 音频转发。
+- Rust 提供房间管理、认证、持久房间、WebSocket 信令、P2P/SFU 媒体路由、WebRTC 音视频转发和静态资源服务。
 - 前端由 Vue/Vite 构建，Rust 服务提供构建后的静态页面。
+- 房间支持语音、成员权限、成员音量/不听偏好、聊天、屏幕共享和摄像头视频。
+- 媒体优先尝试成员间 P2P；单个成员对失败后回退 SFU，不影响其他成员对。
 - 昵称保存在浏览器 `localStorage`。
 - 房间恢复凭据保存在当前标签页 `sessionStorage`，刷新房间页后可在断线宽限期内恢复房主或成员身份。
+- 认证开启后使用 SQLite 保存用户、session、邀请码和持久房间；运行时成员恢复会绑定当前登录用户，避免跨账号接管。
 
 ## 本地运行
 
@@ -38,6 +43,8 @@ room:
 media:
   udp_port_min: 40000
   udp_port_max: 40100
+auth:
+  enabled: false
 ```
 
 修改 `auth.enabled`、管理员密码哈希、session cookie 或 SQLite 路径后需要重启后端才会生效。关闭认证不会删除已有 SQLite 用户、session、邀请码或持久房间数据，再次开启认证时会继续使用同一个数据库。
